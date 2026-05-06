@@ -175,6 +175,7 @@ class GameDesignAgent:
             max_tokens=8000,
             timeout=120,
             max_retries=2,
+            model_kwargs={"thinking": False},  # 关闭 DeepSeek thinking mode，避免 reasoning_content 回传报错
         )
 
         self.checkpointer = MemorySaver()
