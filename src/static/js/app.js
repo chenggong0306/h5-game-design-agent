@@ -119,10 +119,19 @@ async function sendMessage() {
                     } else if (event.type === 'done') {
                         // 移除光标，最终渲染
                         bubble.innerHTML = renderMarkdown(fullText);
-                        // 如果有代码，更新编辑器并运行
                         if (event.code) {
+                            // 有代码变更（新生成 / 编辑指令执行后的结果）
                             editor.setValue(event.code);
                             runGame();
+
+                            // 显示编辑日志
+                            if (event.action === 'edit' && event.edit_logs) {
+                                const logHtml = event.edit_logs
+                                    .map(l => `<span style="color:${l.includes('FAILED')?'#e74c3c':'#2ecc71'}">${l}</span>`)
+                                    .join('<br>');
+                                bubble.innerHTML += `<div style="margin-top:8px;padding:6px 10px;background:#111;border-radius:6px;font-size:12px;font-family:monospace">
+                                    📝 执行了 ${event.edits_count} 个编辑操作：<br>${logHtml}</div>`;
+                            }
                         }
                     } else if (event.type === 'error') {
                         bubble.innerHTML = `<span style="color:#e74c3c">❌ ${event.content}</span>`;

@@ -1,89 +1,74 @@
 """AI H5游戏设计智能体 - 核心 Agent 模块"""
 
 import re
+import json
 
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 
 from src.config import settings
 from src.knowledge.knowledge_base import KnowledgeBase
+from src.agent.code_editor import CodeEditor
 
 SYSTEM_PROMPT = """你是一个专业的 H5 页面游戏设计 AI 助手。你专门帮用户设计和生成可以在手机浏览器中直接运行的 H5 小游戏。
 
 ## 你的职责：
 1. **理解用户需求**：通过对话了解用户想要什么类型的 H5 游戏
-2. **生成游戏代码**：生成完整的、可直接运行的单文件 HTML5 游戏页面
-3. **支持编辑修改**：帮助用户增加、修改或删除游戏功能
+2. **生成游戏代码**：生成完整的单文件 HTML5 游戏页面
+3. **精确编辑代码**：通过编辑指令对现有代码进行增删改查
 
-## 技术要求（非常重要）：
-- 生成的代码必须是 **完整的单文件 HTML**，包含所有 HTML + CSS + JavaScript
-- 使用 **HTML5 Canvas** 或 **纯 CSS/DOM** 实现游戏画面，不依赖任何外部游戏框架
-- 必须做好 **移动端适配**：使用 viewport meta、触摸事件(touchstart/touchmove/touchend)、响应式布局
-- 画布大小自适应屏幕：`canvas.width = window.innerWidth; canvas.height = window.innerHeight;`
-- 同时支持 **触摸操作 + 键盘/鼠标操作**，让 PC 和手机都能玩
-- 用 `requestAnimationFrame` 做游戏循环
-- 代码中加入 **中文注释**
-- 每次生成或修改代码时，输出 **完整代码**，不要用省略号
+## 代码编辑工具（非常重要）：
+当用户已有代码（"当前项目代码"不为空），且用户要求修改/修复/添加/删除功能时，
+你**必须使用编辑指令**，而不是重新输出全部代码。
 
-## 素材引用方法（重要）：
-如果"可用素材信息"中有素材，你**必须优先使用这些素材**而不是用 Canvas 画图形。
-素材已上传到服务器，每个素材都有一个 URL 路径（如 `/assets/image/xxx.png`），在代码中这样使用：
+### 可用的编辑指令（用 JSON 代码块包裹）：
 
-**图片素材加载与使用：**
-```javascript
-// 1. 预加载图片（在游戏循环开始前）
-const assets = {{}};
-let assetsLoaded = 0;
-const totalAssets = 2;  // 需要加载的素材总数
-
-function loadImage(name, url) {{
-    const img = new Image();
-    img.onload = () => {{ assetsLoaded++; if (assetsLoaded >= totalAssets) startGame(); }};
-    img.onerror = () => {{ assetsLoaded++; if (assetsLoaded >= totalAssets) startGame(); }};
-    img.src = url;
-    assets[name] = img;
-}}
-
-// 2. 加载素材（URL 来自"可用素材信息"）
-loadImage('player', '/assets/image/abc123.png');
-loadImage('enemy', '/assets/image/def456.png');
-
-// 3. 在 Canvas 中绘制
-function draw() {{
-    if (assets.player) ctx.drawImage(assets.player, x, y, width, height);
-}}
+**1. 替换代码 str_replace（最常用）：**
+```json
+{{"action": "str_replace", "old_str": "要替换的原始代码", "new_str": "替换后的新代码"}}
 ```
 
-**如果没有素材**，就用 Canvas 2D API 绘制简单图形（fillRect, arc 等）。
-
-## HTML 模板结构：
-```html
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-    <title>游戏名称</title>
-    <style>
-        * {{ margin: 0; padding: 0; }}
-        body {{ overflow: hidden; background: #000; touch-action: none; }}
-        canvas {{ display: block; }}
-    </style>
-</head>
-<body>
-    <canvas id="gameCanvas"></canvas>
-    <script>
-        // 游戏代码
-    </script>
-</body>
-</html>
+**2. 在指定行后插入 insert：**
+```json
+{{"action": "insert", "after_line": 42, "new_str": "要插入的新代码"}}
 ```
 
-## 常见 H5 游戏类型参考：
-- 跳跃类（Flappy Bird 式）、跑酷类、消除类（2048/三消）
-- 射击类、弹球类、接东西类、打地鼠类
-- 答题类、抽奖转盘、刮刮卡
-- 拼图类、记忆翻牌、贪吃蛇、俄罗斯方块
+**3. 删除指定行 delete：**
+```json
+{{"action": "delete", "start_line": 10, "end_line": 15}}
+```
+
+**4. 搜索代码 search：**
+```json
+{{"action": "search", "query": "要搜索的关键字"}}
+```
+
+### 编辑指令使用规则：
+- 一次回复中可以包含**多个编辑指令**，按顺序执行
+- `old_str` 必须与代码中的内容**完全一致**（包括空格缩进），否则替换会失败
+- `old_str` 要足够长以确保唯一匹配（至少包含3行上下文）
+- `new_str` 为空字符串 "" 表示删除该代码段
+- 先用 search 定位问题代码，再用 str_replace 修改
+- 修复 bug 时，先解释问题原因，再给出编辑指令
+
+### 什么时候用编辑指令 vs 完整代码：
+- **无现有代码** → 输出完整 HTML 代码（用 ```html 包裹）
+- **有现有代码 + 小修改**（改参数/修bug/加功能） → 使用编辑指令
+- **有现有代码 + 大重构**（超过50%代码变动） → 输出完整新代码
+
+## 技术要求：
+- 完整单文件 HTML，包含 HTML + CSS + JavaScript
+- HTML5 Canvas 或纯 CSS/DOM，不依赖外部框架
+- 移动端适配：viewport meta、触摸事件、响应式布局
+- 画布自适应：`canvas.width = window.innerWidth; canvas.height = window.innerHeight;`
+- 同时支持触摸 + 键盘/鼠标
+- 用 `requestAnimationFrame` 游戏循环
+- Canvas 2D API 绘制图形，ellipse 半径必须用 Math.max(1, ...) 保护
+- 中文注释
+
+## 素材引用：
+如果有素材，用 `new Image(); img.src = '/assets/image/xxx.png';` 加载，
+用 `ctx.drawImage(img, x, y, w, h)` 绘制。没有素材就用 Canvas 图形。
 
 ## 可用素材信息：
 {available_assets}
@@ -214,37 +199,116 @@ class GameDesignAgent:
                     full_reply += token
                     yield {"type": "token", "content": token}
 
-            # 流结束后，记录历史并提取代码
+            # 流结束后，记录历史并提取代码或编辑指令
             history.append({"role": "user", "content": user_message})
             history.append({"role": "assistant", "content": full_reply})
 
+            # 优先检查完整 HTML 代码
             code = self._extract_code(full_reply)
-            action = "generate" if code and not current_code else "modify" if code else "chat"
+            if code:
+                action = "generate" if not current_code else "replace"
+                yield {"type": "done", "code": code, "action": action}
+                return
 
-            yield {"type": "done", "code": code, "action": action}
+            # 其次检查编辑指令
+            edits = self._extract_edits(full_reply)
+            if edits and current_code:
+                new_code, logs = self.apply_edits(current_code, edits)
+                yield {
+                    "type": "done",
+                    "code": new_code,
+                    "action": "edit",
+                    "edits_count": len(edits),
+                    "edit_logs": logs,
+                }
+                return
+
+            # 纯对话（无代码、无编辑）
+            yield {"type": "done", "code": None, "action": "chat"}
 
         except Exception as e:
             yield {"type": "error", "content": str(e)}
 
     @staticmethod
     def _extract_code(text: str) -> str | None:
-        """从 AI 回复中提取 HTML 游戏代码"""
-        # 1. 匹配 ```html ... ```
+        """从 AI 回复中提取完整的 HTML 游戏代码"""
         matches = re.findall(r"```html\s*\n(.*?)```", text, re.DOTALL)
         if matches:
-            # 取最长的那个（通常是完整代码）
             code = max(matches, key=len).strip()
             if "<html" in code or "<!DOCTYPE" in code.upper() or "<canvas" in code:
                 return code
 
-        # 2. 匹配 ``` ... ```（无语言标记）
         matches = re.findall(r"```\s*\n(.*?)```", text, re.DOTALL)
         for match in matches:
             code = match.strip()
             if ("<html" in code or "<!DOCTYPE" in code.upper()) and "<script" in code:
                 return code
-
         return None
+
+    @staticmethod
+    def _extract_edits(text: str) -> list[dict]:
+        """从 AI 回复中提取编辑指令（```json 代码块中的操作）"""
+        edits = []
+        # 匹配 ```json ... ```
+        for m in re.finditer(r"```json\s*\n(.*?)```", text, re.DOTALL):
+            raw = m.group(1).strip()
+            try:
+                obj = json.loads(raw)
+                if isinstance(obj, dict) and "action" in obj:
+                    edits.append(obj)
+                elif isinstance(obj, list):
+                    for item in obj:
+                        if isinstance(item, dict) and "action" in item:
+                            edits.append(item)
+            except json.JSONDecodeError:
+                continue
+        return edits
+
+    @staticmethod
+    def apply_edits(code: str, edits: list[dict]) -> tuple[str, list[str]]:
+        """在代码上执行编辑指令列表
+
+        Returns:
+            (修改后的代码, 操作日志列表)
+        """
+        logs = []
+        editor = CodeEditor()
+        for i, edit in enumerate(edits, 1):
+            action = edit.get("action", "")
+
+            if action == "str_replace":
+                result = editor.str_replace(
+                    code,
+                    edit.get("old_str", ""),
+                    edit.get("new_str", ""),
+                )
+            elif action == "insert":
+                result = editor.insert_after(
+                    code,
+                    edit.get("after_line", 0),
+                    edit.get("new_str", ""),
+                )
+            elif action == "delete":
+                result = editor.delete_lines(
+                    code,
+                    edit.get("start_line", 1),
+                    edit.get("end_line", 1),
+                )
+            elif action == "search":
+                result = editor.search(code, edit.get("query", ""))
+                logs.append(f"[{i}] search: {result['message']}")
+                continue
+            else:
+                logs.append(f"[{i}] unknown action: {action}")
+                continue
+
+            if result["success"]:
+                code = result["code"]
+                logs.append(f"[{i}] {action}: {result['message']}")
+            else:
+                logs.append(f"[{i}] {action} FAILED: {result['message']}")
+
+        return code, logs
 
     def clear_session(self, session_id: str):
         """清除会话历史"""
