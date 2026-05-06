@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🎮 AI 游戏设计工坊</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+    <!-- Monaco Editor CDN -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/monaco-editor@0.45.0/min/vs/editor/editor.main.css">
+</head>
+<body>
+    <header class="app-header">
+        <h1>🎮 H5 游戏设计工坊</h1>
+        <div class="header-actions">
+            <button id="btn-new" title="新建项目">📄 新建</button>
+            <button id="btn-save" title="保存项目">💾 保存</button>
+            <button id="btn-load" title="加载项目">📂 项目</button>
+            <button id="btn-assets" title="素材管理">🎨 素材</button>
+        </div>
+    </header>
+
+    <main class="app-main">
+        <!-- 左侧：AI对话面板 -->
+        <section class="panel chat-panel">
+            <div class="panel-header">
+                <h2>💬 H5 游戏助手</h2>
+                <button id="btn-clear-chat" title="清除对话">🗑️</button>
+            </div>
+            <div id="chat-messages" class="chat-messages">
+                <div class="msg ai">
+                    <div class="msg-content">
+                        👋 你好！我是 H5 游戏设计助手。<br><br>
+                        告诉我你想做什么 H5 小游戏，我来帮你生成可以在手机浏览器中直接运行的代码！<br><br>
+                        例如：<br>
+                        • "做一个 Flappy Bird 小游戏"<br>
+                        • "做一个贪吃蛇"<br>
+                        • "做一个 2048 数字合并游戏"<br>
+                        • "做一个接水果的小游戏"<br>
+                        • "把速度调快一点"
+                    </div>
+                </div>
+            </div>
+            <div class="chat-input-area">
+                <textarea id="chat-input" placeholder="描述你想要的游戏..." rows="2"></textarea>
+                <button id="btn-send">发送 ⏎</button>
+            </div>
+        </section>
+
+        <!-- 中间：代码编辑器 -->
+        <section class="panel editor-panel">
+            <div class="panel-header">
+                <h2>📝 代码编辑器</h2>
+                <button id="btn-run" title="运行游戏">▶️ 运行</button>
+            </div>
+            <div id="editor-container"></div>
+        </section>
+
+        <!-- 右侧：游戏预览 -->
+        <section class="panel preview-panel">
+            <div class="panel-header">
+                <h2>🎮 游戏预览</h2>
+                <button id="btn-fullscreen" title="全屏">⛶</button>
+            </div>
+            <iframe id="game-preview" sandbox="allow-scripts allow-same-origin"></iframe>
+        </section>
+    </main>
+
+    <!-- 素材管理弹窗 -->
+    <div id="modal-assets" class="modal hidden">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>🎨 素材管理</h2>
+                <button class="modal-close" onclick="closeModal('modal-assets')">✕</button>
+            </div>
+            <div class="modal-body">
+                <div class="upload-zone" id="upload-zone">
+                    <p>📁 拖拽文件到这里或点击上传</p>
+                    <input type="file" id="file-input" multiple accept="image/*,audio/*,.json,.xml">
+                    <select id="asset-type">
+                        <option value="image">图片</option>
+                        <option value="spritesheet">精灵图</option>
+                        <option value="audio">音频</option>
+                        <option value="tilemap">瓦片地图</option>
+                        <option value="font">字体</option>
+                    </select>
+                    <input type="text" id="asset-desc" placeholder="素材描述...">
+                    <input type="text" id="asset-tags" placeholder="标签(逗号分隔)...">
+                    <button id="btn-upload">⬆️ 上传</button>
+                </div>
+                <div id="assets-list" class="assets-list"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 项目列表弹窗 -->
+    <div id="modal-projects" class="modal hidden">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>📂 我的项目</h2>
+                <button class="modal-close" onclick="closeModal('modal-projects')">✕</button>
+            </div>
+            <div class="modal-body">
+                <div id="projects-list" class="projects-list"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 加载提示 -->
+    <div id="loading" class="loading hidden">
+        <div class="spinner"></div>
+        <p>AI 正在思考中...</p>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/monaco-editor@0.45.0/min/vs/loader.js"></script>
+    <script src="/static/js/app.js"></script>
+</body>
+</html>

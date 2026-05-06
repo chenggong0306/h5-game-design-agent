@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+wheels/
+.venv/
+
+# 环境变量（含 API Key）
+.env
+
+# 知识库数据（运行时生成）
+data/chroma_db/
+
+# 用户上传素材（运行时生成）
+data/assets/**
+!data/assets/.gitkeep
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Playwright screenshots
+*.png
+.playwright-mcp/
+
+# uv
+.python-version
