@@ -22,9 +22,39 @@ SYSTEM_PROMPT = """你是一个专业的 H5 页面游戏设计 AI 助手。你�
 - 画布大小自适应屏幕：`canvas.width = window.innerWidth; canvas.height = window.innerHeight;`
 - 同时支持 **触摸操作 + 键盘/鼠标操作**，让 PC 和手机都能玩
 - 用 `requestAnimationFrame` 做游戏循环
-- 所有图形用 Canvas 2D API 绘制（fillRect, arc, drawImage 等），不需要外部图片
 - 代码中加入 **中文注释**
 - 每次生成或修改代码时，输出 **完整代码**，不要用省略号
+
+## 素材引用方法（重要）：
+如果"可用素材信息"中有素材，你**必须优先使用这些素材**而不是用 Canvas 画图形。
+素材已上传到服务器，每个素材都有一个 URL 路径（如 `/assets/image/xxx.png`），在代码中这样使用：
+
+**图片素材加载与使用：**
+```javascript
+// 1. 预加载图片（在游戏循环开始前）
+const assets = {{}};
+let assetsLoaded = 0;
+const totalAssets = 2;  // 需要加载的素材总数
+
+function loadImage(name, url) {{
+    const img = new Image();
+    img.onload = () => {{ assetsLoaded++; if (assetsLoaded >= totalAssets) startGame(); }};
+    img.onerror = () => {{ assetsLoaded++; if (assetsLoaded >= totalAssets) startGame(); }};
+    img.src = url;
+    assets[name] = img;
+}}
+
+// 2. 加载素材（URL 来自"可用素材信息"）
+loadImage('player', '/assets/image/abc123.png');
+loadImage('enemy', '/assets/image/def456.png');
+
+// 3. 在 Canvas 中绘制
+function draw() {{
+    if (assets.player) ctx.drawImage(assets.player, x, y, width, height);
+}}
+```
+
+**如果没有素材**，就用 Canvas 2D API 绘制简单图形（fillRect, arc 等）。
 
 ## HTML 模板结构：
 ```html
@@ -94,13 +124,18 @@ class GameDesignAgent:
         # 搜索相关素材
         assets = self.kb.search_assets(user_message, top_k=5)
         if assets:
-            assets_text = "\n".join(
-                f"- [{a.get('asset_type', '未知')}] {a.get('file_name', '未知')} "
-                f"(路径: /assets/{a.get('asset_type', '')}/{a.get('asset_id', '')}{a.get('extension', '')})"
-                for a in assets
-            )
+            lines = []
+            for a in assets:
+                atype = a.get('asset_type', 'image')
+                fname = a.get('file_name', '未知')
+                aid = a.get('asset_id', '')
+                ext = a.get('extension', '')
+                # 生成可直接在代码中引用的 URL
+                url = f"/assets/{atype}/{aid}{ext}"
+                lines.append(f"- [{atype}] {fname} → URL: `{url}`")
+            assets_text = "\n".join(lines)
         else:
-            assets_text = "暂无上传素材，请使用 Canvas 2D API 绘制所有图形。"
+            assets_text = "暂无上传素材，请使用 Canvas 2D API 绘制所有图形（fillRect/arc 等）。"
 
         # 搜索相关技能/模板
         skills = self.kb.search_skills(user_message, top_k=3)

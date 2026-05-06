@@ -144,6 +144,8 @@ async def upload_asset(
             description=description,
             tags=tag_list,
         )
+        # 添加可引用的 URL
+        result["url"] = f"/assets/{asset_type}/{result['asset_id']}{result.get('extension', '')}"
         return result
     finally:
         os.unlink(tmp_path)
@@ -172,7 +174,17 @@ async def delete_asset(asset_id: str):
 
 @router.get("/api/assets/file/{asset_type}/{filename}")
 async def serve_asset(asset_type: str, filename: str):
-    """提供素材文件访问"""
+    """提供素材文件访问（API路径）"""
+    from src.config import settings
+    file_path = os.path.join(settings.assets_dir, asset_type, filename)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="文件不存在")
+    return FileResponse(file_path)
+
+
+@router.get("/assets/{asset_type}/{filename}")
+async def serve_asset_short(asset_type: str, filename: str):
+    """提供素材文件访问（短路径，供游戏代码引用）"""
     from src.config import settings
     file_path = os.path.join(settings.assets_dir, asset_type, filename)
     if not os.path.exists(file_path):

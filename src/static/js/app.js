@@ -293,14 +293,18 @@ async function loadAssets() {
             list.innerHTML = '<p style="color:#aaa;text-align:center">暂无素材，上传一些吧！</p>';
             return;
         }
-        list.innerHTML = assets.map(a => `
+        list.innerHTML = assets.map(a => {
+            const aid = a.id || a.asset_id;
+            const url = `/assets/${a.asset_type}/${aid}${a.extension || ''}`;
+            return `
             <div class="asset-item">
                 <span class="name">${getTypeIcon(a.asset_type)} ${a.file_name}</span>
+                <code style="font-size:11px;color:#888;margin:0 8px">${url}</code>
                 <div class="actions">
-                    <button onclick="deleteAsset('${a.id || a.asset_id}')" title="删除">🗑️</button>
+                    <button onclick="deleteAsset('${aid}')" title="删除">🗑️</button>
                 </div>
-            </div>
-        `).join('');
+            </div>`;
+        }).join('');
     } catch (err) {
         console.error('加载素材失败:', err);
     }
