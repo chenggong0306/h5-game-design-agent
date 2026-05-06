@@ -114,60 +114,82 @@ class GameDesignAgent:
 
         return assets_text, skills_text
 
-    async def chat(
-        self,
-        session_id: str,
-        user_message: str,
-        current_code: str = "",
-    ) -> dict:
-        """与用户对话，理解需求并生成/修改游戏代码
-
-        Returns:
-            {
-                "reply": str,       # AI 回复文本
-                "code": str | None, # 生成的代码（如果有）
-                "action": str       # "chat" | "generate" | "modify"
-            }
-        """
+    def _build_messages(self, session_id: str, user_message: str, current_code: str = "") -> list:
+        """构建 LLM 消息列表（chat 和 stream 共用）"""
         history = self._get_session(session_id)
-
-        # 搜索知识库获取上下文
         assets_text, skills_text = self._search_context(user_message)
 
-        # 构建系统提示
         system_msg = SYSTEM_PROMPT.format(
             available_assets=assets_text,
             relevant_skills=skills_text,
             current_code=current_code[:3000] if current_code else "暂无项目代码",
         )
 
-        # 构建消息列表
         messages = [SystemMessage(content=system_msg)]
-        # 添加历史消息（最近 10 轮）
         for msg in history[-20:]:
             if msg["role"] == "user":
                 messages.append(HumanMessage(content=msg["content"]))
             else:
                 messages.append(AIMessage(content=msg["content"]))
         messages.append(HumanMessage(content=user_message))
+        return messages
 
-        # 调用 LLM
+    async def chat(
+        self,
+        session_id: str,
+        user_message: str,
+        current_code: str = "",
+    ) -> dict:
+        """非流式对话（保留兼容）"""
+        messages = self._build_messages(session_id, user_message, current_code)
+        history = self._get_session(session_id)
+
         response = await self.llm.ainvoke(messages)
         reply_text = response.content
 
-        # 记录到历史
         history.append({"role": "user", "content": user_message})
         history.append({"role": "assistant", "content": reply_text})
 
-        # 解析回复，提取代码
         code = self._extract_code(reply_text)
         action = "generate" if code and not current_code else "modify" if code else "chat"
 
-        return {
-            "reply": reply_text,
-            "code": code,
-            "action": action,
-        }
+        return {"reply": reply_text, "code": code, "action": action}
+
+    async def chat_stream(
+        self,
+        session_id: str,
+        user_message: str,
+        current_code: str = "",
+    ):
+        """流式对话 - 逐 token 返回
+
+        Yields:
+            dict: {"type": "token", "content": "..."} 逐字输出
+                  {"type": "done", "code": "...|null", "action": "..."}  完成信号
+                  {"type": "error", "content": "..."}  错误信息
+        """
+        messages = self._build_messages(session_id, user_message, current_code)
+        history = self._get_session(session_id)
+        full_reply = ""
+
+        try:
+            async for chunk in self.llm.astream(messages):
+                token = chunk.content
+                if token:
+                    full_reply += token
+                    yield {"type": "token", "content": token}
+
+            # 流结束后，记录历史并提取代码
+            history.append({"role": "user", "content": user_message})
+            history.append({"role": "assistant", "content": full_reply})
+
+            code = self._extract_code(full_reply)
+            action = "generate" if code and not current_code else "modify" if code else "chat"
+
+            yield {"type": "done", "code": code, "action": action}
+
+        except Exception as e:
+            yield {"type": "error", "content": str(e)}
 
     @staticmethod
     def _extract_code(text: str) -> str | None:

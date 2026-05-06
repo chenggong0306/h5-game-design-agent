@@ -28,7 +28,6 @@ const chatInput = document.getElementById('chat-input');
 function addMessage(content, role = 'ai') {
     const div = document.createElement('div');
     div.className = `msg ${role}`;
-    // 简单的 markdown 处理
     let html = content
         .replace(/```(\w*)\n([\s\S]*?)```/g, '<pre><code>$2</code></pre>')
         .replace(/`([^`]+)`/g, '<code>$1</code>')
@@ -37,6 +36,26 @@ function addMessage(content, role = 'ai') {
     div.innerHTML = `<div class="msg-content">${html}</div>`;
     chatMessages.appendChild(div);
     chatMessages.scrollTop = chatMessages.scrollHeight;
+    return div;
+}
+
+// 创建一个空的 AI 消息气泡（用于流式填充）
+function createStreamBubble() {
+    const div = document.createElement('div');
+    div.className = 'msg ai';
+    div.innerHTML = '<div class="msg-content"><span class="stream-cursor">▊</span></div>';
+    chatMessages.appendChild(div);
+    chatMessages.scrollTop = chatMessages.scrollHeight;
+    return div.querySelector('.msg-content');
+}
+
+// 将原始文本渲染为 HTML（简单 markdown）
+function renderMarkdown(text) {
+    return text
+        .replace(/```(\w*)\n([\s\S]*?)```/g, '<pre><code>$2</code></pre>')
+        .replace(/`([^`]+)`/g, '<code>$1</code>')
+        .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+        .replace(/\n/g, '<br>');
 }
 
 async function sendMessage() {
@@ -45,11 +64,15 @@ async function sendMessage() {
 
     addMessage(msg, 'user');
     chatInput.value = '';
-    showLoading(true);
+    document.getElementById('btn-send').disabled = true;
+
+    // 创建流式消息气泡
+    const bubble = createStreamBubble();
+    let fullText = '';
 
     try {
         const currentCode = editor ? editor.getValue() : '';
-        const res = await fetch('/api/chat', {
+        const res = await fetch('/api/chat/stream', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -60,29 +83,64 @@ async function sendMessage() {
         });
 
         if (!res.ok) {
-            // 尝试解析后端返回的错误详情
             let detail = `HTTP ${res.status}`;
-            try {
-                const errData = await res.json();
-                detail = errData.detail || detail;
-            } catch(_) {}
+            try { const d = await res.json(); detail = d.detail || detail; } catch(_) {}
             throw new Error(detail);
         }
-        const data = await res.json();
-        sessionId = data.session_id;
 
-        // 显示 AI 回复
-        addMessage(data.reply, 'ai');
+        // 读取 SSE 流
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
 
-        // 如果有生成的代码，更新编辑器
-        if (data.code) {
-            editor.setValue(data.code);
-            runGame(); // 自动运行
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop(); // 保留不完整的行
+
+            for (const line of lines) {
+                if (!line.startsWith('data: ')) continue;
+                const data = line.slice(6).trim();
+                if (data === '[DONE]') continue;
+
+                try {
+                    const event = JSON.parse(data);
+
+                    if (event.type === 'session') {
+                        sessionId = event.session_id;
+                    } else if (event.type === 'token') {
+                        fullText += event.content;
+                        // 实时渲染（每次更新整个内容，保证 markdown 正确）
+                        bubble.innerHTML = renderMarkdown(fullText) + '<span class="stream-cursor">▊</span>';
+                        chatMessages.scrollTop = chatMessages.scrollHeight;
+                    } else if (event.type === 'done') {
+                        // 移除光标，最终渲染
+                        bubble.innerHTML = renderMarkdown(fullText);
+                        // 如果有代码，更新编辑器并运行
+                        if (event.code) {
+                            editor.setValue(event.code);
+                            runGame();
+                        }
+                    } else if (event.type === 'error') {
+                        bubble.innerHTML = `<span style="color:#e74c3c">❌ ${event.content}</span>`;
+                    }
+                } catch (e) {
+                    // 忽略 JSON 解析错误
+                }
+            }
         }
+
+        // 确保光标被移除
+        const cursor = bubble.querySelector('.stream-cursor');
+        if (cursor) cursor.remove();
+
     } catch (err) {
-        addMessage(`❌ 错误: ${err.message}`, 'ai');
+        bubble.innerHTML = `<span style="color:#e74c3c">❌ 错误: ${err.message}</span>`;
     } finally {
-        showLoading(false);
+        document.getElementById('btn-send').disabled = false;
     }
 }
 

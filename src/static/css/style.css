@@ -146,6 +146,44 @@ body {
     width: 100%;
 }
 
+/* 流式输出光标 */
+.stream-cursor {
+    display: inline-block;
+    color: var(--accent);
+    animation: blink 0.6s infinite;
+    font-size: 14px;
+    margin-left: 2px;
+    vertical-align: baseline;
+}
+@keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }
+
+/* 代码块样式 */
+.msg-content pre {
+    background: #111;
+    border-radius: 6px;
+    padding: 8px 10px;
+    margin: 6px 0;
+    overflow-x: auto;
+    font-size: 12px;
+    line-height: 1.4;
+}
+.msg-content code {
+    background: rgba(255,255,255,0.1);
+    padding: 1px 4px;
+    border-radius: 3px;
+    font-size: 12px;
+}
+.msg-content pre code {
+    background: none;
+    padding: 0;
+}
+
+/* 发送按钮禁用状态 */
+#btn-send:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
 /* ============ 弹窗 ============ */
 .modal {
     position: fixed;

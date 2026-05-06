@@ -1,11 +1,13 @@
 """FastAPI 后端路由 - 游戏设计 API"""
 
 import os
+import json
 import uuid
 import tempfile
 
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException
 from fastapi.responses import FileResponse
+from starlette.responses import StreamingResponse
 from pydantic import BaseModel
 
 from src.knowledge.knowledge_base import KnowledgeBase
@@ -72,6 +74,41 @@ async def chat(req: ChatRequest):
         else:
             detail = f"AI 对话失败: {err_str}"
         raise HTTPException(status_code=500, detail=detail)
+
+
+@router.post("/api/chat/stream")
+async def chat_stream(req: ChatRequest):
+    """流式对话 - SSE (Server-Sent Events)"""
+    session_id = req.session_id or str(uuid.uuid4())
+
+    async def event_generator():
+        # 先发送 session_id
+        yield f"data: {json.dumps({'type': 'session', 'session_id': session_id}, ensure_ascii=False)}\n\n"
+        try:
+            async for chunk in agent.chat_stream(
+                session_id=session_id,
+                user_message=req.message,
+                current_code=req.current_code,
+            ):
+                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+        except Exception as e:
+            err_msg = str(e)
+            if "401" in err_msg or "api_key" in err_msg.lower():
+                err_msg = "API Key 无效或已过期，请检查 .env 配置"
+            elif "timeout" in err_msg.lower():
+                err_msg = "AI 服务响应超时，请稍后重试"
+            yield f"data: {json.dumps({'type': 'error', 'content': err_msg}, ensure_ascii=False)}\n\n"
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.delete("/api/chat/{session_id}")
