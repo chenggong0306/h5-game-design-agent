@@ -42,6 +42,60 @@ class KnowledgeBase:
 
     # ============ 素材管理 ============
 
+    def rebuild_assets_index(self) -> int:
+        """扫描 data/assets/ 目录，把已有文件重新注册到 ChromaDB。
+        用于 ChromaDB 被清空但文件还在时的恢复。
+        Returns: 重建的素材数量
+        """
+        assets_dir = Path(settings.assets_dir)
+        if not assets_dir.exists():
+            return 0
+
+        # 先获取 ChromaDB 中已有的文件路径，避免重复注册
+        existing = self.assets_collection.get()
+        existing_paths = set()
+        if existing and existing.get("metadatas"):
+            for m in existing["metadatas"]:
+                if m and m.get("file_path"):
+                    existing_paths.add(m["file_path"])
+
+        count = 0
+        # 遍历所有子目录（image/audio/spritesheet 等）
+        for asset_type_dir in assets_dir.iterdir():
+            if not asset_type_dir.is_dir():
+                continue
+            asset_type = asset_type_dir.name
+            for file_path in asset_type_dir.iterdir():
+                if not file_path.is_file() or file_path.name == ".gitkeep":
+                    continue
+                if str(file_path) in existing_paths:
+                    continue  # 已注册，跳过
+
+                # 用文件名（去掉 UUID 前缀后的原始名）作为显示名
+                ext = file_path.suffix
+                asset_id = file_path.stem  # UUID 就是 stem
+                file_name = file_path.name  # 先用完整文件名
+
+                metadata = {
+                    "asset_id": asset_id,
+                    "file_name": file_name,
+                    "asset_type": asset_type,
+                    "file_path": str(file_path),
+                    "extension": ext,
+                    "tags": "[]",
+                }
+                search_text = f"[{asset_type}] {file_name}"
+                try:
+                    self.assets_collection.add(
+                        ids=[asset_id],
+                        documents=[search_text],
+                        metadatas=[metadata],
+                    )
+                    count += 1
+                except Exception:
+                    pass  # 可能 id 已存在，忽略
+        return count
+
     def upload_asset(
         self,
         file_path: str,

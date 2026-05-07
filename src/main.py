@@ -56,11 +56,18 @@ app.include_router(router)
 
 @app.on_event("startup")
 async def startup():
-    """启动时加载默认知识"""
+    """启动时加载默认知识 + 自动恢复素材索引"""
+    # 1. 加载/更新技能文档
     count = load_default_skills(kb)
-    print(f"[Startup] Loaded {count} Phaser skill docs")
+    print(f"[Startup] Loaded {count} skill docs")
+
+    # 2. 自动恢复：扫描 data/assets/ 把已有文件重建索引（ChromaDB 被清空时救命用）
+    rebuilt = kb.rebuild_assets_index()
+    if rebuilt > 0:
+        print(f"[Startup] Rebuilt {rebuilt} asset records from disk")
+
     stats = kb.get_stats()
-    print(f"[Startup] Knowledge base stats: {stats}")
+    print(f"[Startup] KB stats: {stats}")
 
 
 @app.get("/")
