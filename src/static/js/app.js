@@ -52,6 +52,7 @@ function createStreamBubble() {
 // 将原始文本渲染为 HTML（简单 markdown）
 function renderMarkdown(text) {
     return text
+        .trim()  // 去掉开头和结尾的空白
         .replace(/```(\w*)\n([\s\S]*?)```/g, '<pre><code>$2</code></pre>')
         .replace(/`([^`]+)`/g, '<code>$1</code>')
         .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
@@ -69,6 +70,8 @@ async function sendMessage() {
     // 创建流式消息气泡
     const bubble = createStreamBubble();
     let fullText = '';
+    let toolCalls = [];
+    let toolResults = [];
 
     try {
         const currentCode = editor ? editor.getValue() : '';
@@ -111,14 +114,89 @@ async function sendMessage() {
 
                     if (event.type === 'session') {
                         sessionId = event.session_id;
+                    } else if (event.type === 'tool_call') {
+                        // 工具调用 - 立即显示
+                        toolCalls.push({ tool: event.tool, args: event.args });
+
+                        // 立即渲染工具调用
+                        let toolHtml = '';
+                        toolCalls.forEach(tc => {
+                            toolHtml += `<div style="margin:4px 0;padding:6px 10px;background:#2a2a3e;border-radius:4px;font-size:11px;">
+                                🔧 <strong>调用工具:</strong> <code>${tc.tool}</code>
+                            </div>`;
+                        });
+                        bubble.innerHTML = toolHtml + '<span class="stream-cursor">▊</span>';
+                        chatMessages.scrollTop = chatMessages.scrollHeight;
+                    } else if (event.type === 'tool_result') {
+                        // 工具执行结果 - 立即显示
+                        toolResults.push({ tool: event.tool, result: event.result });
+
+                        // 立即渲染工具调用和结果
+                        let toolHtml = '';
+                        toolCalls.forEach(tc => {
+                            toolHtml += `<div style="margin:4px 0;padding:6px 10px;background:#2a2a3e;border-radius:4px;font-size:11px;">
+                                🔧 <strong>调用工具:</strong> <code>${tc.tool}</code>
+                            </div>`;
+                        });
+                        toolResults.forEach(tr => {
+                            toolHtml += `<div style="margin:4px 0;padding:6px 10px;background:#1a3a2e;border-radius:4px;font-size:11px;">
+                                ✅ <strong>${tr.tool} 结果:</strong> <code style="color:#2ecc71;">${tr.result}</code>
+                            </div>`;
+                        });
+                        bubble.innerHTML = toolHtml + '<span class="stream-cursor">▊</span>';
+                        chatMessages.scrollTop = chatMessages.scrollHeight;
                     } else if (event.type === 'token') {
                         fullText += event.content;
-                        // 实时渲染（每次更新整个内容，保证 markdown 正确）
-                        bubble.innerHTML = renderMarkdown(fullText) + '<span class="stream-cursor">▊</span>';
+                        // 实时渲染
+                        let html = renderMarkdown(fullText);
+
+                        // 添加工具调用和结果
+                        if (toolCalls.length > 0 || toolResults.length > 0) {
+                            let toolHtml = '';
+
+                            // 显示工具调用
+                            toolCalls.forEach(tc => {
+                                toolHtml += `<div style="margin:4px 0;padding:6px 10px;background:#2a2a3e;border-radius:4px;font-size:11px;">
+                                    🔧 <strong>调用工具:</strong> <code>${tc.tool}</code>
+                                </div>`;
+                            });
+
+                            // 显示工具结果
+                            toolResults.forEach(tr => {
+                                toolHtml += `<div style="margin:4px 0;padding:6px 10px;background:#1a3a2e;border-radius:4px;font-size:11px;">
+                                    ✅ <strong>${tr.tool} 结果:</strong> <code style="color:#2ecc71;">${tr.result}</code>
+                                </div>`;
+                            });
+
+                            html = toolHtml + html;
+                        }
+
+                        bubble.innerHTML = html + '<span class="stream-cursor">▊</span>';
                         chatMessages.scrollTop = chatMessages.scrollHeight;
                     } else if (event.type === 'done') {
-                        // 移除光标，最终渲染
-                        bubble.innerHTML = renderMarkdown(fullText);
+                        // 最终渲染
+                        let html = renderMarkdown(fullText);
+
+                        // 添加工具调用和结果
+                        if (toolCalls.length > 0 || toolResults.length > 0) {
+                            let toolHtml = '';
+
+                            toolCalls.forEach(tc => {
+                                toolHtml += `<div style="margin:4px 0;padding:6px 10px;background:#2a2a3e;border-radius:4px;font-size:11px;">
+                                    🔧 <strong>调用工具:</strong> <code>${tc.tool}</code>
+                                </div>`;
+                            });
+
+                            toolResults.forEach(tr => {
+                                toolHtml += `<div style="margin:4px 0;padding:6px 10px;background:#1a3a2e;border-radius:4px;font-size:11px;">
+                                    ✅ <strong>${tr.tool} 结果:</strong> <code style="color:#2ecc71;">${tr.result}</code>
+                                </div>`;
+                            });
+
+                            html = toolHtml + html;
+                        }
+
+                        bubble.innerHTML = html;
                         if (event.code) {
                             // 有代码变更（新生成 / 编辑指令执行后的结果）
                             editor.setValue(event.code);

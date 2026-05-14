@@ -290,11 +290,15 @@ class GameDesignAgent:
             model=settings.openai_model,
             api_key=settings.openai_api_key,
             base_url=settings.openai_base_url,
-            temperature=0.7,
-            max_tokens=1000000,
+            temperature=0.6,  # 精确编码任务推荐值
+            max_tokens=8000,  # 最大输出 tokens
             timeout=120,
             max_retries=2,
-            extra_body={"thinking": {"type": "disabled"}},  # 关闭 DeepSeek thinking mode
+            model_kwargs={
+                "top_p": 0.95,
+                "presence_penalty": 0.0,
+                "frequency_penalty": 0.0,
+            }
         )
 
         self.checkpointer = MemorySaver()
@@ -337,15 +341,52 @@ class GameDesignAgent:
             async for chunk in self.agent.astream(
                 {"messages": [{"role": "user", "content": user_message}]},
                 config=config,
-                stream_mode="messages",
+                stream_mode=["messages", "updates"],
+                version="v2",
             ):
-                msg, metadata = chunk
-                # 只输出 AI 的文本 token（跳过工具调用/结果）
-                if isinstance(msg, AIMessageChunk) and msg.content:
-                    # 跳过纯工具调用的 chunk
-                    if not msg.tool_call_chunks:
+                # 处理不同类型的 chunk
+                if chunk["type"] == "messages":
+                    # 流式 token
+                    msg, metadata = chunk["data"]
+
+                    if not isinstance(msg, AIMessageChunk):
+                        continue
+
+                    # 处理文本内容
+                    if msg.content:
+                        # 跳过开头的纯空白 token（reasoning 后的换行符）
+                        if not full_reply and not msg.content.strip():
+                            continue
+
                         full_reply += msg.content
                         yield {"type": "token", "content": msg.content}
+
+                elif chunk["type"] == "updates":
+                    # 完整的节点更新（工具调用和工具结果）
+                    for node_name, update in chunk["data"].items():
+                        if "messages" in update:
+                            for msg in update["messages"]:
+                                # 工具调用（在 model 节点）
+                                if hasattr(msg, 'tool_calls') and msg.tool_calls:
+                                    for tc in msg.tool_calls:
+                                        tool_name = tc.get('name') if isinstance(tc, dict) else getattr(tc, 'name', None)
+                                        tool_args = tc.get('args') if isinstance(tc, dict) else getattr(tc, 'args', {})
+                                        if tool_name:
+                                            yield {
+                                                "type": "tool_call",
+                                                "tool": tool_name,
+                                                "args": str(tool_args)[:100] + "..." if len(str(tool_args)) > 100 else str(tool_args)
+                                            }
+
+                                # 工具结果（在 tools 节点）
+                                if type(msg).__name__ == "ToolMessage":
+                                    tool_name = getattr(msg, 'name', 'unknown')
+                                    tool_content = getattr(msg, 'content', '')
+                                    yield {
+                                        "type": "tool_result",
+                                        "tool": tool_name,
+                                        "result": tool_content[:200] + "..." if len(str(tool_content)) > 200 else str(tool_content)
+                                    }
 
             # 流结束，提取代码
             code = self._extract_code(full_reply)
