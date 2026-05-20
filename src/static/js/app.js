@@ -3,7 +3,7 @@
  */
 
 let editor = null;       // Monaco Editor 实例
-let sessionId = '';       // 当前会话 ID
+let sessionId = localStorage.getItem('gameDesignSessionId') || '';       // 当前会话 ID
 let currentProjectId = ''; // 当前项目 ID
 
 // ============ 初始化 Monaco Editor ============
@@ -59,6 +59,90 @@ function renderMarkdown(text) {
         .replace(/\n/g, '<br>');
 }
 
+function renderToolHtml(toolCalls, toolResults) {
+    if (!toolCalls.length && !toolResults.length) return '';
+    let toolHtml = '';
+    toolCalls.forEach(tc => {
+        toolHtml += `<div style="margin:4px 0;padding:6px 10px;background:#2a2a3e;border-radius:4px;font-size:11px;">🔧 <strong>调用工具:</strong> <code>${tc.tool}</code></div>`;
+    });
+    toolResults.forEach(tr => {
+        toolHtml += `<div style="margin:4px 0;padding:6px 10px;background:#1a3a2e;border-radius:4px;font-size:11px;">✅ <strong>${tr.tool} 结果:</strong> <code style="color:#2ecc71;">${tr.result}</code></div>`;
+    });
+    return toolHtml;
+}
+
+function renderStreamMessage(bubble, fullText, toolCalls, toolResults, showCursor = true) {
+    let html = renderMarkdown(fullText);
+    const toolHtml = renderToolHtml(toolCalls, toolResults);
+    if (toolHtml) html = toolHtml + html;
+    bubble.innerHTML = html + (showCursor ? '<span class="stream-cursor">▊</span>' : '');
+}
+
+function setSessionId(id) {
+    sessionId = id || '';
+    if (sessionId) localStorage.setItem('gameDesignSessionId', sessionId);
+    else localStorage.removeItem('gameDesignSessionId');
+}
+
+async function loadChatHistory(session) {
+    if (!session) return false;
+    try {
+        const res = await fetch(`/api/chat/${session}/history`);
+        if (!res.ok) return false;
+        const data = await res.json();
+        const messages = Array.isArray(data.messages) ? data.messages : [];
+        if (!messages.length) return false;
+        chatMessages.innerHTML = '';
+        messages.forEach(m => addMessage(m.content || '', m.role === 'user' ? 'user' : 'ai'));
+        return true;
+    } catch (_) {
+        return false;
+    }
+}
+
+async function loadHistorySessions() {
+    const res = await fetch('/api/chat/history');
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
+}
+
+async function openHistoryModal() {
+    const list = document.getElementById('history-list');
+    list.innerHTML = '<p style="color:#aaa;text-align:center">加载中...</p>';
+    openModal('modal-history');
+    try {
+        const sessions = await loadHistorySessions();
+        if (!sessions.length) {
+            list.innerHTML = '<p style="color:#aaa;text-align:center">暂无历史记录</p>';
+            return;
+        }
+        list.innerHTML = sessions.map(s => `
+            <div class="history-item">
+                <div class="top">
+                    <div>
+                        <div class="title">${s.title || '未命名会话'}</div>
+                        <div class="meta">${s.message_count || 0} 条消息${s.updated_at ? ' · ' + s.updated_at : ''}</div>
+                    </div>
+                    <button onclick="openChatSession('${s.session_id}')">打开</button>
+                </div>
+            </div>
+        `).join('');
+    } catch (err) {
+        list.innerHTML = `<p style="color:#e74c3c">加载失败: ${err.message}</p>`;
+    }
+}
+
+async function openChatSession(id) {
+    setSessionId(id);
+    await loadChatHistory(id);
+    closeModal('modal-history');
+}
+
+window.openHistoryModal = openHistoryModal;
+window.openChatSession = openChatSession;
+window.setSessionId = setSessionId;
+
+
 async function sendMessage() {
     const msg = chatInput.value.trim();
     if (!msg) return;
@@ -113,7 +197,7 @@ async function sendMessage() {
                     const event = JSON.parse(data);
 
                     if (event.type === 'session') {
-                        sessionId = event.session_id;
+                        setSessionId(event.session_id);
                     } else if (event.type === 'tool_call') {
                         // 工具调用 - 立即显示
                         toolCalls.push({ tool: event.tool, args: event.args });
@@ -252,7 +336,9 @@ document.getElementById('btn-clear-chat').addEventListener('click', async () => 
 
 // 对话历史
 const btnHistory = document.getElementById('btn-history');
-btnHistory.addEventListener('click', openHistoryModal);
+if (btnHistory) {
+    btnHistory.addEventListener('click', openHistoryModal);
+}
 
 (async () => {
     if (sessionId) {
