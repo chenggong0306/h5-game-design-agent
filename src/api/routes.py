@@ -1,9 +1,12 @@
 """FastAPI 后端路由 - 游戏设计 API"""
 
-import os
 import json
-import uuid
+import os
 import tempfile
+import uuid
+
+from datetime import datetime, timezone
+from pathlib import Path
 
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException
 from fastapi.responses import FileResponse
@@ -21,6 +24,54 @@ agent = GameDesignAgent(kb)
 
 
 # ============ 请求/响应模型 ============
+
+CHAT_HISTORY_DIR = Path(__file__).resolve().parents[2] / "data" / "chat_history"
+CHAT_HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _history_path(session_id: str) -> Path:
+    return CHAT_HISTORY_DIR / f"{session_id}.json"
+
+
+def _load_chat_history(session_id: str) -> list[dict]:
+    path = _history_path(session_id)
+    if not path.exists():
+        return []
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+
+
+def _save_chat_history(session_id: str, history: list[dict]) -> None:
+    path = _history_path(session_id)
+    path.write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _append_chat_history(session_id: str, role: str, content: str) -> None:
+    history = _load_chat_history(session_id)
+    history.append({
+        "role": role,
+        "content": content,
+        "ts": datetime.now(timezone.utc).isoformat(),
+    })
+    _save_chat_history(session_id, history)
+
+
+def _build_session_summary(session_id: str) -> dict:
+    history = _load_chat_history(session_id)
+    title = "新对话"
+    for item in history:
+        if item.get("role") == "user" and item.get("content"):
+            title = item["content"].strip().replace("\n", " ")[:32]
+            break
+    return {
+        "session_id": session_id,
+        "title": title,
+        "message_count": len(history),
+        "updated_at": history[-1]["ts"] if history else None,
+    }
+
 
 class ChatRequest(BaseModel):
     session_id: str = ""
@@ -61,6 +112,8 @@ async def chat(req: ChatRequest):
             user_message=req.message,
             current_code=req.current_code,
         )
+        _append_chat_history(session_id, "user", req.message)
+        _append_chat_history(session_id, "ai", result.get("reply", ""))
         return ChatResponse(session_id=session_id, **result)
     except Exception as e:
         err_str = str(e)
@@ -82,6 +135,8 @@ async def chat_stream(req: ChatRequest):
     session_id = req.session_id or str(uuid.uuid4())
 
     async def event_generator():
+        assistant_text = ""
+        _append_chat_history(session_id, "user", req.message)
         # 先发送 session_id
         yield f"data: {json.dumps({'type': 'session', 'session_id': session_id}, ensure_ascii=False)}\n\n"
         try:
@@ -90,6 +145,10 @@ async def chat_stream(req: ChatRequest):
                 user_message=req.message,
                 current_code=req.current_code,
             ):
+                if chunk.get("type") == "token":
+                    assistant_text += chunk.get("content", "")
+                elif chunk.get("type") == "done" and assistant_text.strip():
+                    _append_chat_history(session_id, "ai", assistant_text)
                 yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
         except Exception as e:
             err_msg = str(e)
@@ -111,14 +170,33 @@ async def chat_stream(req: ChatRequest):
     )
 
 
+@router.get("/api/chat/history")
+async def list_chat_history():
+    """列出所有对话历史会话"""
+    sessions = []
+    for path in sorted(CHAT_HISTORY_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+        session_id = path.stem
+        sessions.append(_build_session_summary(session_id))
+    return sessions
+
+
+@router.get("/api/chat/{session_id}/history")
+async def get_chat_history(session_id: str):
+    """获取指定会话的消息历史"""
+    return {"session_id": session_id, "messages": _load_chat_history(session_id)}
+
+
 @router.delete("/api/chat/{session_id}")
 async def clear_chat(session_id: str):
     """清除对话历史"""
     agent.clear_session(session_id)
+    path = _history_path(session_id)
+    if path.exists():
+        path.unlink()
     return {"ok": True}
 
 
-# ============ 素材 API ============
+
 
 @router.post("/api/assets/upload")
 async def upload_asset(

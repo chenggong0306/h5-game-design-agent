@@ -17,6 +17,10 @@ data/chroma_db/
 data/assets/**
 !data/assets/.gitkeep
 
+# 对话历史（运行时生成）
+data/chat_history/
+
+
 # IDE
 .vscode/
 .idea/

@@ -249,6 +249,34 @@ ctx.clearRect(0, 0, canvas.width, canvas.height); // 1. 清空
 // 4. 画 UI（分数、血条等，最后画，不被遮挡）
 ```
 
+
+### 9. 启动与初始化顺序（必须严格遵守）
+```javascript
+// 推荐顺序：
+// 1) 先声明所有全局状态（player、enemies、bullets、state 等）
+// 2) 再定义依赖这些状态的函数（resize / update / draw / input handlers）
+// 3) 再初始化状态对象
+// 4) 再调用 resize() / init() / resetGame()
+// 5) 最后注册事件监听和开启 gameLoop()
+//
+// 禁止：在 player / state / canvas 还未初始化时就调用 resize()、update()、draw() 或事件回调
+// 禁止：使用 let/const 声明的变量在声明前被函数访问（避免 Temporal Dead Zone）
+// 禁止：把 window.addEventListener('resize', resize) 放在 player 初始化之前
+//
+// 更安全的写法：
+// let player = null;
+// function resize() { if (!player) return; /* ... */ }
+// player = createPlayer();
+// resize();
+// window.addEventListener('resize', resize);
+```
+
+### 10. 黑屏防护清单（生成前自检）
+- 所有全局状态必须先初始化，再进入首帧绘制
+- 所有 resize 逻辑必须空值保护，不能直接读未初始化对象
+- 所有 requestAnimationFrame / setInterval 启动必须放在 init 完成之后
+- 如果报错涉及 `Cannot access 'xxx' before initialization`，优先检查声明顺序，而不是先改样式或素材
+
 ---
 
 ## 【素材使用规则】
@@ -286,20 +314,61 @@ class GameDesignAgent:
         global _kb
         _kb = knowledge_base
 
-        model = ChatOpenAI(
-            model=settings.openai_model,
-            api_key=settings.openai_api_key,
-            base_url=settings.openai_base_url,
-            temperature=0.6,  # 精确编码任务推荐值
-            max_tokens=8000,  # 最大输出 tokens
-            timeout=120,
-            max_retries=2,
-            model_kwargs={
-                "top_p": 0.95,
-                "presence_penalty": 0.0,
-                "frequency_penalty": 0.0,
-            }
-        )
+        provider = settings.llm_provider.lower().strip()
+        base_url_hint = (settings.openai_base_url or "").lower()
+        model_hint = (settings.openai_model or "").lower()
+        if provider == "openai" and ("api.deepseek.com" in base_url_hint or model_hint.startswith("deepseek")):
+            provider = "deepseek"
+        elif provider == "openai" and ("qwen" in model_hint or "autodl" in base_url_hint):
+            provider = "qwen"
+
+        if provider == "deepseek":
+            api_key = settings.deepseek_api_key or settings.openai_api_key
+            base_url = settings.deepseek_base_url or settings.openai_base_url
+            model_name = settings.deepseek_model or settings.openai_model
+            model = ChatOpenAI(
+                model=model_name,
+                api_key=api_key,
+                base_url=base_url,
+                temperature=0.6,
+                max_tokens=8000,
+                top_p=0.95,
+                presence_penalty=0.0,
+                frequency_penalty=0.0,
+                timeout=120,
+                max_retries=2,
+                extra_body={"thinking": {"type": "disabled"}},
+            )
+        elif provider == "qwen":
+            api_key = settings.qwen_api_key or settings.openai_api_key
+            base_url = settings.qwen_base_url or settings.openai_base_url
+            model_name = settings.qwen_model or settings.openai_model
+            model = ChatOpenAI(
+                model=model_name,
+                api_key=api_key,
+                base_url=base_url,
+                temperature=0.6,
+                max_tokens=8000,
+                top_p=0.95,
+                presence_penalty=0.0,
+                frequency_penalty=0.0,
+                timeout=120,
+                max_retries=2,
+            )
+        else:
+            model = ChatOpenAI(
+                model=settings.openai_model,
+                api_key=settings.openai_api_key,
+                base_url=settings.openai_base_url,
+                temperature=0.6,
+                max_tokens=8000,
+                top_p=0.95,
+                presence_penalty=0.0,
+                frequency_penalty=0.0,
+                timeout=120,
+                max_retries=2,
+            )
+
 
         self.checkpointer = MemorySaver()
         self.agent = create_agent(
@@ -347,7 +416,7 @@ class GameDesignAgent:
                 # 处理不同类型的 chunk
                 if chunk["type"] == "messages":
                     # 流式 token
-                    msg, metadata = chunk["data"]
+                    msg = chunk["data"][0]
 
                     if not isinstance(msg, AIMessageChunk):
                         continue
@@ -363,7 +432,7 @@ class GameDesignAgent:
 
                 elif chunk["type"] == "updates":
                     # 完整的节点更新（工具调用和工具结果）
-                    for node_name, update in chunk["data"].items():
+                    for update in chunk["data"].values():
                         if "messages" in update:
                             for msg in update["messages"]:
                                 # 工具调用（在 model 节点）
@@ -414,7 +483,7 @@ class GameDesignAgent:
                 return code
         return None
 
-    def clear_session(self, session_id: str):
-        """清除会话历史"""
+    def clear_session(self, _session_id: str):
+        del _session_id
         # MemorySaver 不支持删除，但新 thread_id 即可
         pass

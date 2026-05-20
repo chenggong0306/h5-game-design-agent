@@ -245,10 +245,21 @@ document.getElementById('btn-clear-chat').addEventListener('click', async () => 
     if (sessionId) {
         await fetch(`/api/chat/${sessionId}`, { method: 'DELETE' });
     }
-    sessionId = '';
+    setSessionId('');
     chatMessages.innerHTML = '';
     addMessage('👋 对话已清除。告诉我你想做什么游戏吧！', 'ai');
 });
+
+// 对话历史
+const btnHistory = document.getElementById('btn-history');
+btnHistory.addEventListener('click', openHistoryModal);
+
+(async () => {
+    if (sessionId) {
+        await loadChatHistory(sessionId);
+    }
+})();
+
 
 // ============ 游戏预览 ============
 function runGame() {

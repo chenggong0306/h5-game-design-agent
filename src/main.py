@@ -19,7 +19,9 @@ load_dotenv(_ENV_PATH, override=True)
 
 import uvicorn
 from fastapi import FastAPI
+from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
+
 from fastapi.templating import Jinja2Templates
 from fastapi.requests import Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -80,6 +82,19 @@ async def index(request: Request):
 async def preview_page(request: Request):
     """游戏预览页面"""
     return templates.TemplateResponse(request=request, name="preview.html")
+
+
+
+@app.get("/favicon.ico")
+async def favicon():
+    """屏蔽浏览器默认 favicon 请求"""
+    return Response(status_code=204)
+
+
+@app.get("/.well-known/appspecific/com.chrome.devtools.json")
+async def chrome_devtools_config():
+    """屏蔽 Chrome DevTools 自动探测请求"""
+    return Response(status_code=204)
 
 
 if __name__ == "__main__":

@@ -16,6 +16,8 @@
             <button id="btn-save" title="保存项目">💾 保存</button>
             <button id="btn-load" title="加载项目">📂 项目</button>
             <button id="btn-assets" title="素材管理">🎨 素材</button>
+            <button id="btn-history" title="对话历史">📜 历史</button>
+
         </div>
     </header>
 
@@ -101,6 +103,19 @@
             </div>
             <div class="modal-body">
                 <div id="projects-list" class="projects-list"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 对话历史弹窗 -->
+    <div id="modal-history" class="modal hidden">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>📜 对话历史</h2>
+                <button class="modal-close" onclick="closeModal('modal-history')">✕</button>
+            </div>
+            <div class="modal-body">
+                <div id="history-list" class="history-list"></div>
             </div>
         </div>
     </div>
