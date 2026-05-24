@@ -5,6 +5,8 @@
 let editor = null;       // Monaco Editor 实例
 let sessionId = localStorage.getItem('gameDesignSessionId') || '';       // 当前会话 ID
 let currentProjectId = ''; // 当前项目 ID
+let pendingLatestCode = null; // Monaco 尚未初始化时，临时保存要恢复的历史代码
+
 
 // ============ 初始化 Monaco Editor ============
 require.config({ paths: { vs: 'https://cdn.jsdelivr.net/npm/monaco-editor@0.45.0/min/vs' } });
@@ -19,11 +21,26 @@ require(['vs/editor/editor.main'], function () {
         automaticLayout: true,
         tabSize: 2,
     });
+
+    if (pendingLatestCode !== null) {
+        restoreEditorCode(pendingLatestCode);
+        pendingLatestCode = null;
+    }
 });
+
 
 // ============ 对话功能 ============
 const chatMessages = document.getElementById('chat-messages');
 const chatInput = document.getElementById('chat-input');
+const contextMeter = document.getElementById('context-meter');
+const contextPercent = document.getElementById('context-percent');
+const contextRing = document.getElementById('context-ring');
+
+let activeStreamState = null;
+
+
+let currentStreamController = null;
+let isStreaming = false;
 
 function addMessage(content, role = 'ai') {
     const div = document.createElement('div');
@@ -59,24 +76,152 @@ function renderMarkdown(text) {
         .replace(/\n/g, '<br>');
 }
 
-function renderToolHtml(toolCalls, toolResults) {
-    if (!toolCalls.length && !toolResults.length) return '';
-    let toolHtml = '';
-    toolCalls.forEach(tc => {
-        toolHtml += `<div style="margin:4px 0;padding:6px 10px;background:#2a2a3e;border-radius:4px;font-size:11px;">🔧 <strong>调用工具:</strong> <code>${tc.tool}</code></div>`;
-    });
-    toolResults.forEach(tr => {
-        toolHtml += `<div style="margin:4px 0;padding:6px 10px;background:#1a3a2e;border-radius:4px;font-size:11px;">✅ <strong>${tr.tool} 结果:</strong> <code style="color:#2ecc71;">${tr.result}</code></div>`;
-    });
-    return toolHtml;
+function escapeHtml(value) {
+    return String(value ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
 }
 
-function renderStreamMessage(bubble, fullText, toolCalls, toolResults, showCursor = true) {
-    let html = renderMarkdown(fullText);
-    const toolHtml = renderToolHtml(toolCalls, toolResults);
-    if (toolHtml) html = toolHtml + html;
-    bubble.innerHTML = html + (showCursor ? '<span class="stream-cursor">▊</span>' : '');
+function getToolMeta(tool) {
+    const map = {
+        list_all_assets: ['🧩', '列出素材'],
+        search_assets: ['🔎', '搜索素材'],
+        search_knowledge: ['📚', '检索知识库'],
+        search_code: ['⌕', '搜索代码'],
+        view_code: ['👁', '查看代码'],
+        str_replace_code: ['✏️', '替换代码'],
+        replace_code_lines: ['🧵', '按行替换'],
+        write_game_code: ['✍️', '写入 game.html'],
+        insert_code: ['➕', '插入代码'],
+        delete_code: ['🗑️', '删除代码'],
+    };
+    return map[tool] || ['🔧', tool || '工具调用'];
 }
+
+function formatToolPayload(value) {
+    if (!value) return '无';
+    try {
+        const parsed = typeof value === 'string' ? JSON.parse(value.replace(/'/g, '"')) : value;
+        return JSON.stringify(parsed, null, 2);
+    } catch (_) {
+        return String(value);
+    }
+}
+
+function isToolErrorResult(result) {
+    const text = String(result || '');
+    return text.includes('Error invoking tool')
+        || text.includes('Field required')
+        || text.includes('写入失败')
+        || text.includes('调用失败');
+}
+function formatTokenCount(value) {
+    const num = Number(value || 0);
+    if (num >= 1000000) return `${(num / 1000000).toFixed(1)}M`;
+    if (num >= 1000) return `${Math.round(num / 1000)}K`;
+    return String(Math.round(num));
+}
+
+function updateContextMeter(usage = {}) {
+    if (!contextMeter || !contextPercent || !contextRing) return;
+    const used = Number(usage.used_tokens || 0);
+    const max = Number(usage.max_tokens || 131072);
+    const percent = Math.max(0, Math.min(100, Number(usage.percent || (used / max * 100))));
+    const compacted = Boolean(usage.compacted);
+    contextPercent.textContent = `${Math.round(percent)}%`;
+    contextRing.style.strokeDasharray = `${percent} 100`;
+    contextMeter.classList.toggle('warning', percent >= 65 && percent < 80);
+    contextMeter.classList.toggle('danger', percent >= 80);
+    contextMeter.classList.toggle('compacted', compacted);
+    const compactText = compacted ? ' · 已自动压缩' : '';
+    contextMeter.title = `${percent.toFixed(1)}% · ${formatTokenCount(used)} / ${formatTokenCount(max)} context used${compactText}`;
+}
+
+updateContextMeter();
+
+
+
+function renderToolCard(item) {
+    const [icon, title] = getToolMeta(item.tool);
+    const statusText = item.status === 'done' ? '完成' : item.status === 'error' ? '失败' : '运行中';
+    const resultText = item.result ? formatToolPayload(item.result) : '等待工具返回...';
+    return `
+        <div class="tool-card ${item.open ? 'open' : ''}" data-tool-id="${item.id}">
+            <button class="tool-card-header" type="button" onclick="toggleToolCard('${item.id}')">
+                <span class="tool-chevron">${item.open ? '⌄' : '›'}</span>
+                <span class="tool-icon">${icon}</span>
+                <span class="tool-title">${escapeHtml(title)}</span>
+                <span class="tool-status ${item.status}">${statusText}</span>
+            </button>
+            ${item.open ? `
+                <div class="tool-card-body">
+                    <div class="tool-section">
+                        <div class="tool-section-title">参数</div>
+                        <pre>${escapeHtml(formatToolPayload(item.args))}</pre>
+                    </div>
+                    <div class="tool-section">
+                        <div class="tool-section-title">结果</div>
+                        <pre>${escapeHtml(resultText)}</pre>
+                    </div>
+                </div>
+            ` : ''}
+        </div>
+    `;
+}
+
+function renderEditLogCard(block) {
+    const logHtml = (block.logs || [])
+        .map(l => `<span style="color:${l.includes('FAILED')?'#e74c3c':'#2ecc71'}">${escapeHtml(l)}</span>`)
+        .join('<br>');
+    return `<div class="edit-log-card">📝 执行了 ${block.editsCount || 0} 个编辑操作：<br>${logHtml}</div>`;
+}
+
+function ensureTextBlock(state) {
+    const last = state.blocks[state.blocks.length - 1];
+    if (last && last.type === 'text') return last;
+    const block = { type: 'text', content: '' };
+    state.blocks.push(block);
+    return block;
+}
+
+function renderStreamMessage(state, showCursor = true) {
+    if (!state) return;
+    const html = state.blocks.map(block => {
+        if (block.type === 'tool') {
+            return `<div class="tool-timeline">${renderToolCard(block.item)}</div>`;
+        }
+        if (block.type === 'edit-log') {
+            return renderEditLogCard(block);
+        }
+        const textHtml = renderMarkdown(block.content || '');
+        return textHtml ? `<div class="assistant-text">${textHtml}</div>` : '';
+    }).join('');
+    state.bubble.innerHTML = html + (showCursor ? '<span class="stream-cursor">▊</span>' : '');
+    chatMessages.scrollTop = chatMessages.scrollHeight;
+}
+
+window.toggleToolCard = function(id) {
+    if (!activeStreamState) return;
+    const item = activeStreamState.toolEvents.find(t => t.id === id);
+    if (!item) return;
+    item.open = !item.open;
+    renderStreamMessage(activeStreamState, !activeStreamState.done);
+};
+
+function restoreEditorCode(code) {
+    if (!editor) {
+        pendingLatestCode = code;
+        return;
+    }
+    const value = code || '<!-- 这个历史会话暂时没有保存代码快照 -->\n';
+    editor.setValue(value);
+    if (code) runGame();
+    else document.getElementById('game-preview').srcdoc = '';
+}
+
 
 function setSessionId(id) {
     sessionId = id || '';
@@ -94,6 +239,9 @@ async function loadChatHistory(session) {
         if (!messages.length) return false;
         chatMessages.innerHTML = '';
         messages.forEach(m => addMessage(m.content || '', m.role === 'user' ? 'user' : 'ai'));
+        if (typeof data.latest_code === 'string') {
+            restoreEditorCode(data.latest_code);
+        }
         return true;
     } catch (_) {
         return false;
@@ -123,7 +271,10 @@ async function openHistoryModal() {
                         <div class="title">${s.title || '未命名会话'}</div>
                         <div class="meta">${s.message_count || 0} 条消息${s.updated_at ? ' · ' + s.updated_at : ''}</div>
                     </div>
-                    <button onclick="openChatSession('${s.session_id}')">打开</button>
+                    <div class="history-actions">
+                        <button type="button" onclick="openChatSession('${s.session_id}')">打开</button>
+                        <button type="button" class="danger" onclick="deleteChatSession('${s.session_id}')">删除</button>
+                    </div>
                 </div>
             </div>
         `).join('');
@@ -138,24 +289,70 @@ async function openChatSession(id) {
     closeModal('modal-history');
 }
 
+async function deleteChatSession(id) {
+    if (!confirm('确定删除这条历史对话？对应的 AI 上下文也会删除。')) return;
+    try {
+        const res = await fetch(`/api/chat/${id}`, { method: 'DELETE' });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        if (id === sessionId) {
+            setSessionId('');
+            chatMessages.innerHTML = '';
+            addMessage('👋 当前历史对话已删除。告诉我你想做什么游戏吧！', 'ai');
+            restoreEditorCode('');
+        }
+        await openHistoryModal();
+    } catch (err) {
+        alert('❌ 删除失败: ' + err.message);
+    }
+}
+
+
 window.openHistoryModal = openHistoryModal;
 window.openChatSession = openChatSession;
 window.setSessionId = setSessionId;
 
+function setStreamingUI(streaming) {
+    const sendButton = document.getElementById('btn-send');
+    isStreaming = streaming;
+    sendButton.disabled = false;
+    sendButton.textContent = streaming ? '停止 ■' : '发送 ⏎';
+    sendButton.classList.toggle('stop-mode', streaming);
+    chatInput.disabled = streaming;
+}
+
+function stopCurrentStream() {
+    if (!isStreaming || !currentStreamController) return;
+    currentStreamController.abort();
+}
+
+window.deleteChatSession = deleteChatSession;
+
+
 
 async function sendMessage() {
+    if (isStreaming) {
+        stopCurrentStream();
+        return;
+    }
+
     const msg = chatInput.value.trim();
     if (!msg) return;
 
     addMessage(msg, 'user');
     chatInput.value = '';
-    document.getElementById('btn-send').disabled = true;
+    currentStreamController = new AbortController();
+    setStreamingUI(true);
 
     // 创建流式消息气泡
     const bubble = createStreamBubble();
-    let fullText = '';
-    let toolCalls = [];
-    let toolResults = [];
+    activeStreamState = {
+        bubble,
+        blocks: [],
+        toolEvents: [],
+        toolSeq: 0,
+        done: false,
+        codeUpdated: false,
+    };
 
     try {
         const currentCode = editor ? editor.getValue() : '';
@@ -167,6 +364,7 @@ async function sendMessage() {
                 message: msg,
                 current_code: currentCode,
             }),
+            signal: currentStreamController.signal,
         });
 
         if (!res.ok) {
@@ -199,104 +397,80 @@ async function sendMessage() {
                     if (event.type === 'session') {
                         setSessionId(event.session_id);
                     } else if (event.type === 'tool_call') {
-                        // 工具调用 - 立即显示
-                        toolCalls.push({ tool: event.tool, args: event.args });
-
-                        // 立即渲染工具调用
-                        let toolHtml = '';
-                        toolCalls.forEach(tc => {
-                            toolHtml += `<div style="margin:4px 0;padding:6px 10px;background:#2a2a3e;border-radius:4px;font-size:11px;">
-                                🔧 <strong>调用工具:</strong> <code>${tc.tool}</code>
-                            </div>`;
-                        });
-                        bubble.innerHTML = toolHtml + '<span class="stream-cursor">▊</span>';
-                        chatMessages.scrollTop = chatMessages.scrollHeight;
+                        activeStreamState.toolSeq += 1;
+                        const toolId = event.id || `tool-${Date.now()}-${activeStreamState.toolSeq}`;
+                        const item = {
+                            id: toolId,
+                            tool: event.tool,
+                            args: event.args || '',
+                            result: '',
+                            status: 'running',
+                            open: false,
+                        };
+                        activeStreamState.toolEvents.push(item);
+                        activeStreamState.blocks.push({ type: 'tool', item });
+                        renderStreamMessage(activeStreamState, true);
                     } else if (event.type === 'tool_result') {
-                        // 工具执行结果 - 立即显示
-                        toolResults.push({ tool: event.tool, result: event.result });
-
-                        // 立即渲染工具调用和结果
-                        let toolHtml = '';
-                        toolCalls.forEach(tc => {
-                            toolHtml += `<div style="margin:4px 0;padding:6px 10px;background:#2a2a3e;border-radius:4px;font-size:11px;">
-                                🔧 <strong>调用工具:</strong> <code>${tc.tool}</code>
-                            </div>`;
-                        });
-                        toolResults.forEach(tr => {
-                            toolHtml += `<div style="margin:4px 0;padding:6px 10px;background:#1a3a2e;border-radius:4px;font-size:11px;">
-                                ✅ <strong>${tr.tool} 结果:</strong> <code style="color:#2ecc71;">${tr.result}</code>
-                            </div>`;
-                        });
-                        bubble.innerHTML = toolHtml + '<span class="stream-cursor">▊</span>';
-                        chatMessages.scrollTop = chatMessages.scrollHeight;
+                        const target = event.id
+                            ? activeStreamState.toolEvents.find(t => t.id === event.id)
+                            : [...activeStreamState.toolEvents]
+                                .reverse()
+                                .find(t => t.tool === event.tool && t.status === 'running');
+                        if (target) {
+                            target.result = event.result || '';
+                            target.status = isToolErrorResult(target.result) ? 'error' : 'done';
+                        } else {
+                            activeStreamState.toolSeq += 1;
+                            const toolId = event.id || `tool-${Date.now()}-${activeStreamState.toolSeq}`;
+                            const item = {
+                                id: toolId,
+                                tool: event.tool,
+                                args: '',
+                                result: event.result || '',
+                                status: isToolErrorResult(event.result) ? 'error' : 'done',
+                                open: false,
+                            };
+                            activeStreamState.toolEvents.push(item);
+                            activeStreamState.blocks.push({ type: 'tool', item });
+                        }
+                        renderStreamMessage(activeStreamState, true);
                     } else if (event.type === 'token') {
-                        fullText += event.content;
-                        // 实时渲染
-                        let html = renderMarkdown(fullText);
+                        ensureTextBlock(activeStreamState).content += event.content;
+                        renderStreamMessage(activeStreamState, true);
+                    } else if (event.type === 'context_usage') {
+                        updateContextMeter(event);
 
-                        // 添加工具调用和结果
-                        if (toolCalls.length > 0 || toolResults.length > 0) {
-                            let toolHtml = '';
-
-                            // 显示工具调用
-                            toolCalls.forEach(tc => {
-                                toolHtml += `<div style="margin:4px 0;padding:6px 10px;background:#2a2a3e;border-radius:4px;font-size:11px;">
-                                    🔧 <strong>调用工具:</strong> <code>${tc.tool}</code>
-                                </div>`;
-                            });
-
-                            // 显示工具结果
-                            toolResults.forEach(tr => {
-                                toolHtml += `<div style="margin:4px 0;padding:6px 10px;background:#1a3a2e;border-radius:4px;font-size:11px;">
-                                    ✅ <strong>${tr.tool} 结果:</strong> <code style="color:#2ecc71;">${tr.result}</code>
-                                </div>`;
-                            });
-
-                            html = toolHtml + html;
-                        }
-
-                        bubble.innerHTML = html + '<span class="stream-cursor">▊</span>';
-                        chatMessages.scrollTop = chatMessages.scrollHeight;
-                    } else if (event.type === 'done') {
-                        // 最终渲染
-                        let html = renderMarkdown(fullText);
-
-                        // 添加工具调用和结果
-                        if (toolCalls.length > 0 || toolResults.length > 0) {
-                            let toolHtml = '';
-
-                            toolCalls.forEach(tc => {
-                                toolHtml += `<div style="margin:4px 0;padding:6px 10px;background:#2a2a3e;border-radius:4px;font-size:11px;">
-                                    🔧 <strong>调用工具:</strong> <code>${tc.tool}</code>
-                                </div>`;
-                            });
-
-                            toolResults.forEach(tr => {
-                                toolHtml += `<div style="margin:4px 0;padding:6px 10px;background:#1a3a2e;border-radius:4px;font-size:11px;">
-                                    ✅ <strong>${tr.tool} 结果:</strong> <code style="color:#2ecc71;">${tr.result}</code>
-                                </div>`;
-                            });
-
-                            html = toolHtml + html;
-                        }
-
-                        bubble.innerHTML = html;
-                        if (event.code) {
-                            // 有代码变更（新生成 / 编辑指令执行后的结果）
+                    } else if (event.type === 'code_update') {
+                        if (editor && event.code) {
                             editor.setValue(event.code);
                             runGame();
+                            activeStreamState.codeUpdated = true;
+                        }
+                        renderStreamMessage(activeStreamState, true);
 
-                            // 显示编辑日志
-                            if (event.action === 'edit' && event.edit_logs) {
-                                const logHtml = event.edit_logs
-                                    .map(l => `<span style="color:${l.includes('FAILED')?'#e74c3c':'#2ecc71'}">${l}</span>`)
-                                    .join('<br>');
-                                bubble.innerHTML += `<div style="margin-top:8px;padding:6px 10px;background:#111;border-radius:6px;font-size:12px;font-family:monospace">
-                                    📝 执行了 ${event.edits_count} 个编辑操作：<br>${logHtml}</div>`;
-                            }
+                    } else if (event.type === 'done') {
+                        activeStreamState.done = true;
+                        renderStreamMessage(activeStreamState, false);
+
+                        if (event.code && !activeStreamState.codeUpdated) {
+                            // 没有收到过 code_update 时，done 保留兜底同步
+                            editor.setValue(event.code);
+                            runGame();
+                        }
+
+                        // 显示编辑日志，不依赖 editor 是否需要兜底同步
+                        if (event.action === 'edit' && event.edit_logs) {
+                            activeStreamState.blocks.push({
+                                type: 'edit-log',
+                                editsCount: event.edits_count,
+                                logs: event.edit_logs,
+                            });
+                            renderStreamMessage(activeStreamState, false);
                         }
                     } else if (event.type === 'error') {
-                        bubble.innerHTML = `<span style="color:#e74c3c">❌ ${event.content}</span>`;
+                        activeStreamState.done = true;
+                        ensureTextBlock(activeStreamState).content += `\n❌ ${event.content}`;
+                        renderStreamMessage(activeStreamState, false);
                     }
                 } catch (e) {
                     // 忽略 JSON 解析错误
@@ -309,9 +483,16 @@ async function sendMessage() {
         if (cursor) cursor.remove();
 
     } catch (err) {
-        bubble.innerHTML = `<span style="color:#e74c3c">❌ 错误: ${err.message}</span>`;
+        activeStreamState.done = true;
+        if (err.name === 'AbortError') {
+            ensureTextBlock(activeStreamState).content += '\n⏹️ 已停止生成。';
+        } else {
+            ensureTextBlock(activeStreamState).content += `\n❌ 错误: ${err.message}`;
+        }
+        renderStreamMessage(activeStreamState, false);
     } finally {
-        document.getElementById('btn-send').disabled = false;
+        currentStreamController = null;
+        setStreamingUI(false);
     }
 }
 
@@ -324,8 +505,34 @@ chatInput.addEventListener('keydown', (e) => {
     }
 });
 
+async function resetCurrentWorkspace(message = '👋 已创建新项目。告诉我你想做什么游戏吧！') {
+    if (isStreaming) {
+        stopCurrentStream();
+    }
+    if (sessionId) {
+        try {
+            await fetch(`/api/chat/${sessionId}`, { method: 'DELETE' });
+        } catch (_) {}
+    }
+    setSessionId('');
+    currentProjectId = '';
+    chatMessages.innerHTML = '';
+    addMessage(message, 'ai');
+    const starterCode = '<!-- 新项目 - 开始设计你的游戏 -->\n';
+    if (editor) {
+        editor.setValue(starterCode);
+        document.getElementById('game-preview').srcdoc = '';
+    } else {
+        pendingLatestCode = starterCode;
+    }
+}
+
+
 // 清除对话
 document.getElementById('btn-clear-chat').addEventListener('click', async () => {
+    if (isStreaming) {
+        stopCurrentStream();
+    }
     if (sessionId) {
         await fetch(`/api/chat/${sessionId}`, { method: 'DELETE' });
     }
@@ -362,11 +569,9 @@ document.getElementById('btn-fullscreen').addEventListener('click', () => {
 });
 
 // ============ 项目管理 ============
-document.getElementById('btn-new').addEventListener('click', () => {
-    if (confirm('创建新项目？当前未保存的代码将丢失。')) {
-        currentProjectId = '';
-        editor.setValue('<!-- 新项目 - 开始设计你的游戏 -->\n');
-        document.getElementById('game-preview').srcdoc = '';
+document.getElementById('btn-new').addEventListener('click', async () => {
+    if (confirm('创建新项目？当前未保存的代码和当前对话上下文都会清空。')) {
+        await resetCurrentWorkspace();
     }
 });
 

@@ -119,6 +119,42 @@ class CodeEditor:
             "lines_added": len(new_lines),
         }
 
+
+    @staticmethod
+    def replace_lines(code: str, start: int, end: int, new_str: str) -> dict:
+        """替换指定行范围
+
+        Args:
+            code: 完整代码
+            start: 起始行号（1-based）
+            end: 结束行号（1-based, inclusive）
+            new_str: 替换后的代码；空字符串表示删除该范围
+        Returns:
+            {"success": True/False, "code": "修改后代码", "message": "..."}
+        """
+        lines = code.split('\n')
+        total = len(lines)
+
+        if start < 1 or end > total or start > end:
+            return {
+                "success": False,
+                "code": code,
+                "message": f"行号范围 {start}-{end} 无效（总共 {total} 行）",
+            }
+
+        new_lines = new_str.split('\n') if new_str else []
+        lines[start - 1:end] = new_lines
+
+        return {
+            "success": True,
+            "code": '\n'.join(lines),
+            "message": f"已替换第 {start}-{end} 行"
+                       f"（{end - start + 1} 行 → {len(new_lines)} 行）",
+            "line_start": start,
+            "lines_removed": end - start + 1,
+            "lines_added": len(new_lines),
+        }
+
     @staticmethod
     def delete_lines(code: str, start: int, end: int) -> dict:
         """删除指定行范围

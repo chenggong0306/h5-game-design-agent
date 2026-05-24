@@ -20,6 +20,10 @@ data/assets/**
 # 对话历史（运行时生成）
 data/chat_history/
 
+# LangGraph checkpoint 数据库（运行时生成）
+data/langgraph_checkpoints.sqlite*
+
+
 
 # IDE
 .vscode/

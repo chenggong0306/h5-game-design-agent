@@ -10,14 +10,19 @@
 </head>
 <body>
     <header class="app-header">
-        <h1>🎮 H5 游戏设计工坊</h1>
+        <div class="brand">
+            <div class="brand-mark">⚡</div>
+            <div>
+                <h1>H5 GameForge AI</h1>
+                <p>用自然语言生成、调试、预览移动端小游戏</p>
+            </div>
+        </div>
         <div class="header-actions">
             <button id="btn-new" title="新建项目">📄 新建</button>
             <button id="btn-save" title="保存项目">💾 保存</button>
             <button id="btn-load" title="加载项目">📂 项目</button>
             <button id="btn-assets" title="素材管理">🎨 素材</button>
             <button id="btn-history" title="对话历史">📜 历史</button>
-
         </div>
     </header>
 
@@ -25,7 +30,7 @@
         <!-- 左侧：AI对话面板 -->
         <section class="panel chat-panel">
             <div class="panel-header">
-                <h2>💬 H5 游戏助手</h2>
+                <h2><span>AI Copilot</span> 游戏助手</h2>
                 <button id="btn-clear-chat" title="清除对话">🗑️</button>
             </div>
             <div id="chat-messages" class="chat-messages">
@@ -44,14 +49,23 @@
             </div>
             <div class="chat-input-area">
                 <textarea id="chat-input" placeholder="描述你想要的游戏..." rows="2"></textarea>
-                <button id="btn-send">发送 ⏎</button>
+                <div class="chat-submit-stack">
+                    <div id="context-meter" class="context-meter" title="0% · 0 / 128K context used">
+                        <svg viewBox="0 0 36 36" aria-hidden="true">
+                            <circle class="context-ring-bg" cx="18" cy="18" r="15.5"></circle>
+                            <circle id="context-ring" class="context-ring" cx="18" cy="18" r="15.5"></circle>
+                        </svg>
+                        <span id="context-percent">0%</span>
+                    </div>
+                    <button id="btn-send">发送 ⏎</button>
+                </div>
             </div>
         </section>
 
         <!-- 中间：代码编辑器 -->
         <section class="panel editor-panel">
             <div class="panel-header">
-                <h2>📝 代码编辑器</h2>
+                <h2><span>Monaco</span> 代码编辑器</h2>
                 <button id="btn-run" title="运行游戏">▶️ 运行</button>
             </div>
             <div id="editor-container"></div>
@@ -60,7 +74,7 @@
         <!-- 右侧：游戏预览 -->
         <section class="panel preview-panel">
             <div class="panel-header">
-                <h2>🎮 游戏预览</h2>
+                <h2><span>Live</span> 游戏预览</h2>
                 <button id="btn-fullscreen" title="全屏">⛶</button>
             </div>
             <iframe id="game-preview" sandbox="allow-scripts allow-same-origin"></iframe>
@@ -127,6 +141,6 @@
     </div>
 
     <script src="https://cdn.jsdelivr.net/npm/monaco-editor@0.45.0/min/vs/loader.js"></script>
-    <script src="/static/js/app.js"></script>
+    <script src="/static/js/app.js?v=20260524-history-delete"></script>
 </body>
 </html>

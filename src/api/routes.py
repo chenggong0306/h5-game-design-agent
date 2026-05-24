@@ -48,14 +48,25 @@ def _save_chat_history(session_id: str, history: list[dict]) -> None:
     path.write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def _append_chat_history(session_id: str, role: str, content: str) -> None:
+def _append_chat_history(session_id: str, role: str, content: str, extra: dict | None = None) -> None:
     history = _load_chat_history(session_id)
-    history.append({
+    item = {
         "role": role,
         "content": content,
         "ts": datetime.now(timezone.utc).isoformat(),
-    })
+    }
+    if extra:
+        item.update(extra)
+    history.append(item)
     _save_chat_history(session_id, history)
+
+
+def _get_latest_code_from_history(history: list[dict]) -> str:
+    for item in reversed(history):
+        code = item.get("code")
+        if isinstance(code, str) and code:
+            return code
+    return ""
 
 
 def _build_session_summary(session_id: str) -> dict:
@@ -113,7 +124,7 @@ async def chat(req: ChatRequest):
             current_code=req.current_code,
         )
         _append_chat_history(session_id, "user", req.message)
-        _append_chat_history(session_id, "ai", result.get("reply", ""))
+        _append_chat_history(session_id, "ai", result.get("reply", ""), {"code": result.get("code") or ""})
         return ChatResponse(session_id=session_id, **result)
     except Exception as e:
         err_str = str(e)
@@ -136,6 +147,7 @@ async def chat_stream(req: ChatRequest):
 
     async def event_generator():
         assistant_text = ""
+        latest_code = ""
         _append_chat_history(session_id, "user", req.message)
         # 先发送 session_id
         yield f"data: {json.dumps({'type': 'session', 'session_id': session_id}, ensure_ascii=False)}\n\n"
@@ -147,8 +159,12 @@ async def chat_stream(req: ChatRequest):
             ):
                 if chunk.get("type") == "token":
                     assistant_text += chunk.get("content", "")
-                elif chunk.get("type") == "done" and assistant_text.strip():
-                    _append_chat_history(session_id, "ai", assistant_text)
+                elif chunk.get("type") == "code_update":
+                    latest_code = chunk.get("code") or latest_code
+                elif chunk.get("type") == "done":
+                    latest_code = chunk.get("code") or latest_code
+                    if assistant_text.strip():
+                        _append_chat_history(session_id, "ai", assistant_text, {"code": latest_code})
                 yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
         except Exception as e:
             err_msg = str(e)
@@ -182,14 +198,19 @@ async def list_chat_history():
 
 @router.get("/api/chat/{session_id}/history")
 async def get_chat_history(session_id: str):
-    """获取指定会话的消息历史"""
-    return {"session_id": session_id, "messages": _load_chat_history(session_id)}
+    """获取指定会话的消息历史，并返回该会话最后一次代码快照。"""
+    history = _load_chat_history(session_id)
+    return {
+        "session_id": session_id,
+        "messages": history,
+        "latest_code": _get_latest_code_from_history(history),
+    }
 
 
 @router.delete("/api/chat/{session_id}")
 async def clear_chat(session_id: str):
     """清除对话历史"""
-    agent.clear_session(session_id)
+    await agent.clear_session(session_id)
     path = _history_path(session_id)
     if path.exists():
         path.unlink()
