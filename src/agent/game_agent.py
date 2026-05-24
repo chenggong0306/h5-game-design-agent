@@ -656,7 +656,7 @@ class GameDesignAgent:
         await self._ensure_agent()
 
         try:
-            config = {"configurable": {"thread_id": session_id}, "recursion_limit": 50}
+            config = {"configurable": {"thread_id": session_id}, "recursion_limit": 500}
             result = await self.agent.ainvoke(
                 {"messages": [{"role": "user", "content": user_message}]},
                 config=config,
