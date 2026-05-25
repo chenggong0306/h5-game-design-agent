@@ -5,7 +5,8 @@
 
 ![Python](https://img.shields.io/badge/Python-3.14-blue)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.136-green)
-![LangChain](https://img.shields.io/badge/LangChain-1.2-orange)
+![LangChain](https://img.shields.io/badge/LangChain-1.3-orange)
+![LangGraph](https://img.shields.io/badge/LangGraph-1.2-red)
 ![License](https://img.shields.io/badge/License-MIT-yellow)
 
 ## ✨ 核心功能
@@ -17,24 +18,44 @@
 | 📝 **代码编辑器** | Monaco Editor（VS Code 同款），语法高亮 + 自动补全 |
 | 🎮 **实时预览** | iframe 沙盒预览，代码改完即时运行 |
 | 🎨 **素材管理** | 上传图片/音频素材，AI 自动在生成的代码中引用 |
-| 📚 **知识库** | ChromaDB 向量检索，内置 7 个 H5 游戏开发技能文档 |
-| 💾 **项目管理** | 保存 / 加载 / 删除游戏项目（增删改查） |
+| 📚 **知识库** | ChromaDB 向量检索，内置 H5 游戏开发技能文档 |
+| 💾 **项目管理** | 保存 / 加载 / 删除游戏项目 |
+| 🧠 **上下文压缩** | 对话历史自动总结，长对话不丢失上下文 |
 
 ## 🏗️ 架构
 
 ```
-用户对话 ──→ FastAPI ──→ LangChain Agent ──→ DeepSeek / OpenAI
+用户对话 ──→ FastAPI ──→ LangGraph Agent ──→ DeepSeek / Qwen / OpenAI
                 │              │
+                │         Middleware 层
+                │          ├── track_context_usage（上下文监控）
+                │          ├── ContextEditingMiddleware（清理旧工具结果）
+                │          └── SummarizationMiddleware（历史自动总结）
+                │
                 │        ChromaDB 知识库
                 │         ├── 游戏素材（图片/音频）
-                │         ├── H5 开发技能文档
-                │         └── 用户项目代码
+                │         └── H5 开发技能文档
                 │
            SSE 流式输出 ──→ 前端实时渲染
                               ├── 对话面板（打字机效果）
+                              ├── 上下文使用率圆环
+                              ├── 工具调用卡片
                               ├── Monaco 代码编辑器
                               └── iframe 游戏预览
 ```
+
+## 🤖 Agent 工具
+
+| 工具 | 说明 |
+|------|------|
+| `search_assets` | 搜索知识库中的游戏素材 |
+| `search_knowledge` | 搜索 H5 游戏开发知识库 |
+| `write_game_code` | 一次性写入完整游戏代码（<500行） |
+| `start_code_write` | 分块写入：初始化缓冲区（长代码用） |
+| `append_code_chunk` | 分块写入：追加代码块 |
+| `finish_code_write` | 分块写入：完成并写入编辑器 |
+| `view_code` | 查看代码（每次最多100行） |
+| `str_replace_code` | 替换代码片段（支持空白归一化匹配） |
 
 ## 🚀 快速开始
 
@@ -215,9 +236,10 @@ data: [DONE]                                      ← 结束
 | 层 | 技术 | 用途 |
 | -- | ---- | ---- |
 | 后端 | **FastAPI** + uvicorn | REST API + SSE 流式 |
-| 智能体 | **LangChain** + ChatOpenAI | 对话管理 + 流式输出 |
-| 知识库 | **ChromaDB** | 向量检索（素材/技能/项目） |
-| LLM | **DeepSeek** / OpenAI / Ollama | 代码生成 |
+| 智能体 | **LangChain 1.3** + **LangGraph 1.2** | Agent 框架 + 持久化 checkpoint |
+| 上下文管理 | **SummarizationMiddleware** + **ContextEditingMiddleware** | 自动总结历史 + 清理旧工具结果 |
+| 知识库 | **ChromaDB** | 向量检索（素材/技能） |
+| LLM | **DeepSeek** / **Qwen** / OpenAI | 代码生成（OpenAI 兼容接口） |
 | 前端 | **Monaco Editor** | 代码编辑（VS Code 同款） |
 | 预览 | **iframe sandbox** | 安全的游戏实时预览 |
 | 包管理 | **uv** | Python 依赖管理 |
