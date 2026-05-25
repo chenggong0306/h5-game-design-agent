@@ -9,12 +9,11 @@ from typing import Any
 import aiosqlite
 from langchain.tools import tool
 from langchain.agents import AgentState, create_agent
-from langchain.agents.middleware import before_model
-from langchain.messages import RemoveMessage
-from langchain_openai import ChatOpenAI
+from langchain.agents.middleware import before_model, SummarizationMiddleware, ContextEditingMiddleware, ClearToolUsesEdit
+from langchain.chat_models import init_chat_model
 from langchain_core.messages import AIMessageChunk
+from langchain_core.messages.utils import count_tokens_approximately
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
-from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langgraph.runtime import Runtime
 
 from src.config import settings
@@ -25,27 +24,37 @@ from src.agent.code_editor import CodeEditor
 _kb: KnowledgeBase | None = None
 _current_session_id: ContextVar[str] = ContextVar("current_session_id", default="")
 _code_by_session: dict[str, str] = {}
+_code_session_last_access: dict[str, float] = {}  # 记录最后访问时间，用于清理
+_code_write_buffer: dict[str, list[str]] = {}  # 分块写入临时缓冲区
+CODE_SESSION_TIMEOUT = 3600  # 1小时未访问的会话代码将被清理
 
 
 def _get_current_code() -> str:
     """读取当前会话的编辑器代码，避免不同请求共享同一份全局代码。"""
+    import time
     session_id = _current_session_id.get()
     if not session_id:
         return ""
+    _code_session_last_access[session_id] = time.time()  # 更新访问时间
     return _code_by_session.get(session_id, "")
 
 
 def _set_current_code(code: str) -> None:
     """写入当前会话的编辑器代码。"""
+    import time
     session_id = _current_session_id.get()
     if session_id:
         _code_by_session[session_id] = code
+        _code_session_last_access[session_id] = time.time()  # 更新访问时间
 
 
 def _begin_code_session(session_id: str, code: str):
     """绑定当前 async 上下文的会话 ID，并初始化该会话代码。"""
+    import time
     token = _current_session_id.set(session_id)
     _code_by_session[session_id] = code
+    _code_session_last_access[session_id] = time.time()
+    _cleanup_old_sessions()  # 定期清理旧会话
     return token
 
 
@@ -54,20 +63,62 @@ def _end_code_session(token) -> None:
     _current_session_id.reset(token)
 
 
-CONTEXT_WINDOW_TOKENS = 131_072
-CONTEXT_COMPACT_THRESHOLD = 0.80
-RECENT_MESSAGES_TO_KEEP = 12
-LARGE_TEXT_CHARS = 2_000
+def _cleanup_old_sessions() -> None:
+    """清理超过1小时未访问的会话代码，防止内存泄漏。"""
+    import time
+    current_time = time.time()
+    expired_sessions = [
+        sid for sid, last_access in _code_session_last_access.items()
+        if current_time - last_access > CODE_SESSION_TIMEOUT
+    ]
+    for sid in expired_sessions:
+        _code_by_session.pop(sid, None)
+        _code_session_last_access.pop(sid, None)
+        _code_write_buffer.pop(sid, None)  # 同时清理未完成的分块写入缓冲区
+
+
+CONTEXT_WINDOW_TOKENS = 131_072          # 默认（openai/qwen 128K）
+CONTEXT_WINDOW_TOKENS_DEEPSEEK = 1_000_000  # deepseek 1M 上下文
+MODEL_OUTPUT_TOKEN_BUDGET = 16_000   # 与 max_tokens 保持一致
+CONTEXT_SAFETY_MARGIN_TOKENS = 8_000
+SYSTEM_AND_TOOLS_OVERHEAD_TOKENS = 24_000
+CONTEXT_INPUT_BUDGET_TOKENS = (
+    CONTEXT_WINDOW_TOKENS
+    - MODEL_OUTPUT_TOKEN_BUDGET
+    - CONTEXT_SAFETY_MARGIN_TOKENS
+    - SYSTEM_AND_TOOLS_OVERHEAD_TOKENS
+)
+# SummarizationMiddleware 配置
+SUMMARIZATION_KEEP_MESSAGES = 10  # 总结后保留最近10条消息
+# fraction 需要 langchain 支持 profile 参数，当前版本不支持，改用绝对 token 数
+# deepseek 1M 上下文触发阈值：(1,000,000 - 开销) * 0.70
+SUMMARIZATION_TRIGGER_TOKENS_DEEPSEEK = int((1_000_000 - MODEL_OUTPUT_TOKEN_BUDGET - CONTEXT_SAFETY_MARGIN_TOKENS - SYSTEM_AND_TOOLS_OVERHEAD_TOKENS) * 0.70)
+# qwen/openai 128K 上下文触发阈值：CONTEXT_INPUT_BUDGET_TOKENS * 0.70
+SUMMARIZATION_TRIGGER_TOKENS_DEFAULT = int(CONTEXT_INPUT_BUDGET_TOKENS * 0.70)
+LARGE_TEXT_CHARS = 1_000
 _context_usage_by_session: dict[str, dict[str, int | bool]] = {}
 
 
 def _estimate_tokens(text: str) -> int:
-    """轻量估算 token 数：中文/代码场景下按字符粗略折算，避免引入额外 tokenizer 依赖。"""
+    """使用 LangChain 的近似 token 计数。
+
+    注意：这是快速估算，真实 token 数可能略有偏差。
+    对于精确计数，应使用 model.get_num_tokens_from_messages()。
+    """
     if not text:
         return 0
-    ascii_chars = sum(1 for ch in text if ord(ch) < 128)
-    non_ascii_chars = len(text) - ascii_chars
-    return max(1, ascii_chars // 4 + non_ascii_chars)
+    # 使用 LangChain 的官方近似计数
+    # 这比自定义的字符计数更准确
+    try:
+        from langchain_core.messages import HumanMessage
+        msg = HumanMessage(content=text)
+        return count_tokens_approximately([msg])
+    except Exception:
+        # 降级到简单估算
+        ascii_chars = sum(1 for ch in text if ord(ch) < 128)
+        non_ascii_chars = len(text) - ascii_chars
+        base = ascii_chars / 2.5 + non_ascii_chars
+        return max(1, int(base * 1.25))
 
 
 def _message_text_for_budget(message) -> str:
@@ -77,81 +128,68 @@ def _message_text_for_budget(message) -> str:
     return "\n".join(parts)
 
 
-def _compact_tool_calls(message):
-    tool_calls = getattr(message, "tool_calls", None)
-    if not tool_calls:
-        return message
-    compacted = []
-    changed = False
-    for tc in tool_calls:
-        item = dict(tc)
-        args = item.get("args")
-        if isinstance(args, dict):
-            args = dict(args)
-            tool_name = item.get("name")
-            if tool_name == "write_game_code" and len(str(args.get("code", ""))) > LARGE_TEXT_CHARS:
-                args["code"] = "[已省略：历史 write_game_code 的完整 HTML 已写入右侧编辑器，不再注入模型上下文]"
-                changed = True
-            elif tool_name == "append_game_code_chunk" and len(str(args.get("chunk", ""))) > LARGE_TEXT_CHARS:
-                args["chunk"] = "[已省略：历史代码分块内容不再注入模型上下文]"
-                changed = True
-            item["args"] = args
-        compacted.append(item)
-    return message.model_copy(update={"tool_calls": compacted}) if changed else message
-
-
-def _compact_tool_result(message):
-    name = getattr(message, "name", "")
-    content = str(getattr(message, "content", "") or "")
-    if name == "view_code" and len(content) > LARGE_TEXT_CHARS:
-        return message.model_copy(update={"content": "[已省略：历史 view_code 大段代码结果不再注入模型上下文]"})
-    return message
-
-
 @before_model
-def compact_messages_before_model(state: AgentState, runtime: Runtime) -> dict[str, Any] | None:
-    """上下文达到 80% 时，裁剪旧消息并脱敏历史大代码，防止 checkpoint 撑爆上下文。"""
+def track_context_usage(state: AgentState, runtime: Runtime) -> dict[str, Any] | None:
+    """跟踪上下文使用情况，用于前端显示。不再手动压缩，由 SummarizationMiddleware 自动处理。"""
     messages = state["messages"]
-    used_tokens = sum(_estimate_tokens(_message_text_for_budget(m)) for m in messages)
-    compacted = used_tokens >= int(CONTEXT_WINDOW_TOKENS * CONTEXT_COMPACT_THRESHOLD)
+
+    # 使用 LangChain 的官方 token 计数（更准确）
+    try:
+        used_tokens = count_tokens_approximately(messages)
+    except Exception:
+        # 降级到自定义估算
+        used_tokens = sum(_estimate_tokens(_message_text_for_budget(m)) for m in messages)
+
+    # used_tokens 是纯消息 tokens，max_tokens 已经扣除了系统开销，直接对比即可
+    effective_used_tokens = used_tokens
+
     session_id = ""
     try:
         session_id = runtime.config.get("configurable", {}).get("thread_id", "")
     except Exception:
         session_id = _current_session_id.get()
+
+    # 检测是否已总结：通过消息数量和 token 使用率的变化
+    prev_usage = _context_usage_by_session.get(session_id, {})
+    prev_percent = prev_usage.get("percent", 0)
+    prev_msg_count = prev_usage.get("message_count", 0)
+    current_percent = round(effective_used_tokens / CONTEXT_INPUT_BUDGET_TOKENS * 100)
+    current_msg_count = len(messages)
+
+    # 启发式检测：
+    # 1. 消息数量突然减少到接近 KEEP 阈值
+    # 2. 或者之前超过70%，现在降到60%以下
+    msg_dropped = prev_msg_count > SUMMARIZATION_KEEP_MESSAGES + 5 and current_msg_count <= SUMMARIZATION_KEEP_MESSAGES + 3
+    token_dropped = prev_percent >= 70 and current_percent < prev_percent * 0.6
+    summarized = msg_dropped or token_dropped
+
     if session_id:
         _context_usage_by_session[session_id] = {
-            "used_tokens": used_tokens,
-            "max_tokens": CONTEXT_WINDOW_TOKENS,
-            "percent": round(used_tokens / CONTEXT_WINDOW_TOKENS * 100),
-            "compacted": compacted,
+            "used_tokens": effective_used_tokens,
+            "raw_message_tokens": used_tokens,
+            "max_tokens": CONTEXT_INPUT_BUDGET_TOKENS,
+            "context_window_tokens": CONTEXT_WINDOW_TOKENS,
+            "reserved_output_tokens": MODEL_OUTPUT_TOKEN_BUDGET,
+            "reserved_overhead_tokens": SYSTEM_AND_TOOLS_OVERHEAD_TOKENS + CONTEXT_SAFETY_MARGIN_TOKENS,
+            "percent": current_percent,
+            "message_count": current_msg_count,  # 记录消息数量
+            "compacted": summarized,
         }
-    if not compacted:
-        return None
 
-    head = messages[:1]
-    recent = messages[-RECENT_MESSAGES_TO_KEEP:]
-    middle = messages[1:-RECENT_MESSAGES_TO_KEEP]
-    summary = (
-        f"[系统上下文压缩] 已省略 {len(middle)} 条较早消息。"
-        "当前右侧编辑器保存最新游戏代码；如需修改代码，请使用 search_code/view_code 查看。"
-    )
-    sanitized_recent = [_compact_tool_result(_compact_tool_calls(m)) for m in recent]
-    return {
-        "messages": [
-            RemoveMessage(id=REMOVE_ALL_MESSAGES),
-            *head,
-            {"role": "system", "content": summary},
-            *sanitized_recent,
-        ]
-    }
+    # 不返回任何修改，让 SummarizationMiddleware 处理
+    return None
 
 
 def _get_context_usage(session_id: str) -> dict[str, int | bool]:
     return _context_usage_by_session.get(session_id, {
         "used_tokens": 0,
-        "max_tokens": CONTEXT_WINDOW_TOKENS,
+        "raw_message_tokens": 0,
+        "max_tokens": CONTEXT_INPUT_BUDGET_TOKENS,
+        "context_window_tokens": CONTEXT_WINDOW_TOKENS,
+        "reserved_output_tokens": MODEL_OUTPUT_TOKEN_BUDGET,
+        "reserved_overhead_tokens": SYSTEM_AND_TOOLS_OVERHEAD_TOKENS + CONTEXT_SAFETY_MARGIN_TOKENS,
         "percent": 0,
+        "message_count": 0,
         "compacted": False,
     })
 
@@ -200,11 +238,13 @@ def search_knowledge(query: str) -> str:
 
 @tool
 def str_replace_code(old_str: str, new_str: str) -> str:
-    """精确替换当前游戏代码中的一段内容。用于修 bug、改参数、小范围修改。
-    old_str 必须与代码中的内容完全一致（包括空格缩进）。
+    """替换当前游戏代码中的一段内容。用于修 bug、改参数、小范围修改。
+    支持空白归一化匹配：缩进不完全一致也能匹配，匹配后保留原始缩进。
+    插入新代码：将 new_str 设为 old_str + 新内容 即可在目标位置后追加。
+    删除代码：将 new_str 设为空字符串即可。
 
     Args:
-        old_str: 要被替换的原始代码片段（必须精确匹配）
+        old_str: 要被替换的原始代码片段
         new_str: 替换后的新代码（空字符串表示删除）
     """
     result = CodeEditor.str_replace(_get_current_code(), old_str, new_str)
@@ -269,10 +309,70 @@ def _detect_startup_order_issues(code: str) -> list[str]:
     return issues
 
 
+@tool
+def start_code_write(reason: str = "") -> str:
+    """开始分块写入游戏代码。用于写入超长代码（>500行）时，先调用此工具初始化。
+
+    Args:
+        reason: 本次写入代码的原因或摘要
+    """
+    session_id = _current_session_id.get()
+    if not session_id:
+        return "错误：无法获取会话ID"
+    _code_write_buffer[session_id] = []
+    return f"已初始化代码写入缓冲区。{f'原因：{reason}' if reason else ''}\n请依次调用 append_code_chunk 写入代码块，最后调用 finish_code_write 完成。"
+
+@tool
+def append_code_chunk(chunk: str) -> str:
+    """追加一块代码到缓冲区。用于分块写入长代码。
+
+    Args:
+        chunk: 代码片段（可以是 HTML 的一部分）
+    """
+    session_id = _current_session_id.get()
+    if not session_id:
+        return "错误：无法获取会话ID"
+    if session_id not in _code_write_buffer:
+        return "错误：请先调用 start_code_write 初始化缓冲区"
+
+    _code_write_buffer[session_id].append(chunk)
+    total_chars = sum(len(c) for c in _code_write_buffer[session_id])
+    return f"已追加 {len(chunk)} 字符，当前缓冲区共 {total_chars} 字符。继续调用 append_code_chunk 或调用 finish_code_write 完成。"
+
+@tool
+def finish_code_write() -> str:
+    """完成分块写入，将缓冲区的所有代码块合并并写入编辑器。"""
+    session_id = _current_session_id.get()
+    if not session_id:
+        return "错误：无法获取会话ID"
+    if session_id not in _code_write_buffer:
+        return "错误：请先调用 start_code_write 初始化缓冲区"
+
+    chunks = _code_write_buffer.pop(session_id)
+    if not chunks:
+        return "错误：缓冲区为空，没有代码可写入"
+
+    clean_code = "".join(chunks).strip()
+    startup_issues = _detect_startup_order_issues(clean_code)
+    if startup_issues:
+        return (
+            "写入失败：生成的 HTML 可能黑屏，必须先修复启动顺序问题：\n"
+            + "\n".join(f"- {issue}" for issue in startup_issues)
+            + "\n\n请重新开始：start_code_write → append_code_chunk × N → finish_code_write"
+        )
+
+    _set_current_code(clean_code)
+    lines = clean_code.count("\n") + 1
+    return f"✅ 已成功写入右侧编辑器 game.html，共 {lines} 行。"
 
 @tool
 def write_game_code(code: str = "", reason: str = "") -> str:
-    """将完整 H5 游戏代码写入当前会话的右侧代码编辑器。新建游戏或需要整体重写时必须使用此工具。
+    """将完整 H5 游戏代码写入当前会话的右侧代码编辑器。
+
+    ⚠️ 重要：如果代码超过 500 行或生成时被截断，请改用分块写入：
+    1. start_code_write(reason) - 初始化
+    2. append_code_chunk(chunk) - 多次调用，每次传入一部分代码
+    3. finish_code_write() - 完成写入
 
     Args:
         code: 完整 HTML 代码，必须可直接在浏览器运行。不可为空。
@@ -281,9 +381,25 @@ def write_game_code(code: str = "", reason: str = "") -> str:
     clean_code = code.strip()
     if not clean_code:
         return (
-            "写入失败：缺少 code 参数。请重新调用 write_game_code，"
-            "并在 code 参数中传入完整 HTML 字符串；不要使用空对象 {} 调用此工具。"
+            "写入失败：缺少 code 参数。\n\n"
+            "💡 提示：如果代码太长导致被截断，请使用分块写入：\n"
+            "1. start_code_write(reason)\n"
+            "2. append_code_chunk(chunk) × N\n"
+            "3. finish_code_write()"
         )
+
+    # 检查是否可能被截断：行数少且没有闭合的 </html> 标签
+    lines = clean_code.count("\n") + 1
+    if not clean_code.rstrip().endswith("</html>") and lines < 50:
+        return (
+            f"⚠️ 代码似乎被截断了（只有 {lines} 行，且未以 </html> 结尾）。\n\n"
+            "请使用分块写入机制：\n"
+            "1. start_code_write(reason='重新生成完整游戏')\n"
+            "2. append_code_chunk(chunk) - 多次调用，每次传入一部分代码\n"
+            "3. finish_code_write()\n\n"
+            "示例：先传 <!DOCTYPE html>...<style>...</style>，再传 <script>...</script>，最后传 </body></html>"
+        )
+
     startup_issues = _detect_startup_order_issues(clean_code)
     if startup_issues:
         return (
@@ -291,7 +407,6 @@ def write_game_code(code: str = "", reason: str = "") -> str:
             + "\n".join(f"- {issue}" for issue in startup_issues)
         )
     _set_current_code(clean_code)
-    lines = clean_code.count("\n") + 1
     suffix = f"\n原因：{reason}" if reason else ""
     return f"已写入右侧编辑器 game.html，共 {lines} 行。{suffix}"
 
@@ -301,13 +416,21 @@ def write_game_code(code: str = "", reason: str = "") -> str:
 @tool
 def view_code(start_line: int = 1, end_line: int = -1) -> str:
     """查看当前游戏代码的指定行范围，返回带行号代码。修改前应先调用此工具确认上下文。
+    每次最多返回 100 行，超出请分段查看。
 
     Args:
         start_line: 起始行号（从1开始）
         end_line: 结束行号（包含此行，-1表示到末尾）
     """
+    # 限制单次最多返回 100 行，防止撑满上下文
+    MAX_LINES = 100
+    if end_line == -1 or end_line - start_line + 1 > MAX_LINES:
+        end_line = start_line + MAX_LINES - 1
     result = CodeEditor.view_lines(_get_current_code(), start_line, end_line)
-    return f"共 {result['total_lines']} 行，当前显示 {result['range'][0]}-{result['range'][1]} 行：\n{result['content']}"
+    total = result['total_lines']
+    r = result['range']
+    suffix = f"\n（共 {total} 行，当前显示 {r[0]}-{r[1]}，如需继续请调用 view_code({r[1]+1}, {r[1]+MAX_LINES})）" if r[1] < total else ""
+    return f"共 {total} 行，当前显示 {r[0]}-{r[1]} 行：\n{result['content']}{suffix}"
 
 
 @tool
@@ -367,24 +490,26 @@ SYSTEM_PROMPT = """你是一个专业的 H5 页面游戏设计 AI 助手，帮�
 ## 【强制工作流 - 必须按顺序执行】
 
 ### 新建游戏时（用户首次描述游戏）：
-1. **必须先调用 `list_all_assets()`** → 查看所有可用素材，有素材就用，没有就用 Canvas 绘图
+1. **必须调用 `search_assets("图片 音频 素材")`** → 搜索可用素材，有素材就用，没有就用 Canvas 绘图
 2. **必须调用 `search_knowledge("游戏类型 模板")`** → 获取完整代码模板和防 bug 规则
-3. **必须调用 `search_knowledge("bug 预防 碰撞 边界")`** → 获取防 bug 清单
-4. 综合以上信息生成完整 HTML，但**必须调用 `write_game_code(code, reason)` 写入右侧编辑器**。
-   - `write_game_code` 的 `code` 参数必须是完整 HTML 字符串，禁止用 `{}` 或空 `code` 调用。
-   - 如果工具返回“写入失败：缺少 code 参数”，必须立刻重新调用 `write_game_code` 并补齐完整 HTML。
-5. 最终回复只总结游戏玩法、操作方式和完成内容，**不要在聊天中输出完整 HTML 代码块**
+3. 综合以上信息生成完整 HTML，然后：
+    - **如果代码较短（<500行）**：调用 `write_game_code(code, reason)` 一次性写入
+    - **如果代码较长（≥500行）或生成时被截断**：使用分块写入机制：
+      1. `start_code_write(reason)` - 初始化缓冲区
+      2. `append_code_chunk(chunk)` - 多次调用，每次传入一部分代码
+      3. `finish_code_write()` - 完成写入并检查
+    - 禁止用空 `code` 或 `{}` 调用工具
+    - 如果 `write_game_code` 返回"代码似乎被截断"，立即改用分块写入
+4. 最终回复只总结游戏玩法、操作方式和完成内容，**不要在聊天中输出完整 HTML 代码块**
 
 ### 修改/修 bug 时：
-1. 调用 `search_code("关键字")` → 精确定位问题代码行号
-2. 调用 `view_code(start_line, end_line)` → 查看要修改位置附近的上下文
-3. 优先调用 `str_replace_code(old, new)` 精确替换；如果精确匹配失败，再调用 `replace_code_lines(start_line, end_line, new_str)` 按行替换
-4. **绝不重新输出全部代码**
+1. 调用 `view_code(start_line, end_line)` → 查看要修改位置附近的上下文（每次最多100行，分段定位）
+2. 调用 `str_replace_code(old_str, new_str)` 替换，支持空白归一化匹配，无需缩进完全一致
+3. **绝不重新输出全部代码**
 
 ### 加新功能时：
-1. 调用 `search_code("插入点关键字")` → 找到插入位置行号
-2. 调用 `view_code(start_line, end_line)` → 确认插入点上下文
-3. 调用 `insert_code(after_line, new_str)` → 插入新代码
+1. 调用 `view_code(start_line, end_line)` → 找到插入位置并确认上下文
+2. 调用 `str_replace_code(old_str, old_str + new_str)` → 在目标内容后追加新代码
 
 ---
 
@@ -526,7 +651,7 @@ resize();
 ---
 
 ## 【素材使用规则】
-- 生成游戏前**必须先调用 `list_all_assets()`**
+- 生成游戏前**必须先调用 `search_assets("图片 音频 素材")`** 搜索可用素材
 - 有素材 → 用 `loadImages()` 预加载，用 `drawObj()` 绘制，绘制失败自动降级为图形
 - 无素材 → 用 Canvas 图形代替（矩形/圆形/三角形），用颜色区分不同对象
 
@@ -534,7 +659,7 @@ resize();
 
 ## 【禁止事项】
 - ❌ 新建游戏时禁止把完整 HTML 作为聊天正文输出，必须用 `write_game_code` 写入右侧编辑器
-- ❌ 修改代码时禁止重新输出全部代码，必须用 view_code 后配合 str_replace_code/replace_code_lines/insert_code/delete_code 工具
+- ❌ 修改代码时禁止重新输出全部代码，必须用 view_code 查看后配合 str_replace_code 工具修改
 - ❌ 禁止直接 `ctx.arc(x,y,r,...)` 而不保护 r 值
 - ❌ 禁止 `arr.splice()` 在正向 for 循环中（用 filter 代替）
 - ❌ 禁止忽略 deltaTime 直接写固定像素移动
@@ -545,16 +670,14 @@ resize();
 # ============ Agent 类 ============
 
 ALL_TOOLS = [
-    list_all_assets,
     search_assets,
     search_knowledge,
     str_replace_code,
     write_game_code,
-    insert_code,
-    delete_code,
+    start_code_write,
+    append_code_chunk,
+    finish_code_write,
     view_code,
-    replace_code_lines,
-    search_code,
 ]
 
 
@@ -577,12 +700,13 @@ class GameDesignAgent:
             api_key = settings.deepseek_api_key or settings.openai_api_key
             base_url = settings.deepseek_base_url or settings.openai_base_url
             model_name = settings.deepseek_model or settings.openai_model
-            model = ChatOpenAI(
+            model = init_chat_model(
                 model=model_name,
+                model_provider="openai",
                 api_key=api_key,
                 base_url=base_url,
                 temperature=0.6,
-                max_tokens=8000,
+                max_tokens=16000,
                 top_p=0.95,
                 presence_penalty=0.0,
                 frequency_penalty=0.0,
@@ -594,12 +718,13 @@ class GameDesignAgent:
             api_key = settings.qwen_api_key or settings.openai_api_key
             base_url = settings.qwen_base_url or settings.openai_base_url
             model_name = settings.qwen_model or settings.openai_model
-            model = ChatOpenAI(
+            model = init_chat_model(
                 model=model_name,
+                model_provider="openai",
                 api_key=api_key,
                 base_url=base_url,
                 temperature=0.6,
-                max_tokens=8000,
+                max_tokens=16000,
                 top_p=0.95,
                 presence_penalty=0.0,
                 frequency_penalty=0.0,
@@ -607,12 +732,13 @@ class GameDesignAgent:
                 max_retries=2,
             )
         else:
-            model = ChatOpenAI(
+            model = init_chat_model(
                 model=settings.openai_model,
+                model_provider="openai",
                 api_key=settings.openai_api_key,
                 base_url=settings.openai_base_url,
                 temperature=0.6,
-                max_tokens=8000,
+                max_tokens=16000,
                 top_p=0.95,
                 presence_penalty=0.0,
                 frequency_penalty=0.0,
@@ -628,6 +754,11 @@ class GameDesignAgent:
         self.checkpointer: AsyncSqliteSaver | None = None
         self.agent = None
         self._agent_lock: asyncio.Lock | None = None
+        self._provider = provider  # 保存 provider 供后续使用
+
+    def _detect_provider(self) -> str:
+        """返回当前使用的 LLM provider"""
+        return self._provider
 
     async def _ensure_agent(self) -> None:
         """懒初始化持久化 LangGraph agent，避免 MemorySaver 重启丢上下文。"""
@@ -641,16 +772,66 @@ class GameDesignAgent:
             self.checkpoint_conn = await aiosqlite.connect(str(self.checkpoint_path))
             self.checkpointer = AsyncSqliteSaver(self.checkpoint_conn)
             await self.checkpointer.setup()
+
+            # 创建用于总结的模型（根据 provider 配置，使用更便宜的模型）
+            provider = self._detect_provider()
+
+            if provider == "deepseek":
+                summarization_model = init_chat_model(
+                    model=settings.deepseek_model or settings.openai_model,
+                    model_provider="openai",
+                    api_key=settings.deepseek_api_key or settings.openai_api_key,
+                    base_url=settings.deepseek_base_url or settings.openai_base_url,
+                    temperature=0.3,
+                    max_tokens=500,
+                )
+            elif provider == "qwen":
+                summarization_model = init_chat_model(
+                    model=settings.qwen_model or settings.openai_model,
+                    model_provider="openai",
+                    api_key=settings.qwen_api_key or settings.openai_api_key,
+                    base_url=settings.qwen_base_url or settings.openai_base_url,
+                    temperature=0.3,
+                    max_tokens=500,
+                )
+            else:
+                summarization_model = init_chat_model(
+                    model="gpt-4o-mini",
+                    model_provider="openai",
+                    api_key=settings.openai_api_key,
+                    base_url=settings.openai_base_url,
+                    temperature=0.3,
+                    max_tokens=500,
+                )
+
             self.agent = create_agent(
                 self.model,
                 ALL_TOOLS,
                 system_prompt=SYSTEM_PROMPT,
-                middleware=[compact_messages_before_model],
+                middleware=[
+                    track_context_usage,
+                    # 清理旧工具调用结果（view_code/write_game_code 返回的大段代码会占用大量上下文）
+                    ContextEditingMiddleware(
+                        edits=[
+                            ClearToolUsesEdit(
+                                trigger=40000,   # 工具结果累计超过 40K tokens 时清理
+                                keep=3,          # 保留最近 3 次工具结果
+                                placeholder="[已清理]",
+                            ),
+                        ],
+                    ),
+                    # 历史对话总结：上下文用到 70% 时触发，保留最近 10 条消息
+                    SummarizationMiddleware(
+                        model=summarization_model,
+                        trigger=("tokens", SUMMARIZATION_TRIGGER_TOKENS_DEEPSEEK if provider == "deepseek" else SUMMARIZATION_TRIGGER_TOKENS_DEFAULT),
+                        keep=("messages", SUMMARIZATION_KEEP_MESSAGES),
+                    ),
+                ],
                 checkpointer=self.checkpointer,
             )
 
 
-    async def chat(self, session_id: str, user_message: str, current_code: str = "") -> dict:
+    async def chat(self, session_id: str, user_message, current_code: str = "") -> dict:
         """非流式对话"""
         token = _begin_code_session(session_id, current_code)
         await self._ensure_agent()
@@ -671,12 +852,12 @@ class GameDesignAgent:
         finally:
             _end_code_session(token)
 
-    async def chat_stream(self, session_id: str, user_message: str, current_code: str = ""):
+    async def chat_stream(self, session_id: str, user_message, current_code: str = ""):
         """流式对话 - 逐 token 返回"""
         token = _begin_code_session(session_id, current_code)
         await self._ensure_agent()
 
-        config = {"configurable": {"thread_id": session_id}, "recursion_limit": 50}
+        config = {"configurable": {"thread_id": session_id}, "recursion_limit": 500}
         full_reply = ""
 
         last_code_sent = current_code

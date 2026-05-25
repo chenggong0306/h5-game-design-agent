@@ -1,6 +1,10 @@
 """代码编辑工具 - 支持对代码进行精确的增删改查操作"""
 
 
+def _normalize_line_endings(text: str) -> str:
+    return text.replace('\r\n', '\n')
+
+
 class CodeEditor:
     """代码编辑器工具，提供 str_replace / insert / delete / view 操作"""
 
@@ -35,7 +39,12 @@ class CodeEditor:
 
     @staticmethod
     def str_replace(code: str, old_str: str, new_str: str) -> dict:
-        """替换代码中的指定片段
+        """替换代码中的指定片段。
+
+        移植自 MCP filesystem server 的 applyFileEdits 逻辑：
+        1. 先精确字符串匹配
+        2. 失败后逐行 trim 对比（忽略缩进差异）
+        3. 匹配成功时保留原始缩进
 
         Args:
             code: 完整代码
@@ -47,44 +56,78 @@ class CodeEditor:
         if not old_str:
             return {"success": False, "code": code, "message": "old_str 不能为空"}
 
-        count = code.count(old_str)
-        if count == 0:
-            # 尝试忽略首尾空白匹配
-            stripped = old_str.strip()
-            lines = code.split('\n')
-            found = False
-            for i, line in enumerate(lines):
-                if stripped in line.strip():
-                    found = True
-                    break
-            hint = f"（但找到了类似内容在第 {i+1} 行）" if found else ""
-            return {
-                "success": False,
-                "code": code,
-                "message": f"未找到要替换的代码片段{hint}",
-            }
+        content = _normalize_line_endings(code)
+        normalized_old = _normalize_line_endings(old_str)
+        normalized_new = _normalize_line_endings(new_str)
+
+        # 1. 先尝试精确匹配
+        count = content.count(normalized_old)
         if count > 1:
             return {
                 "success": False,
                 "code": code,
                 "message": f"找到 {count} 处匹配，请提供更精确的代码片段以避免歧义",
             }
+        if count == 1:
+            new_code = content.replace(normalized_old, normalized_new, 1)
+            before_lines = content[:content.index(normalized_old)].count('\n') + 1
+            old_line_count = normalized_old.count('\n') + 1
+            new_line_count = normalized_new.count('\n') + 1 if normalized_new else 0
+            return {
+                "success": True,
+                "code": new_code,
+                "message": f"已替换第 {before_lines}-{before_lines + old_line_count - 1} 行"
+                           f"（{old_line_count} 行 → {new_line_count} 行）",
+                "line_start": before_lines,
+                "lines_removed": old_line_count,
+                "lines_added": new_line_count,
+            }
 
-        new_code = code.replace(old_str, new_str, 1)
+        # 2. 精确匹配失败，逐行 trim 对比（忽略空白差异）
+        old_lines = normalized_old.split('\n')
+        content_lines = content.split('\n')
 
-        # 计算变更的行号
-        before_lines = code[:code.index(old_str)].count('\n') + 1
-        old_line_count = old_str.count('\n') + 1
-        new_line_count = new_str.count('\n') + 1 if new_str else 0
+        for i in range(len(content_lines) - len(old_lines) + 1):
+            potential = content_lines[i:i + len(old_lines)]
+            if all(o.strip() == c.strip() for o, c in zip(old_lines, potential)):
+                # 保留第一行的原始缩进
+                original_indent = len(content_lines[i]) - len(content_lines[i].lstrip())
+                indent_str = content_lines[i][:original_indent]
 
+                new_lines_raw = normalized_new.split('\n') if normalized_new else []
+                adjusted = []
+                for j, line in enumerate(new_lines_raw):
+                    if j == 0:
+                        adjusted.append(indent_str + line.lstrip())
+                    else:
+                        old_indent = len(old_lines[j].expandtabs()) - len(old_lines[j].lstrip()) if j < len(old_lines) else 0
+                        new_indent = len(line.expandtabs()) - len(line.lstrip())
+                        rel = new_indent - old_indent
+                        adjusted.append(indent_str + ' ' * max(0, rel) + line.lstrip())
+
+                content_lines[i:i + len(old_lines)] = adjusted
+                new_code = '\n'.join(content_lines)
+                return {
+                    "success": True,
+                    "code": new_code,
+                    "message": f"已替换第 {i + 1}-{i + len(old_lines)} 行（空白归一化匹配）"
+                               f"（{len(old_lines)} 行 → {len(adjusted)} 行）",
+                    "line_start": i + 1,
+                    "lines_removed": len(old_lines),
+                    "lines_added": len(adjusted),
+                }
+
+        # 3. 都失败，给出提示行号
+        hint_line = None
+        for i, line in enumerate(content_lines):
+            if old_lines[0].strip() and old_lines[0].strip() in line.strip():
+                hint_line = i + 1
+                break
+        hint = f"（但找到了类似内容在第 {hint_line} 行）" if hint_line else ""
         return {
-            "success": True,
-            "code": new_code,
-            "message": f"已替换第 {before_lines}-{before_lines + old_line_count - 1} 行"
-                       f"（{old_line_count} 行 → {new_line_count} 行）",
-            "line_start": before_lines,
-            "lines_removed": old_line_count,
-            "lines_added": new_line_count,
+            "success": False,
+            "code": code,
+            "message": f"未找到要替换的代码片段{hint}",
         }
 
     @staticmethod

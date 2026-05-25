@@ -48,8 +48,13 @@
                 </div>
             </div>
             <div class="chat-input-area">
-                <textarea id="chat-input" placeholder="描述你想要的游戏..." rows="2"></textarea>
+                <div class="chat-input-main">
+                    <div id="image-attachments" class="image-attachments hidden"></div>
+                    <textarea id="chat-input" placeholder="描述你想要的游戏，可附加不超过 10MB 的图片..." rows="2"></textarea>
+                </div>
                 <div class="chat-submit-stack">
+                    <button id="btn-attach-image" class="icon-button" type="button" title="添加图片">＋图</button>
+                    <input id="chat-image-input" type="file" accept="image/*" multiple hidden>
                     <div id="context-meter" class="context-meter" title="0% · 0 / 128K context used">
                         <svg viewBox="0 0 36 36" aria-hidden="true">
                             <circle class="context-ring-bg" cx="18" cy="18" r="15.5"></circle>
@@ -75,11 +80,33 @@
         <section class="panel preview-panel">
             <div class="panel-header">
                 <h2><span>Live</span> 游戏预览</h2>
-                <button id="btn-fullscreen" title="全屏">⛶</button>
+                <div class="preview-actions">
+                    <button id="preview-error-badge" class="preview-error-badge hidden" type="button" title="查看运行错误">⚠ 运行错误</button>
+                    <button id="btn-fullscreen" title="全屏">⛶</button>
+                </div>
             </div>
             <iframe id="game-preview" sandbox="allow-scripts allow-same-origin"></iframe>
         </section>
     </main>
+
+    <!-- 运行错误诊断弹窗 -->
+    <div id="modal-runtime-error" class="modal hidden">
+        <div class="modal-content runtime-error-modal">
+            <div class="modal-header">
+                <h2>⚠️ 运行错误诊断</h2>
+                <button class="modal-close" onclick="closeModal('modal-runtime-error')">✕</button>
+            </div>
+            <div class="modal-body">
+                <p class="runtime-error-hint">预览 iframe 捕获到运行错误。你可以让 AI 根据错误和当前代码自动修复。</p>
+                <pre id="runtime-error-modal-detail"></pre>
+                <div class="runtime-error-actions">
+                    <button id="btn-ai-fix-runtime-error" type="button">让 AI 修复</button>
+                    <button id="btn-ignore-runtime-error" type="button">忽略这次错误</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
 
     <!-- 素材管理弹窗 -->
     <div id="modal-assets" class="modal hidden">
@@ -141,6 +168,6 @@
     </div>
 
     <script src="https://cdn.jsdelivr.net/npm/monaco-editor@0.45.0/min/vs/loader.js"></script>
-    <script src="/static/js/app.js?v=20260524-history-delete"></script>
+    <script src="/static/js/app.js?v=20260525-runtime-diagnostics"></script>
 </body>
 </html>

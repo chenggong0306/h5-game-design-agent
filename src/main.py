@@ -17,6 +17,14 @@ from dotenv import load_dotenv
 _ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
 load_dotenv(_ENV_PATH, override=True)
 
+# 可选：使用系统证书存储，改善 Windows / 企业代理环境下的 LangSmith HTTPS 证书问题
+try:
+    import truststore
+    truststore.inject_into_ssl()
+except Exception:
+    pass
+
+
 import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import Response

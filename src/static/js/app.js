@@ -35,12 +35,25 @@ const chatInput = document.getElementById('chat-input');
 const contextMeter = document.getElementById('context-meter');
 const contextPercent = document.getElementById('context-percent');
 const contextRing = document.getElementById('context-ring');
+const imageInput = document.getElementById('chat-image-input');
+const attachImageButton = document.getElementById('btn-attach-image');
+const imageAttachments = document.getElementById('image-attachments');
+const MAX_CHAT_IMAGE_BYTES = 10 * 1024 * 1024;
+let selectedImages = [];
+
 
 let activeStreamState = null;
 
 
 let currentStreamController = null;
 let isStreaming = false;
+
+function formatBytes(bytes) {
+    const size = Number(bytes || 0);
+    if (size >= 1024 * 1024) return `${(size / 1024 / 1024).toFixed(1)}MB`;
+    if (size >= 1024) return `${Math.round(size / 1024)}KB`;
+    return `${size}B`;
+}
 
 function addMessage(content, role = 'ai') {
     const div = document.createElement('div');
@@ -50,6 +63,85 @@ function addMessage(content, role = 'ai') {
         .replace(/`([^`]+)`/g, '<code>$1</code>')
         .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
         .replace(/\n/g, '<br>');
+    div.innerHTML = `<div class="msg-content">${html}</div>`;
+    chatMessages.appendChild(div);
+    chatMessages.scrollTop = chatMessages.scrollHeight;
+    return div;
+}
+
+function renderImageAttachments() {
+    if (!imageAttachments) return;
+    if (!selectedImages.length) {
+        imageAttachments.classList.add('hidden');
+        imageAttachments.innerHTML = '';
+        return;
+    }
+    imageAttachments.classList.remove('hidden');
+    imageAttachments.innerHTML = selectedImages.map((image, index) => `
+        <div class="image-attachment-card">
+            <img src="${escapeHtml(image.data_url)}" alt="${escapeHtml(image.name)}">
+            <div class="image-attachment-info">
+                <strong>${escapeHtml(image.name)}</strong>
+                <span>${escapeHtml(formatBytes(image.size))}</span>
+            </div>
+            <button type="button" onclick="removeSelectedImage(${index})" title="移除图片">×</button>
+        </div>
+    `).join('');
+}
+
+function readImageFile(file) {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve({
+            name: file.name,
+            type: file.type || 'image/png',
+            size: file.size,
+            data_url: reader.result,
+        });
+        reader.onerror = () => reject(new Error(`读取图片失败: ${file.name}`));
+        reader.readAsDataURL(file);
+    });
+}
+
+window.removeSelectedImage = function(index) {
+    selectedImages.splice(index, 1);
+    renderImageAttachments();
+};
+
+async function addSelectedImageFiles(files) {
+    for (const file of files) {
+        if (!file.type.startsWith('image/')) {
+            alert(`❌ ${file.name} 不是图片文件`);
+            continue;
+        }
+        if (file.size > MAX_CHAT_IMAGE_BYTES) {
+            alert(`❌ ${file.name} 超过 10MB 限制`);
+            continue;
+        }
+        if (selectedImages.length >= 4) {
+            alert('❌ 一次最多发送 4 张图片');
+            break;
+        }
+        selectedImages.push(await readImageFile(file));
+    }
+    renderImageAttachments();
+}
+
+function renderMessageImages(images = []) {
+    if (!images.length) return '';
+    return `<div class="message-image-list">${images.map(image => `
+        <div class="message-image-card">
+            <img src="${escapeHtml(image.data_url || '')}" alt="${escapeHtml(image.name || 'image')}">
+            <span>${escapeHtml(image.name || 'image')} · ${escapeHtml(formatBytes(image.size))}</span>
+        </div>
+    `).join('')}</div>`;
+}
+
+function addUserMessage(content, images = []) {
+    const div = document.createElement('div');
+    div.className = 'msg user';
+    const html = escapeHtml(content || '请看这张图片')
+        .replace(/\n/g, '<br>') + renderMessageImages(images);
     div.innerHTML = `<div class="msg-content">${html}</div>`;
     chatMessages.appendChild(div);
     chatMessages.scrollTop = chatMessages.scrollHeight;
@@ -219,7 +311,10 @@ function restoreEditorCode(code) {
     const value = code || '<!-- 这个历史会话暂时没有保存代码快照 -->\n';
     editor.setValue(value);
     if (code) runGame();
-    else document.getElementById('game-preview').srcdoc = '';
+    else {
+        document.getElementById('game-preview').srcdoc = '';
+        clearPreviewRuntimeError();
+    }
 }
 
 
@@ -329,17 +424,27 @@ window.deleteChatSession = deleteChatSession;
 
 
 
-async function sendMessage() {
+async function sendMessage(messageOverride = null, options = {}) {
+    if (messageOverride && typeof messageOverride !== 'string') {
+        messageOverride = null;
+        options = {};
+    }
     if (isStreaming) {
         stopCurrentStream();
         return;
     }
 
-    const msg = chatInput.value.trim();
-    if (!msg) return;
+    const hasOverride = typeof messageOverride === 'string';
+    const msg = hasOverride ? messageOverride.trim() : chatInput.value.trim();
+    const imagesToSend = hasOverride ? [] : [...selectedImages];
+    if (!msg && !imagesToSend.length) return;
 
-    addMessage(msg, 'user');
-    chatInput.value = '';
+    addUserMessage(options.displayText || msg, imagesToSend);
+    if (!hasOverride) {
+        chatInput.value = '';
+        selectedImages = [];
+        renderImageAttachments();
+    }
     currentStreamController = new AbortController();
     setStreamingUI(true);
 
@@ -363,6 +468,8 @@ async function sendMessage() {
                 session_id: sessionId,
                 message: msg,
                 current_code: currentCode,
+                images: imagesToSend,
+
             }),
             signal: currentStreamController.signal,
         });
@@ -505,6 +612,14 @@ chatInput.addEventListener('keydown', (e) => {
     }
 });
 
+if (attachImageButton && imageInput) {
+    attachImageButton.addEventListener('click', () => imageInput.click());
+    imageInput.addEventListener('change', async () => {
+        await addSelectedImageFiles(Array.from(imageInput.files || []));
+        imageInput.value = '';
+    });
+}
+
 async function resetCurrentWorkspace(message = '👋 已创建新项目。告诉我你想做什么游戏吧！') {
     if (isStreaming) {
         stopCurrentStream();
@@ -554,12 +669,147 @@ if (btnHistory) {
 })();
 
 
-// ============ 游戏预览 ============
+// ============ 游戏预览与运行时错误捕获 ============
+let lastPreviewRuntimeError = null;
+let runtimeErrorCard = null;
+
+function getRuntimeErrorDetailText() {
+    if (!lastPreviewRuntimeError) return '';
+    const location = lastPreviewRuntimeError.line
+        ? `第 ${lastPreviewRuntimeError.line} 行，第 ${lastPreviewRuntimeError.column || 0} 列`
+        : '未知位置';
+    return [
+        lastPreviewRuntimeError.message,
+        location,
+        lastPreviewRuntimeError.stack,
+    ].filter(Boolean).join('\n');
+}
+
+function clearPreviewRuntimeError() {
+    lastPreviewRuntimeError = null;
+    const badge = document.getElementById('preview-error-badge');
+    const detail = document.getElementById('runtime-error-modal-detail');
+    if (badge) badge.classList.add('hidden');
+    if (detail) detail.textContent = '';
+    closeModal('modal-runtime-error');
+    if (runtimeErrorCard) {
+        runtimeErrorCard.remove();
+        runtimeErrorCard = null;
+    }
+}
+
+function renderRuntimeErrorCard() {
+    if (!lastPreviewRuntimeError) return;
+    if (!runtimeErrorCard) {
+        runtimeErrorCard = document.createElement('div');
+        runtimeErrorCard.className = 'msg ai runtime-error-chat-card';
+        chatMessages.appendChild(runtimeErrorCard);
+    }
+    const line = lastPreviewRuntimeError.line || '未知';
+    runtimeErrorCard.innerHTML = `
+        <div class="msg-content runtime-error-content">
+            <div class="runtime-error-kicker">⚠️ 预览运行错误</div>
+            <div class="runtime-error-summary">${escapeHtml(lastPreviewRuntimeError.message)}</div>
+            <div class="runtime-error-meta">位置：${escapeHtml(line)} 行</div>
+            <div class="runtime-error-card-actions">
+                <button type="button" onclick="fixPreviewRuntimeError()">让 AI 修复</button>
+                <button type="button" onclick="openRuntimeErrorModal()">查看详情</button>
+                <button type="button" onclick="ignorePreviewRuntimeError()">忽略</button>
+            </div>
+        </div>`;
+    chatMessages.scrollTop = chatMessages.scrollHeight;
+}
+
+function showPreviewRuntimeError(error) {
+    lastPreviewRuntimeError = {
+        message: String(error.message || '未知运行错误'),
+        source: String(error.source || ''),
+        line: error.line || 0,
+        column: error.column || 0,
+        stack: String(error.stack || ''),
+        ts: new Date().toISOString(),
+    };
+
+    const badge = document.getElementById('preview-error-badge');
+    const detail = document.getElementById('runtime-error-modal-detail');
+    if (badge) badge.classList.remove('hidden');
+    if (detail) detail.textContent = getRuntimeErrorDetailText();
+    renderRuntimeErrorCard();
+}
+
+function buildRuntimeErrorFixPrompt() {
+    if (!lastPreviewRuntimeError) return '';
+    const currentCode = editor ? editor.getValue() : '';
+    return [
+        '右侧 iframe 运行游戏时报错了，请直接修复当前代码。',
+        '',
+        '要求：',
+        '1. 先定位报错根因，不要重写无关功能。',
+        '2. 用代码编辑工具精准修改，最后写回可运行的完整 HTML。',
+        '3. 修复后保证游戏能继续启动和游玩，避免黑屏。',
+        '',
+        '运行错误：',
+        `message: ${lastPreviewRuntimeError.message}`,
+        `line: ${lastPreviewRuntimeError.line || 'unknown'}`,
+        `column: ${lastPreviewRuntimeError.column || 'unknown'}`,
+        lastPreviewRuntimeError.stack ? `stack:\n${lastPreviewRuntimeError.stack}` : '',
+        '',
+        `当前代码长度：${currentCode.length} 字符，代码已随请求作为 current_code 传入。`,
+    ].filter(Boolean).join('\n');
+}
+
+function injectPreviewErrorBridge(code) {
+    const bridge = `
+<script>
+(function(){
+  function sendRuntimeError(payload){
+    try {
+      parent.postMessage(Object.assign({ channel: 'h5-game-preview-runtime-error' }, payload), '*');
+    } catch (_) {}
+  }
+  window.addEventListener('error', function(event){
+    var target = event.target || {};
+    if (target !== window && (target.src || target.href)) {
+      sendRuntimeError({
+        message: '资源加载失败: ' + (target.src || target.href),
+        source: target.src || target.href || '',
+        line: 0,
+        column: 0,
+        stack: ''
+      });
+      return;
+    }
+    sendRuntimeError({
+      message: event.message || 'Script error',
+      source: event.filename || '',
+      line: event.lineno || 0,
+      column: event.colno || 0,
+      stack: event.error && event.error.stack ? String(event.error.stack) : ''
+    });
+  }, true);
+  window.addEventListener('unhandledrejection', function(event){
+    var reason = event.reason || {};
+    sendRuntimeError({
+      message: reason.message || String(reason || 'Unhandled promise rejection'),
+      source: '',
+      line: 0,
+      column: 0,
+      stack: reason.stack ? String(reason.stack) : ''
+    });
+  });
+})();
+<\/script>`;
+    if (/<head[^>]*>/i.test(code)) return code.replace(/<head([^>]*)>/i, `<head$1>\n${bridge}`);
+    if (/<html[^>]*>/i.test(code)) return code.replace(/<html([^>]*)>/i, `<html$1>\n${bridge}`);
+    return `${bridge}\n${code}`;
+}
+
 function runGame() {
     const code = editor ? editor.getValue() : '';
     if (!code.trim()) return;
+    clearPreviewRuntimeError();
     const iframe = document.getElementById('game-preview');
-    iframe.srcdoc = code;
+    iframe.srcdoc = injectPreviewErrorBridge(code);
 }
 
 document.getElementById('btn-run').addEventListener('click', runGame);
@@ -567,6 +817,43 @@ document.getElementById('btn-fullscreen').addEventListener('click', () => {
     const iframe = document.getElementById('game-preview');
     if (iframe.requestFullscreen) iframe.requestFullscreen();
 });
+
+window.addEventListener('message', (event) => {
+    if (!event.data || event.data.channel !== 'h5-game-preview-runtime-error') return;
+    showPreviewRuntimeError(event.data);
+});
+
+function openRuntimeErrorModal() {
+    const detail = document.getElementById('runtime-error-modal-detail');
+    if (detail) detail.textContent = getRuntimeErrorDetailText();
+    openModal('modal-runtime-error');
+}
+
+function ignorePreviewRuntimeError() {
+    clearPreviewRuntimeError();
+}
+
+function fixPreviewRuntimeError() {
+    const prompt = buildRuntimeErrorFixPrompt();
+    if (!prompt) return;
+    if (isStreaming) {
+        alert('AI 正在生成中，请先停止或等待完成后再修复。');
+        return;
+    }
+    closeModal('modal-runtime-error');
+    sendMessage(prompt, {
+        displayText: `🔧 请修复右侧预览运行错误：${lastPreviewRuntimeError.message}`,
+    });
+}
+
+window.openRuntimeErrorModal = openRuntimeErrorModal;
+window.ignorePreviewRuntimeError = ignorePreviewRuntimeError;
+window.fixPreviewRuntimeError = fixPreviewRuntimeError;
+
+document.getElementById('preview-error-badge')?.addEventListener('click', openRuntimeErrorModal);
+document.getElementById('btn-ai-fix-runtime-error')?.addEventListener('click', fixPreviewRuntimeError);
+document.getElementById('btn-ignore-runtime-error')?.addEventListener('click', ignorePreviewRuntimeError);
+
 
 // ============ 项目管理 ============
 document.getElementById('btn-new').addEventListener('click', async () => {

@@ -118,6 +118,78 @@ body {
     padding: 10px;
     border-top: 1px solid var(--border);
 }
+.chat-input-main {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+.image-attachments {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+.image-attachments.hidden { display: none; }
+.image-attachment-card,
+.message-image-card {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    border: 1px solid rgba(130, 160, 255, 0.22);
+    background: rgba(5, 8, 20, 0.46);
+    border-radius: 10px;
+    padding: 6px;
+}
+.image-attachment-card img,
+.message-image-card img {
+    width: 42px;
+    height: 42px;
+    object-fit: cover;
+    border-radius: 8px;
+    background: #000;
+}
+.image-attachment-info {
+    min-width: 0;
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+.image-attachment-info strong {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 12px;
+}
+.image-attachment-info span,
+.message-image-card span {
+    color: var(--text-secondary);
+    font-size: 11px;
+}
+.image-attachment-card button {
+    width: 22px;
+    height: 22px;
+    border: none;
+    border-radius: 999px;
+    background: rgba(239,68,68,0.26);
+    color: #fecaca;
+    cursor: pointer;
+}
+.message-image-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-top: 8px;
+}
+.icon-button {
+    border: 1px solid var(--border);
+    background: rgba(15, 26, 56, 0.72);
+    color: var(--text-primary);
+    border-radius: 8px;
+    padding: 6px 8px;
+    cursor: pointer;
+    font-size: 12px;
+}
 .chat-input-area textarea {
     flex: 1;
     background: var(--bg-secondary);
@@ -194,13 +266,94 @@ body {
 #editor-container { flex: 1; }
 
 /* 预览面板 */
-.preview-panel { width: 420px; min-width: 350px; border-right: none; }
+.preview-panel {
+    position: relative;
+    width: 420px;
+    min-width: 350px;
+    border-right: none;
+}
 #game-preview {
     flex: 1;
     border: none;
     background: #000;
     width: 100%;
 }
+
+.preview-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.preview-error-badge {
+    border-color: rgba(248, 113, 113, 0.65) !important;
+    background: linear-gradient(135deg, rgba(239,68,68,0.30), rgba(244,63,94,0.20)) !important;
+    color: #fecaca !important;
+    box-shadow: 0 0 18px rgba(239,68,68,0.22);
+}
+.preview-error-badge.hidden { display: none; }
+.runtime-error-modal { width: 720px; }
+.runtime-error-hint {
+    margin: 0 0 12px;
+    color: var(--text-secondary);
+    font-size: 13px;
+}
+#runtime-error-modal-detail {
+    max-height: 320px;
+    overflow: auto;
+    margin: 0 0 14px;
+    padding: 12px;
+    border: 1px solid rgba(248, 113, 113, 0.22);
+    border-radius: 12px;
+    background: rgba(0,0,0,0.32);
+    color: #ffe4e6;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-size: 12px;
+    line-height: 1.5;
+}
+.runtime-error-actions,
+.runtime-error-card-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+.runtime-error-actions button,
+.runtime-error-card-actions button {
+    border: 1px solid rgba(134,169,255,0.24);
+    border-radius: 8px;
+    padding: 6px 10px;
+    background: rgba(15, 26, 56, 0.72);
+    color: var(--text-primary);
+    cursor: pointer;
+    font-size: 12px;
+}
+.runtime-error-actions button:first-child,
+.runtime-error-card-actions button:first-child {
+    border-color: rgba(53, 231, 255, 0.45);
+    background: linear-gradient(135deg, rgba(53,231,255,0.28), rgba(139,92,246,0.28));
+}
+.runtime-error-content {
+    border-color: rgba(248, 113, 113, 0.32) !important;
+    background: linear-gradient(180deg, rgba(42, 8, 18, 0.72), rgba(18, 29, 62, 0.72)) !important;
+}
+.runtime-error-kicker {
+    color: #fecaca;
+    font-size: 12px;
+    font-weight: 700;
+    margin-bottom: 6px;
+}
+.runtime-error-summary {
+    color: var(--text-primary);
+    font-size: 13px;
+    line-height: 1.45;
+    margin-bottom: 4px;
+}
+.runtime-error-meta {
+    color: var(--text-secondary);
+    font-size: 11px;
+    margin-bottom: 10px;
+}
+
 
 /* 流式输出光标 */
 .stream-cursor {

@@ -1,5 +1,6 @@
 """FastAPI 后端路由 - 游戏设计 API"""
 
+import base64
 import json
 import os
 import tempfile
@@ -11,7 +12,7 @@ from pathlib import Path
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException
 from fastapi.responses import FileResponse
 from starlette.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from src.knowledge.knowledge_base import KnowledgeBase
 from src.agent.game_agent import GameDesignAgent
@@ -83,11 +84,56 @@ def _build_session_summary(session_id: str) -> dict:
         "updated_at": history[-1]["ts"] if history else None,
     }
 
+MAX_CHAT_IMAGE_BYTES = 10 * 1024 * 1024
+
+
+class ChatImage(BaseModel):
+    name: str = "image.png"
+    type: str = "image/png"
+    size: int = 0
+    data_url: str
+
+
+def _validate_chat_images(images: list[ChatImage]) -> list[ChatImage]:
+    if len(images) > 4:
+        raise HTTPException(status_code=413, detail="一次最多发送 4 张图片")
+    for image in images:
+        if image.size > MAX_CHAT_IMAGE_BYTES:
+            raise HTTPException(status_code=413, detail=f"图片 {image.name} 超过 10MB 限制")
+        if not image.type.startswith("image/"):
+            raise HTTPException(status_code=400, detail=f"文件 {image.name} 不是图片")
+        prefix = f"data:{image.type};base64,"
+        if not image.data_url.startswith(prefix):
+            raise HTTPException(status_code=400, detail=f"图片 {image.name} data URL 格式无效")
+        try:
+            raw = base64.b64decode(image.data_url[len(prefix):], validate=True)
+        except Exception:
+            raise HTTPException(status_code=400, detail=f"图片 {image.name} base64 无效")
+        if len(raw) > MAX_CHAT_IMAGE_BYTES:
+            raise HTTPException(status_code=413, detail=f"图片 {image.name} 超过 10MB 限制")
+    return images
+
+
+def _build_user_message_content(text: str, images: list[ChatImage]):
+    if not images:
+        return text
+    content = [{"type": "text", "text": text or "请观察这张图片，并结合我的游戏需求回答。"}]
+    for image in images:
+        content.append({"type": "image_url", "image_url": {"url": image.data_url}})
+    return content
+
+
+def _image_history_meta(images: list[ChatImage]) -> list[dict]:
+    return [{"name": image.name, "type": image.type, "size": image.size} for image in images]
+
+
 
 class ChatRequest(BaseModel):
     session_id: str = ""
     message: str
     current_code: str = ""
+    images: list[ChatImage] = Field(default_factory=list)
+
 
 
 class ChatResponse(BaseModel):
@@ -118,12 +164,14 @@ async def chat(req: ChatRequest):
     """与 AI 智能体对话"""
     session_id = req.session_id or str(uuid.uuid4())
     try:
+        images = _validate_chat_images(req.images)
+        user_content = _build_user_message_content(req.message, images)
         result = await agent.chat(
             session_id=session_id,
-            user_message=req.message,
+            user_message=user_content,
             current_code=req.current_code,
         )
-        _append_chat_history(session_id, "user", req.message)
+        _append_chat_history(session_id, "user", req.message, {"images": _image_history_meta(images)} if images else None)
         _append_chat_history(session_id, "ai", result.get("reply", ""), {"code": result.get("code") or ""})
         return ChatResponse(session_id=session_id, **result)
     except Exception as e:
@@ -148,13 +196,15 @@ async def chat_stream(req: ChatRequest):
     async def event_generator():
         assistant_text = ""
         latest_code = ""
-        _append_chat_history(session_id, "user", req.message)
+        images = _validate_chat_images(req.images)
+        user_content = _build_user_message_content(req.message, images)
+        _append_chat_history(session_id, "user", req.message, {"images": _image_history_meta(images)} if images else None)
         # 先发送 session_id
         yield f"data: {json.dumps({'type': 'session', 'session_id': session_id}, ensure_ascii=False)}\n\n"
         try:
             async for chunk in agent.chat_stream(
                 session_id=session_id,
-                user_message=req.message,
+                user_message=user_content,
                 current_code=req.current_code,
             ):
                 if chunk.get("type") == "token":
