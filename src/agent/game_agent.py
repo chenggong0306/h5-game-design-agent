@@ -707,7 +707,15 @@ resize();
 - ❌ 禁止忽略 deltaTime 直接写固定像素移动
 - ❌ 禁止图片加载完成前启动游戏循环
 - ❌ 禁止在声明 `let player` / `let state` / `let enemies` 等全局状态之前调用 `resize()`、`init()`、`resetGame()`、`requestAnimationFrame()`
-- ❌ 禁止在 resize 中只用 `ctx.scale(dpr,dpr)`，必须用 `ctx.setTransform(dpr,0,0,dpr,0,0)` 防止缩放叠加"""
+- ❌ 禁止在 resize 中只用 `ctx.scale(dpr,dpr)`，必须用 `ctx.setTransform(dpr,0,0,dpr,0,0)` 防止缩放叠加
+
+---
+
+## 【工具调用行为规则 - 必须严格遵守】
+- ✅ 修改代码时必须一次性完成所有步骤（搜索→查看→替换），不要中途停下来回复用户等"继续"
+- ✅ 如果需要多处修改，在一轮对话中连续调用工具完成全部修改，最后再统一回复
+- ✅ 只有全部修改完成后，才输出文字总结修改内容
+- ❌ 禁止调用一两个工具后就停下来告诉用户"我已经找到问题了"或"接下来我会..."——直接做完"""
 
 # ============ Agent 类 ============
 
