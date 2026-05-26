@@ -414,7 +414,44 @@ def write_game_code(code: str = "", reason: str = "") -> str:
 
 
 @tool
-def view_code(start_line: int = 1, end_line: int = -1) -> str:
+def search_code(query: str, context_lines: int = 5) -> str:
+    """在当前游戏代码中搜索关键字，返回匹配行及其上下文。
+    用于定位需要修改的代码位置，避免盲目查看大段代码。
+
+    Args:
+        query: 要搜索的关键字
+        context_lines: 每个匹配行前后显示的行数（默认5行）
+    """
+    code = _get_current_code()
+    if not code:
+        return "当前没有游戏代码"
+    lines = code.split('\n')
+    total = len(lines)
+    query_lower = query.lower()
+    match_indices = [i for i, line in enumerate(lines) if query_lower in line.lower()]
+    if not match_indices:
+        return f"未找到包含 '{query}' 的代码"
+
+    # 合并相邻的上下文范围，避免重复输出
+    ranges = []
+    for idx in match_indices:
+        start = max(0, idx - context_lines)
+        end = min(total - 1, idx + context_lines)
+        if ranges and start <= ranges[-1][1] + 1:
+            ranges[-1] = (ranges[-1][0], end)
+        else:
+            ranges.append((start, end))
+
+    parts = []
+    for start, end in ranges:
+        snippet = '\n'.join(
+            f"{'>>>' if lines[i].lower().find(query_lower) >= 0 else '   '} {i+1:4d} | {lines[i]}"
+            for i in range(start, end + 1)
+        )
+        parts.append(snippet)
+
+    header = f"找到 {len(match_indices)} 处匹配（共 {total} 行）：\n"
+    return header + '\n---\n'.join(parts)
     """查看当前游戏代码的指定行范围，返回带行号代码。修改前应先调用此工具确认上下文。
     每次最多返回 100 行，超出请分段查看。
 
@@ -503,12 +540,13 @@ SYSTEM_PROMPT = """你是一个专业的 H5 页面游戏设计 AI 助手，帮�
 4. 最终回复只总结游戏玩法、操作方式和完成内容，**不要在聊天中输出完整 HTML 代码块**
 
 ### 修改/修 bug 时：
-1. 调用 `view_code(start_line, end_line)` → 查看要修改位置附近的上下文（每次最多100行，分段定位）
-2. 调用 `str_replace_code(old_str, new_str)` 替换，支持空白归一化匹配，无需缩进完全一致
-3. **绝不重新输出全部代码**
+1. 调用 `search_code("关键字")` → 搜索定位，返回匹配行及上下文，无需再调用 view_code
+2. 如需查看更多上下文，调用 `view_code(start_line, end_line)`（每次最多100行）
+3. 调用 `str_replace_code(old_str, new_str)` 替换，支持空白归一化匹配，无需缩进完全一致
+4. **绝不重新输出全部代码**
 
 ### 加新功能时：
-1. 调用 `view_code(start_line, end_line)` → 找到插入位置并确认上下文
+1. 调用 `search_code("插入点关键字")` → 定位插入位置
 2. 调用 `str_replace_code(old_str, old_str + new_str)` → 在目标内容后追加新代码
 
 ---
@@ -678,6 +716,7 @@ ALL_TOOLS = [
     append_code_chunk,
     finish_code_write,
     view_code,
+    search_code,
 ]
 
 
