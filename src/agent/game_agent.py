@@ -262,34 +262,6 @@ def str_replace_code(old_str: str, new_str: str) -> str:
     return result["message"]
 
 
-@tool
-def insert_code(after_line: int, new_str: str) -> str:
-    """在当前游戏代码的指定行号之后插入新代码。
-
-    Args:
-        after_line: 在此行之后插入（0表示插到最前面）
-        new_str: 要插入的代码内容
-    """
-    result = CodeEditor.insert_after(_get_current_code(), after_line, new_str)
-    if result["success"]:
-        _set_current_code(result["code"])
-    return result["message"]
-
-
-@tool
-def delete_code(start_line: int, end_line: int) -> str:
-    """删除当前游戏代码中指定行范围的代码。
-
-    Args:
-        start_line: 起始行号（从1开始）
-        end_line: 结束行号（包含此行）
-    """
-    result = CodeEditor.delete_lines(_get_current_code(), start_line, end_line)
-    if result["success"]:
-        _set_current_code(result["code"])
-    return result["message"]
-
-
 def _detect_startup_order_issues(code: str) -> list[str]:
     """检测常见黑屏启动顺序问题，尤其是 let/const 变量声明前被 resize/init 调用访问。"""
     issues = []
@@ -481,56 +453,6 @@ def view_code(start_line: int = 1, end_line: int = -1) -> str:
     r = result['range']
     suffix = f"\n（共 {total} 行，当前显示 {r[0]}-{r[1]}，如需继续请调用 view_code({r[1]+1}, {r[1]+MAX_LINES})）" if r[1] < total else ""
     return f"共 {total} 行，当前显示 {r[0]}-{r[1]} 行：\n{result['content']}{suffix}"
-
-
-@tool
-def replace_code_lines(start_line: int, end_line: int, new_str: str) -> str:
-    """按行号替换当前游戏代码中的一段内容。适合 str_replace_code 精确匹配失败后的局部修改。
-
-    Args:
-        start_line: 起始行号（从1开始）
-        end_line: 结束行号（包含此行）
-        new_str: 替换后的新代码（空字符串表示删除）
-    """
-    result = CodeEditor.replace_lines(_get_current_code(), start_line, end_line, new_str)
-    if result["success"]:
-        _set_current_code(result["code"])
-    return result["message"]
-
-
-@tool
-def list_all_assets() -> str:
-    """列出知识库中所有可用的游戏素材（图片、音频等），生成游戏前必须调用此工具。"""
-    if not _kb:
-        return "知识库未初始化"
-    results = _kb.list_assets()
-    if not results:
-        return "【无素材】知识库中暂无上传的素材，请用 Canvas 2D API 绘制所有图形。"
-    lines = ["【可用素材列表】以下素材可直接在代码中引用："]
-    for a in results:
-        atype = a.get("asset_type", "image")
-        fname = a.get("file_name", "未知")
-        aid = a.get("asset_id", "")
-        ext = a.get("extension", "")
-        url = f"/assets/{atype}/{aid}{ext}"
-        lines.append(f"  - [{atype}] {fname} → src: \"{url}\"")
-    lines.append("\n⚠️ 生成代码时必须通过 loadImages() 预加载后使用这些素材！")
-    return "\n".join(lines)
-
-
-
-@tool
-def search_code(query: str) -> str:
-    """在当前游戏代码中搜索包含关键字的行，返回行号和内容。
-
-    Args:
-        query: 要搜索的关键字
-    """
-    result = CodeEditor.search(_get_current_code(), query)
-    if not result["matches"]:
-        return f"未找到包含 '{query}' 的代码"
-    lines = [f"  L{m['line']}: {m['content']}" for m in result["matches"][:15]]
-    return f"找到 {len(result['matches'])} 处匹配:\n" + "\n".join(lines)
 
 
 # ============ System Prompt ============
