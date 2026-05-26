@@ -452,6 +452,10 @@ def search_code(query: str, context_lines: int = 5) -> str:
 
     header = f"找到 {len(match_indices)} 处匹配（共 {total} 行）：\n"
     return header + '\n---\n'.join(parts)
+
+
+@tool
+def view_code(start_line: int = 1, end_line: int = -1) -> str:
     """查看当前游戏代码的指定行范围，返回带行号代码。修改前应先调用此工具确认上下文。
     每次最多返回 100 行，超出请分段查看。
 
