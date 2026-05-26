@@ -88,6 +88,15 @@ CONTEXT_INPUT_BUDGET_TOKENS = (
     - CONTEXT_SAFETY_MARGIN_TOKENS
     - SYSTEM_AND_TOOLS_OVERHEAD_TOKENS
 )
+CONTEXT_INPUT_BUDGET_TOKENS_DEEPSEEK = (
+    CONTEXT_WINDOW_TOKENS_DEEPSEEK
+    - MODEL_OUTPUT_TOKEN_BUDGET
+    - CONTEXT_SAFETY_MARGIN_TOKENS
+    - SYSTEM_AND_TOOLS_OVERHEAD_TOKENS
+)
+# 运行时根据 provider 动态设置，供 track_context_usage 使用
+_active_context_window: int = CONTEXT_WINDOW_TOKENS
+_active_input_budget: int = CONTEXT_INPUT_BUDGET_TOKENS
 # SummarizationMiddleware 配置
 SUMMARIZATION_KEEP_MESSAGES = 10  # 总结后保留最近10条消息
 # fraction 需要 langchain 支持 profile 参数，当前版本不支持，改用绝对 token 数
@@ -153,7 +162,7 @@ def track_context_usage(state: AgentState, runtime: Runtime) -> dict[str, Any] |
     prev_usage = _context_usage_by_session.get(session_id, {})
     prev_percent = prev_usage.get("percent", 0)
     prev_msg_count = prev_usage.get("message_count", 0)
-    current_percent = round(effective_used_tokens / CONTEXT_INPUT_BUDGET_TOKENS * 100)
+    current_percent = round(effective_used_tokens / _active_input_budget * 100)
     current_msg_count = len(messages)
 
     # 启发式检测：
@@ -167,8 +176,8 @@ def track_context_usage(state: AgentState, runtime: Runtime) -> dict[str, Any] |
         _context_usage_by_session[session_id] = {
             "used_tokens": effective_used_tokens,
             "raw_message_tokens": used_tokens,
-            "max_tokens": CONTEXT_INPUT_BUDGET_TOKENS,
-            "context_window_tokens": CONTEXT_WINDOW_TOKENS,
+            "max_tokens": _active_input_budget,
+            "context_window_tokens": _active_context_window,
             "reserved_output_tokens": MODEL_OUTPUT_TOKEN_BUDGET,
             "reserved_overhead_tokens": SYSTEM_AND_TOOLS_OVERHEAD_TOKENS + CONTEXT_SAFETY_MARGIN_TOKENS,
             "percent": current_percent,
@@ -184,8 +193,8 @@ def _get_context_usage(session_id: str) -> dict[str, int | bool]:
     return _context_usage_by_session.get(session_id, {
         "used_tokens": 0,
         "raw_message_tokens": 0,
-        "max_tokens": CONTEXT_INPUT_BUDGET_TOKENS,
-        "context_window_tokens": CONTEXT_WINDOW_TOKENS,
+        "max_tokens": _active_input_budget,
+        "context_window_tokens": _active_context_window,
         "reserved_output_tokens": MODEL_OUTPUT_TOKEN_BUDGET,
         "reserved_overhead_tokens": SYSTEM_AND_TOOLS_OVERHEAD_TOKENS + CONTEXT_SAFETY_MARGIN_TOKENS,
         "percent": 0,
@@ -801,6 +810,14 @@ class GameDesignAgent:
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.checkpoint_path = checkpoint_dir / "langgraph_checkpoints.sqlite"
         self.model = model
+        # 根据 provider 设置活跃上下文窗口大小，供前端圆环显示
+        global _active_context_window, _active_input_budget
+        if provider == "deepseek":
+            _active_context_window = CONTEXT_WINDOW_TOKENS_DEEPSEEK
+            _active_input_budget = CONTEXT_INPUT_BUDGET_TOKENS_DEEPSEEK
+        else:
+            _active_context_window = CONTEXT_WINDOW_TOKENS
+            _active_input_budget = CONTEXT_INPUT_BUDGET_TOKENS
         self.checkpoint_conn: aiosqlite.Connection | None = None
         self.checkpointer: AsyncSqliteSaver | None = None
         self.agent = None
@@ -824,36 +841,16 @@ class GameDesignAgent:
             self.checkpointer = AsyncSqliteSaver(self.checkpoint_conn)
             await self.checkpointer.setup()
 
-            # 创建用于总结的模型（根据 provider 配置，使用更便宜的模型）
+            # 统一使用 DeepSeek 作为总结模型（1M 上下文，适合长对话总结）
             provider = self._detect_provider()
-
-            if provider == "deepseek":
-                summarization_model = init_chat_model(
-                    model=settings.deepseek_model or settings.openai_model,
-                    model_provider="openai",
-                    api_key=settings.deepseek_api_key or settings.openai_api_key,
-                    base_url=settings.deepseek_base_url or settings.openai_base_url,
-                    temperature=0.3,
-                    max_tokens=500,
-                )
-            elif provider == "qwen":
-                summarization_model = init_chat_model(
-                    model=settings.qwen_model or settings.openai_model,
-                    model_provider="openai",
-                    api_key=settings.qwen_api_key or settings.openai_api_key,
-                    base_url=settings.qwen_base_url or settings.openai_base_url,
-                    temperature=0.3,
-                    max_tokens=500,
-                )
-            else:
-                summarization_model = init_chat_model(
-                    model="gpt-4o-mini",
-                    model_provider="openai",
-                    api_key=settings.openai_api_key,
-                    base_url=settings.openai_base_url,
-                    temperature=0.3,
-                    max_tokens=500,
-                )
+            summarization_model = init_chat_model(
+                model=settings.deepseek_model or "deepseek-v4-flash",
+                model_provider="openai",
+                api_key=settings.deepseek_api_key,
+                base_url=settings.deepseek_base_url or "https://api.deepseek.com",
+                temperature=0.3,
+                max_tokens=2000,
+            )
 
             self.agent = create_agent(
                 self.model,
@@ -866,7 +863,7 @@ class GameDesignAgent:
                         edits=[
                             ClearToolUsesEdit(
                                 trigger=40000,   # 工具结果累计超过 40K tokens 时清理
-                                keep=3,          # 保留最近 3 次工具结果
+                                keep=5,          # 保留最近 5 次工具结果
                                 placeholder="[已清理]",
                             ),
                         ],
@@ -876,6 +873,7 @@ class GameDesignAgent:
                         model=summarization_model,
                         trigger=("tokens", SUMMARIZATION_TRIGGER_TOKENS_DEEPSEEK if provider == "deepseek" else SUMMARIZATION_TRIGGER_TOKENS_DEFAULT),
                         keep=("messages", SUMMARIZATION_KEEP_MESSAGES),
+                        trim_tokens_to_summarize=32000,  # 默认4000太小，增大以支持长对话总结
                     ),
                 ],
                 checkpointer=self.checkpointer,
@@ -1021,3 +1019,8 @@ class GameDesignAgent:
                 await self.checkpointer.adelete_thread(session_id)
         except Exception:
             pass
+        # 清理上下文使用率缓存，让前端圆环归零
+        _context_usage_by_session.pop(session_id, None)
+        _code_by_session.pop(session_id, None)
+        _code_session_last_access.pop(session_id, None)
+        _code_write_buffer.pop(session_id, None)

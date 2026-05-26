@@ -633,6 +633,7 @@ async function resetCurrentWorkspace(message = '👋 已创建新项目。告诉
     currentProjectId = '';
     chatMessages.innerHTML = '';
     addMessage(message, 'ai');
+    updateContextMeter();  // 重置上下文圆环
     const starterCode = '<!-- 新项目 - 开始设计你的游戏 -->\n';
     if (editor) {
         editor.setValue(starterCode);
