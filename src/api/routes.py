@@ -15,7 +15,7 @@ from starlette.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from src.knowledge.knowledge_base import KnowledgeBase
-from src.agent.game_agent import GameDesignAgent
+from src.agent.game_agent import GameDesignAgent, SKILLS, _save_custom_skills
 
 router = APIRouter()
 
@@ -379,15 +379,157 @@ async def delete_project(project_id: str):
     return {"ok": True}
 
 
-# ============ 知识库 API ============
+# ============ Skills API ============
 
-@router.get("/api/knowledge/stats")
-async def knowledge_stats():
-    """知识库统计"""
-    return kb.get_stats()
+def _sync_skills():
+    """更新 SkillMiddleware 的 prompt 缓存 + 持久化到磁盘"""
+    import src.agent.game_agent as ga
+    ga._skills_prompt = "\n".join(f"- **{s['name']}**: {s['description']}" for s in SKILLS)
+    _save_custom_skills()
+
+class SkillCreateRequest(BaseModel):
+    name: str
+    description: str
+    content: str
+
+@router.get("/api/skills")
+async def list_skills():
+    """列出所有技能"""
+    return [{"name": s["name"], "description": s["description"]} for s in SKILLS]
+
+@router.post("/api/skills")
+async def add_skill(req: SkillCreateRequest):
+    """添加自定义技能"""
+    for s in SKILLS:
+        if s["name"] == req.name:
+            raise HTTPException(400, f"技能 '{req.name}' 已存在")
+    SKILLS.append({"name": req.name, "description": req.description, "content": req.content})
+    _sync_skills()
+    return {"ok": True, "name": req.name}
+
+@router.delete("/api/skills/{skill_name}")
+async def delete_skill(skill_name: str):
+    """删除技能"""
+    for i, s in enumerate(SKILLS):
+        if s["name"] == skill_name:
+            SKILLS.pop(i)
+            _sync_skills()
+            return {"ok": True}
+    raise HTTPException(404, f"技能 '{skill_name}' 不存在")
+
+@router.get("/api/skills/{skill_name}")
+async def get_skill(skill_name: str):
+    """获取技能完整内容"""
+    for s in SKILLS:
+        if s["name"] == skill_name:
+            return s
+    raise HTTPException(404, f"技能 '{skill_name}' 不存在")
 
 
-@router.get("/api/knowledge/search")
-async def search_knowledge(q: str, category: str | None = None, top_k: int = 5):
-    """搜索知识库"""
-    return kb.search_skills(q, category, top_k)
+@router.post("/api/skills/import")
+async def import_skills_zip(file: UploadFile = File(...)):
+    """从 ZIP 文件批量导入技能（每个 .md 文件 = 一个技能，每个 .json 文件 = 一个或多个技能）"""
+    import zipfile, io, json as json_mod
+    if not file.filename or not file.filename.endswith('.zip'):
+        raise HTTPException(400, "请上传 .zip 文件")
+    content = await file.read()
+    added = 0
+    try:
+        with zipfile.ZipFile(io.BytesIO(content)) as zf:
+            for name in zf.namelist():
+                # 跳过目录和隐藏文件
+                if name.endswith('/') or '/__MACOSX' in name or name.startswith('.'):
+                    continue
+                ext = name.rsplit('.', 1)[-1].lower()
+                raw = zf.read(name).decode('utf-8', errors='ignore')
+
+                if ext == 'md':
+                    skill_name = name.rsplit('/', 1)[-1].replace('.md', '').replace(' ', '_')
+                    lines = raw.split('\n')
+                    description = skill_name
+                    skill_content = raw
+                    if lines[0].startswith('#'):
+                        description = lines[0].lstrip('#').strip()
+                        skill_content = '\n'.join(lines[1:]).strip()
+                    if any(s["name"] == skill_name for s in SKILLS):
+                        continue
+                    SKILLS.append({"name": skill_name, "description": description, "content": skill_content})
+                    added += 1
+
+                elif ext == 'json':
+                    data = json_mod.loads(raw)
+                    items = data if isinstance(data, list) else [data]
+                    for s in items:
+                        if not s.get("name") or not s.get("content"):
+                            continue
+                        if any(existing["name"] == s["name"] for existing in SKILLS):
+                            continue
+                        SKILLS.append({
+                            "name": s["name"],
+                            "description": s.get("description", s["name"]),
+                            "content": s["content"],
+                        })
+                        added += 1
+    except zipfile.BadZipFile:
+        raise HTTPException(400, "无效的 ZIP 文件")
+
+    _sync_skills()
+    return {"ok": True, "added": added}
+
+
+class SkillScanRequest(BaseModel):
+    path: str  # 本地文件夹路径
+
+@router.post("/api/skills/scan")
+async def scan_skills_folder(req: SkillScanRequest):
+    """扫描本地文件夹，找到所有 SKILL.md 文件并导入"""
+    import os, re as re_mod
+    folder = req.path.strip()
+    if not os.path.isdir(folder):
+        raise HTTPException(400, f"路径不存在: {folder}")
+
+    found = []
+    for root, dirs, files in os.walk(folder):
+        for fname in files:
+            if fname.upper() == 'SKILL.MD':
+                filepath = os.path.join(root, fname)
+                try:
+                    with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                        raw = f.read()
+                    # 解析 YAML frontmatter
+                    skill_name = os.path.basename(root).replace(' ', '_')
+                    description = skill_name
+                    content = raw
+                    fm_match = re_mod.match(r'^---\s*\n(.*?)\n---\s*\n(.*)', raw, re_mod.DOTALL)
+                    if fm_match:
+                        fm_text = fm_match.group(1)
+                        content = fm_match.group(2).strip()
+                        for line in fm_text.split('\n'):
+                            if line.startswith('name:'):
+                                skill_name = line.split(':', 1)[1].strip().strip('"').strip("'")
+                            elif line.startswith('description:'):
+                                description = line.split(':', 1)[1].strip().strip('"').strip("'")
+                    found.append({
+                        "name": skill_name,
+                        "description": description,
+                        "content": content,
+                        "source": filepath,
+                    })
+                except Exception:
+                    continue
+
+    if not found:
+        raise HTTPException(404, f"在 {folder} 中未找到 SKILL.md 文件")
+
+    # 导入（跳过重名）
+    added = 0
+    skipped = []
+    for s in found:
+        if any(existing["name"] == s["name"] for existing in SKILLS):
+            skipped.append(s["name"])
+            continue
+        SKILLS.append({"name": s["name"], "description": s["description"], "content": s["content"]})
+        added += 1
+
+    _sync_skills()
+    return {"ok": True, "added": added, "skipped": skipped, "total_found": len(found)}

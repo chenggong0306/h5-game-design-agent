@@ -1021,3 +1021,179 @@ function showLoading(show) { document.getElementById('loading').classList.toggle
 document.querySelectorAll('.modal').forEach(m => {
     m.addEventListener('click', (e) => { if (e.target === m) m.classList.add('hidden'); });
 });
+
+// ============ 技能管理 ============
+document.getElementById('btn-skills').addEventListener('click', () => {
+    openModal('modal-skills');
+    loadSkills();
+});
+
+async function loadSkills() {
+    const list = document.getElementById('skills-list');
+    list.innerHTML = '<p style="color:#888;text-align:center">加载中...</p>';
+    try {
+        const res = await fetch('/api/skills');
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const skills = await res.json();
+        if (!skills.length) {
+            list.innerHTML = '<p style="color:#888;text-align:center">暂无技能</p>';
+            return;
+        }
+        list.innerHTML = skills.map(s => `
+            <div class="skill-item">
+                <div class="skill-info">
+                    <strong>${s.name}</strong>
+                    <span>${s.description}</span>
+                </div>
+                <div class="skill-actions">
+                    <button onclick="viewSkill('${s.name}')" title="查看">👁</button>
+                    <button onclick="deleteSkill('${s.name}')" title="删除">🗑️</button>
+                </div>
+            </div>
+        `).join('');
+    } catch (err) {
+        list.innerHTML = `<p style="color:#f66;text-align:center">加载失败: ${err.message}</p>`;
+        console.error('加载技能失败:', err);
+    }
+}
+
+async function viewSkill(name) {
+    try {
+        const res = await fetch(`/api/skills/${name}`);
+        const skill = await res.json();
+        document.getElementById('skill-name').value = skill.name;
+        document.getElementById('skill-name').disabled = true;  // 查看时禁止改名
+        document.getElementById('skill-desc').value = skill.description;
+        document.getElementById('skill-content').value = skill.content;
+        // 切换按钮文字
+        document.getElementById('btn-add-skill').textContent = '✏️ 更新技能';
+        document.getElementById('btn-add-skill').dataset.mode = 'edit';
+    } catch (err) {
+        alert('加载失败: ' + err.message);
+    }
+}
+
+async function deleteSkill(name) {
+    if (!confirm(`确定删除技能 "${name}"？`)) return;
+    try {
+        await fetch(`/api/skills/${name}`, { method: 'DELETE' });
+        await loadSkills();
+    } catch (err) {
+        alert('删除失败: ' + err.message);
+    }
+}
+
+document.getElementById('btn-add-skill').addEventListener('click', async () => {
+    const btn = document.getElementById('btn-add-skill');
+    const nameInput = document.getElementById('skill-name');
+    const name = nameInput.value.trim();
+    const desc = document.getElementById('skill-desc').value.trim();
+    const content = document.getElementById('skill-content').value.trim();
+    if (!name || !desc || !content) { alert('请填写完整'); return; }
+    try {
+        // 编辑模式：先删除旧的
+        if (btn.dataset.mode === 'edit') {
+            await fetch(`/api/skills/${name}`, { method: 'DELETE' });
+        }
+        const res = await fetch('/api/skills', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name, description: desc, content }),
+        });
+        if (!res.ok) { const d = await res.json(); throw new Error(d.detail); }
+        // 重置表单
+        nameInput.value = '';
+        nameInput.disabled = false;
+        document.getElementById('skill-desc').value = '';
+        document.getElementById('skill-content').value = '';
+        btn.textContent = '➕ 添加技能';
+        btn.dataset.mode = 'add';
+        await loadSkills();
+    } catch (err) {
+        alert('操作失败: ' + err.message);
+    }
+});
+
+// 文件导入（支持 .json / .md / .zip）
+document.getElementById('skill-import-file').addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const ext = file.name.split('.').pop().toLowerCase();
+    try {
+        let added = 0;
+        if (ext === 'json') {
+            // JSON：单个或数组格式
+            const text = await file.text();
+            const data = JSON.parse(text);
+            const skills = Array.isArray(data) ? data : [data];
+            for (const s of skills) {
+                if (!s.name || !s.description || !s.content) continue;
+                const res = await fetch('/api/skills', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(s),
+                });
+                if (res.ok) added++;
+            }
+        } else if (ext === 'md') {
+            // Markdown：文件名作为 name，首行作为 description，其余作为 content
+            const text = await file.text();
+            const name = file.name.replace(/\.md$/, '').replace(/[^a-zA-Z0-9_-]/g, '_');
+            const lines = text.split('\n');
+            let description = name;
+            let content = text;
+            // 如果首行是 # 标题，用作描述
+            if (lines[0] && lines[0].startsWith('#')) {
+                description = lines[0].replace(/^#+\s*/, '').trim();
+                content = lines.slice(1).join('\n').trim();
+            }
+            const res = await fetch('/api/skills', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name, description, content }),
+            });
+            if (res.ok) added++;
+        } else if (ext === 'zip') {
+            // ZIP：上传到后端解析
+            const formData = new FormData();
+            formData.append('file', file);
+            const res = await fetch('/api/skills/import', { method: 'POST', body: formData });
+            if (!res.ok) { const d = await res.json(); throw new Error(d.detail); }
+            const result = await res.json();
+            added = result.added || 0;
+        } else {
+            alert('不支持的文件格式，请使用 .json / .md / .zip');
+            e.target.value = '';
+            return;
+        }
+        alert(`✅ 成功导入 ${added} 个技能`);
+        await loadSkills();
+    } catch (err) {
+        alert('导入失败: ' + err.message);
+    }
+    e.target.value = '';
+});
+
+
+// 扫描本地文件夹导入
+document.getElementById('btn-scan-skills').addEventListener('click', async () => {
+    const scanPath = document.getElementById('skill-scan-path').value.trim();
+    if (!scanPath) { alert('请输入文件夹路径'); return; }
+    try {
+        const res = await fetch('/api/skills/scan', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ path: scanPath }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail);
+        let msg = `✅ 扫描完成！找到 ${data.total_found} 个技能，成功导入 ${data.added} 个`;
+        if (data.skipped && data.skipped.length) {
+            msg += `\n跳过（已存在）: ${data.skipped.join(', ')}`;
+        }
+        alert(msg);
+        await loadSkills();
+    } catch (err) {
+        alert('扫描失败: ' + err.message);
+    }
+});

@@ -342,6 +342,94 @@ function drawJoystick() {
 }
 ```"""
     },
+    {
+        "title": "H5 启动顺序与黑屏防护",
+        "category": "startup",
+        "tags": ["startup", "init", "blackscreen", "order", "resize"],
+        "content": """启动顺序是 H5 游戏黑屏的头号原因。必须严格遵守以下顺序：
+
+```
+正确顺序（从上到下）：
+1. canvas/ctx 获取
+2. resize() 定义 + window.addEventListener('resize', resize) + resize()
+3. let/const 全局状态声明（player, state, enemies, score 等）
+4. 工具函数定义（碰撞检测、绘图等）
+5. update(dt) / draw() 定义
+6. resetGame() 定义
+7. 输入事件绑定（click/touch/keyboard）
+8. loadImages({...}, () => { state='start'; requestAnimationFrame(loop); })
+```
+
+❌ 绝对禁止：
+- resize() 调用在 let player 声明之前
+- resetGame() 调用在 state 声明之前
+- requestAnimationFrame(loop) 在图片加载完成之前
+- init() 在全局变量声明之前
+
+黑屏自检清单（生成代码后必须逐项检查）：
+□ 有且仅有一个 requestAnimationFrame(loop)，在 loadImages 回调中
+□ loop 函数调用了 ctx.clearRect(0,0,canvas.width,canvas.height)
+□ state 初始值是 'loading' 或 'start'，不是 'playing'
+□ drawStart() 函数存在且有可见绘制（fillText/fillRect）
+□ canvas.addEventListener('click', ...) 在 resetGame 定义之后
+□ resize 中使用 ctx.setTransform(dpr,0,0,dpr,0,0) 而非 ctx.scale(dpr,dpr)
+□ 所有 let/const 变量在顶层 resize() 调用之后声明
+
+resize 正确写法：
+```javascript
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  const w = window.innerWidth, h = window.innerHeight;
+  canvas.width = w * dpr;
+  canvas.height = h * dpr;
+  canvas.style.width = w + 'px';
+  canvas.style.height = h + 'px';
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0); // ✅ 不要用 ctx.scale
+}
+```"""
+    },
+    {
+        "title": "H5 代码质量规则集",
+        "category": "quality",
+        "tags": ["quality", "rules", "safety", "validation", "platform"],
+        "content": """生成 H5 游戏代码时必须遵守的完整质量规则：
+
+## 状态机
+- 必须有 state 变量，至少包含 'start' | 'playing' | 'over' 三种状态
+- 主循环 loop(ts) 根据 state 分支：drawStart / update+draw / drawOver
+- 点击/触摸事件切换状态，不要在 loop 里写 if(clicked)
+
+## 帧率无关
+- 所有移动必须用 deltaTime：obj.x += speed * dt
+- dt = Math.min((ts - lastTime) / 1000, 0.05)，必须有 0.05 上限防卡顿跳帧
+- 禁止 obj.x += 5 这种固定像素移动
+
+## 数值安全
+- ctx.ellipse / ctx.arc 的半径参数必须 Math.max(1, value)
+- 除法前检查分母：time > 0 ? distance / time : 0
+- Math.random 范围不要超出画布：Math.random() * (canvas.width - margin)
+
+## 数组与内存
+- 删除元素用 filter，不要在 for 循环中 splice
+- 屏幕外对象及时清理：arr = arr.filter(o => o.y < canvas.height + margin)
+- 粒子/子弹数组限制最大长度
+
+## 触摸与输入
+- 触摸坐标必须转换：getBoundingClientRect() + clientX/clientY 偏移
+- 同时支持 touch + mouse + keyboard
+- touchstart/touchmove 必须 e.preventDefault() + {passive: false}
+
+## Canvas 绘制
+- 每帧开头 ctx.clearRect(0, 0, canvas.width, canvas.height)
+- 绘制顺序：背景 → 游戏对象 → UI/分数（后绘制的在上层）
+- 文字用相对尺寸：ctx.font = `${canvas.width * 0.05}px Arial`
+
+## 平台类游戏额外规则
+- 重力加速度基于 dt：vy += gravity * dt; y += vy * dt
+- 第一个平台必须在玩家脚下，间隙 ≤ 跳跃距离
+- 落出屏幕底部 → game over
+- 平台宽度 ≥ 玩家宽度 × 1.5"""
+    },
 ]
 
 

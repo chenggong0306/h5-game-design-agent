@@ -18,7 +18,7 @@
 | 📝 **代码编辑器** | Monaco Editor（VS Code 同款），语法高亮 + 自动补全 |
 | 🎮 **实时预览** | iframe 沙盒预览，代码改完即时运行 |
 | 🎨 **素材管理** | 上传图片/音频素材，AI 自动在生成的代码中引用 |
-| 📚 **知识库** | ChromaDB 向量检索，内置 H5 游戏开发技能文档 |
+| 🧠 **技能系统** | 内置 7 个 H5 游戏开发技能，支持自定义导入（JSON/MD/ZIP/本地扫描） |
 | 💾 **项目管理** | 保存 / 加载 / 删除游戏项目 |
 | 🧠 **上下文压缩** | 对话历史自动总结，长对话不丢失上下文 |
 
@@ -29,18 +29,21 @@
                 │              │
                 │         Middleware 层
                 │          ├── track_context_usage（上下文监控）
+                │          ├── SkillMiddleware（技能列表注入 + load_skill 工具）
                 │          ├── ContextEditingMiddleware（清理旧工具结果）
                 │          └── SummarizationMiddleware（历史自动总结）
                 │
-                │        ChromaDB 知识库
-                │         ├── 游戏素材（图片/音频）
-                │         └── H5 开发技能文档
+                │        数据层
+                │         ├── ChromaDB（素材向量检索）
+                │         ├── Skills（内置 + 自定义，JSON 持久化）
+                │         └── Projects（项目管理）
                 │
            SSE 流式输出 ──→ 前端实时渲染
                               ├── 对话面板（打字机效果）
                               ├── 上下文使用率圆环
                               ├── 工具调用卡片
                               ├── Monaco 代码编辑器
+                              ├── 技能管理面板
                               └── iframe 游戏预览
 ```
 
@@ -49,12 +52,13 @@
 | 工具 | 说明 |
 |------|------|
 | `search_assets` | 搜索知识库中的游戏素材 |
-| `search_knowledge` | 搜索 H5 游戏开发知识库 |
+| `load_skill` | 加载技能完整内容（由 SkillMiddleware 注册） |
 | `write_game_code` | 一次性写入完整游戏代码（<500行） |
 | `start_code_write` | 分块写入：初始化缓冲区（长代码用） |
 | `append_code_chunk` | 分块写入：追加代码块 |
 | `finish_code_write` | 分块写入：完成并写入编辑器 |
 | `view_code` | 查看代码（每次最多100行） |
+| `search_code` | 搜索代码关键字（返回匹配行+上下文） |
 | `str_replace_code` | 替换代码片段（支持空白归一化匹配） |
 
 ## 🚀 快速开始

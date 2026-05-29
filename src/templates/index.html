@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>🎮 AI 游戏设计工坊</title>
-    <link rel="stylesheet" href="/static/css/style.css">
+    <link rel="stylesheet" href="/static/css/style.css?v=20250712-skills">
     <!-- Monaco Editor CDN -->
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/monaco-editor@0.45.0/min/vs/editor/editor.main.css">
 </head>
@@ -22,6 +22,7 @@
             <button id="btn-save" title="保存项目">💾 保存</button>
             <button id="btn-load" title="加载项目">📂 项目</button>
             <button id="btn-assets" title="素材管理">🎨 素材</button>
+            <button id="btn-skills" title="技能管理">🧠 技能</button>
             <button id="btn-history" title="对话历史">📜 历史</button>
         </div>
     </header>
@@ -161,6 +162,35 @@
         </div>
     </div>
 
+    <!-- 技能管理弹窗 -->
+    <div id="modal-skills" class="modal hidden">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>🧠 技能管理</h2>
+                <button class="modal-close" onclick="closeModal('modal-skills')">✕</button>
+            </div>
+            <div class="modal-body">
+                <div class="skill-add-form">
+                    <input type="text" id="skill-name" placeholder="技能名称（英文，如 rpg_combat）">
+                    <input type="text" id="skill-desc" placeholder="技能描述（中文）">
+                    <textarea id="skill-content" rows="6" placeholder="技能内容（代码模板、规则等）"></textarea>
+                    <div class="skill-add-actions">
+                        <button id="btn-add-skill">➕ 添加技能</button>
+                        <label class="skill-import-label">
+                            📥 导入文件
+                            <input type="file" id="skill-import-file" accept=".json,.md,.zip" style="display:none">
+                        </label>
+                    </div>
+                    <div class="skill-scan-row">
+                        <input type="text" id="skill-scan-path" placeholder="本地文件夹路径，如 C:\skills 或 /home/user/skills">
+                        <button id="btn-scan-skills">📂 扫描导入</button>
+                    </div>
+                </div>
+                <div id="skills-list" class="skills-list"></div>
+            </div>
+        </div>
+    </div>
+
     <!-- 加载提示 -->
     <div id="loading" class="loading hidden">
         <div class="spinner"></div>
@@ -168,6 +198,6 @@
     </div>
 
     <script src="https://cdn.jsdelivr.net/npm/monaco-editor@0.45.0/min/vs/loader.js"></script>
-    <script src="/static/js/app.js?v=20260525-runtime-diagnostics"></script>
+    <script src="/static/js/app.js?v=20250712-skills"></script>
 </body>
 </html>

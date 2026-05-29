@@ -481,6 +481,49 @@ body {
 
 /* 历史列表 */
 .history-list { display: flex; flex-direction: column; gap: 10px; }
+
+/* 技能管理 */
+.skill-add-form {
+    display: flex; flex-direction: column; gap: 10px;
+    margin-bottom: 16px; padding: 16px;
+    border: 1px dashed var(--border); border-radius: 12px;
+}
+.skill-add-form input, .skill-add-form textarea {
+    padding: 8px 12px; background: var(--bg-primary);
+    border: 1px solid var(--border); color: var(--text-primary);
+    border-radius: 6px; font-size: 13px; font-family: inherit;
+}
+.skill-add-form textarea { resize: vertical; min-height: 80px; }
+.skill-add-actions { display: flex; gap: 10px; }
+.skill-add-actions button, .skill-import-label {
+    padding: 8px 16px; border-radius: 8px;
+    background: var(--accent); color: #fff; border: none;
+    cursor: pointer; font-size: 13px; font-weight: 600;
+}
+.skill-import-label { background: var(--bg-secondary); cursor: pointer; text-align: center; }
+.skill-scan-row {
+    display: flex; gap: 10px; margin-top: 6px;
+}
+.skill-scan-row input { flex: 1; }
+.skill-scan-row button {
+    padding: 8px 16px; border-radius: 8px;
+    background: var(--bg-secondary); color: var(--text-primary); border: 1px solid var(--border);
+    cursor: pointer; font-size: 13px; font-weight: 600; white-space: nowrap;
+}
+.skills-list { display: flex; flex-direction: column; gap: 8px; }
+.skill-item {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 10px 14px; background: var(--bg-primary);
+    border-radius: 8px; font-size: 13px;
+}
+.skill-info { display: flex; flex-direction: column; gap: 2px; flex: 1; }
+.skill-info strong { color: var(--accent); }
+.skill-info span { color: var(--text-secondary); font-size: 12px; }
+.skill-actions { display: flex; gap: 6px; }
+.skill-actions button {
+    background: none; border: none; cursor: pointer;
+    font-size: 16px; padding: 2px 6px;
+}
 .history-item {
     display: flex;
     flex-direction: column;
@@ -666,7 +709,7 @@ body::before {
     background: linear-gradient(180deg, rgba(16,24,50,0.95), rgba(7,10,24,0.95));
     border: 1px solid var(--line); border-radius: 22px; box-shadow: var(--shadow-card), var(--shadow-glow);
 }
-.upload-zone, .asset-item, .project-item, .history-item {
+.upload-zone, .asset-item, .project-item, .history-item, .skill-item, .skill-add-form {
     background: rgba(7, 12, 28, 0.70); border: 1px solid rgba(134,169,255,0.18);
 }
 .spinner { border-color: rgba(134,169,255,0.18); border-top-color: var(--neon-cyan); box-shadow: 0 0 24px rgba(53,231,255,0.25); }
