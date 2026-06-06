@@ -53,13 +53,9 @@
 |------|------|
 | `search_assets` | 搜索知识库中的游戏素材 |
 | `load_skill` | 加载技能完整内容（由 SkillMiddleware 注册） |
-| `write_game_code` | 一次性写入完整游戏代码（<500行） |
-| `start_code_write` | 分块写入：初始化缓冲区（长代码用） |
-| `append_code_chunk` | 分块写入：追加代码块 |
-| `finish_code_write` | 分块写入：完成并写入编辑器 |
+| `str_replace_code` | 写入/编辑代码（new_str 以 `<!DOCTYPE` 开头=重置覆盖；`append=True`=分段追加；`old_str` 非空=替换片段） |
 | `view_code` | 查看代码（每次最多100行） |
 | `search_code` | 搜索代码关键字（返回匹配行+上下文） |
-| `str_replace_code` | 替换代码片段（支持空白归一化匹配） |
 
 ## 🚀 快速开始
 

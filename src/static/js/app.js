@@ -2,10 +2,160 @@
  * AI 游戏设计工坊 - 前端主逻辑
  */
 
+// ============ 企业级错误处理模块 ============
+class ErrorHandler {
+    constructor() {
+        this.errorLog = []; // 错误日志
+        this.maxLogSize = 100; // 最多保留 100 条
+    }
+
+    /**
+     * 解析后端结构化错误
+     * @param {string} message - 错误消息
+     * @returns {{code: string, message: string, isError: boolean}}
+     */
+    parse(message) {
+        const match = String(message || '').match(/\[ERROR:(\w+)\]\s*(.+)/);
+        if (match) {
+            return {
+                code: match[1],
+                message: match[2],
+                isError: true
+            };
+        }
+        return { code: null, message, isError: false };
+    }
+
+    /**
+     * 记录错误到日志
+     */
+    log(error) {
+        this.errorLog.push({
+            timestamp: new Date().toISOString(),
+            code: error.code,
+            message: error.message,
+        });
+        if (this.errorLog.length > this.maxLogSize) {
+            this.errorLog.shift();
+        }
+    }
+
+    /**
+     * 显示错误消息（根据错误码分类处理）
+     */
+    show(error) {
+        this.log(error);
+
+        const handlers = {
+            'RATE_LIMIT_EXCEEDED': () => this.showRateLimitError(error),
+            'INPUT_TOO_LARGE': () => this.showInputTooLargeError(error),
+            'CODE_SIZE_EXCEEDED': () => this.showCodeSizeError(error),
+            'INVALID_PARAMS': () => this.showParamError(error),
+            'APPEND_TO_EMPTY': () => this.showAppendError(error),
+        };
+
+        const handler = handlers[error.code] || (() => this.showDefaultError(error));
+        handler();
+    }
+
+    showRateLimitError(error) {
+        this.showErrorBubble('⏱️ 操作频率过快', error.message + '\n\n请稍等片刻再试。', 'warning');
+    }
+
+    showInputTooLargeError(error) {
+        this.showErrorBubble('📦 内容过大', error.message + '\n\n建议：\n• 分段输入代码\n• 优化代码长度', 'warning');
+    }
+
+    showCodeSizeError(error) {
+        this.showErrorBubble('💾 代码文件过大', error.message + '\n\n建议：\n• 删除不必要的注释\n• 精简代码逻辑', 'warning');
+    }
+
+    showParamError(error) {
+        this.showErrorBubble('⚠️ 参数错误', error.message, 'error');
+    }
+
+    showAppendError(error) {
+        this.showErrorBubble('📝 续写失败', error.message, 'error');
+    }
+
+    showDefaultError(error) {
+        this.showErrorBubble('❌ 错误', error.message, 'error');
+    }
+
+    /**
+     * 在聊天界面显示错误气泡
+     */
+    showErrorBubble(title, message, level = 'error') {
+        const div = document.createElement('div');
+        div.className = `msg error error-${level}`;
+        div.innerHTML = `
+            <div class="msg-content">
+                <div class="error-title">${escapeHtml(title)}</div>
+                <div class="error-message">${escapeHtml(message).replace(/\n/g, '<br>')}</div>
+            </div>
+        `;
+        chatMessages.appendChild(div);
+        chatMessages.scrollTop = chatMessages.scrollHeight;
+    }
+
+    /**
+     * 导出错误日志
+     */
+    export() {
+        return JSON.stringify(this.errorLog, null, 2);
+    }
+}
+
+const errorHandler = new ErrorHandler();
+
+// ============ 工具调用状态跟踪 ============
+class ToolProgressTracker {
+    constructor() {
+        this.activeTools = new Map(); // tool_id -> {name, startTime, status}
+    }
+
+    start(toolId, toolName) {
+        this.activeTools.set(toolId, {
+            name: toolName,
+            startTime: performance.now(),
+            status: 'running'
+        });
+    }
+
+    finish(toolId, success = true) {
+        const tool = this.activeTools.get(toolId);
+        if (tool) {
+            tool.status = success ? 'success' : 'error';
+            tool.duration = performance.now() - tool.startTime;
+        }
+    }
+
+    getStatus(toolId) {
+        return this.activeTools.get(toolId);
+    }
+
+    clear() {
+        this.activeTools.clear();
+    }
+}
+
+const toolTracker = new ToolProgressTracker();
+
 let editor = null;       // Monaco Editor 实例
 let sessionId = localStorage.getItem('gameDesignSessionId') || '';       // 当前会话 ID
 let currentProjectId = ''; // 当前项目 ID
 let pendingLatestCode = null; // Monaco 尚未初始化时，临时保存要恢复的历史代码
+let codeDirty = false;        // 用户是否在编辑器里手动改过代码（随请求上报，服务端据此决定是否采用 current_code）
+let isApplyingCode = false;   // 程序化写入编辑器时置位，避免把它误判为用户编辑
+
+// 程序化写入编辑器（服务器代码 / 模板 / 加载项目），写入后清除 dirty 标记
+function applyEditorCode(code) {
+    if (!editor) { pendingLatestCode = code; return; }
+    isApplyingCode = true;
+    editor.setValue(code || '');
+    isApplyingCode = false;
+    codeDirty = false;
+}
 
 
 // ============ 初始化 Monaco Editor ============
@@ -20,6 +170,11 @@ require(['vs/editor/editor.main'], function () {
         wordWrap: 'on',
         automaticLayout: true,
         tabSize: 2,
+    });
+
+    // 区分用户手改与程序化写入：只有非程序化写入才标记为脏
+    editor.onDidChangeModelContent(() => {
+        if (!isApplyingCode) codeDirty = true;
     });
 
     if (pendingLatestCode !== null) {
@@ -179,14 +334,13 @@ function escapeHtml(value) {
 
 function getToolMeta(tool) {
     const map = {
-        list_all_assets: ['🧩', '列出素材'],
         search_assets: ['🔎', '搜索素材'],
-        search_knowledge: ['📚', '检索知识库'],
+        load_skill: ['📚', '加载技能'],
         search_code: ['⌕', '搜索代码'],
         view_code: ['👁', '查看代码'],
-        str_replace_code: ['✏️', '替换代码'],
-        replace_code_lines: ['🧵', '按行替换'],
-        write_game_code: ['✍️', '写入 game.html'],
+        write_game: ['✍️', '写入游戏'],
+        append_game: ['➿', '续写游戏'],
+        replace_code: ['✏️', '替换代码'],
         insert_code: ['➕', '插入代码'],
         delete_code: ['🗑️', '删除代码'],
     };
@@ -309,7 +463,7 @@ function restoreEditorCode(code) {
         return;
     }
     const value = code || '<!-- 这个历史会话暂时没有保存代码快照 -->\n';
-    editor.setValue(value);
+    applyEditorCode(value);
     if (code) runGame();
     else {
         document.getElementById('game-preview').srcdoc = '';
@@ -468,6 +622,7 @@ async function sendMessage(messageOverride = null, options = {}) {
                 session_id: sessionId,
                 message: msg,
                 current_code: currentCode,
+                code_dirty: codeDirty,
                 images: imagesToSend,
 
             }),
@@ -516,6 +671,10 @@ async function sendMessage(messageOverride = null, options = {}) {
                         };
                         activeStreamState.toolEvents.push(item);
                         activeStreamState.blocks.push({ type: 'tool', item });
+
+                        // 工具进度跟踪：启动进度条
+                        toolTracker.start(toolId, event.tool);
+
                         renderStreamMessage(activeStreamState, true);
                     } else if (event.type === 'tool_result') {
                         const target = event.id
@@ -525,16 +684,37 @@ async function sendMessage(messageOverride = null, options = {}) {
                                 .find(t => t.tool === event.tool && t.status === 'running');
                         if (target) {
                             target.result = event.result || '';
-                            target.status = isToolErrorResult(target.result) ? 'error' : 'done';
+
+                            // 企业级错误处理：解析后端错误码
+                            const parsedError = errorHandler.parse(target.result);
+                            if (parsedError.isError) {
+                                errorHandler.show(parsedError);
+                                target.status = 'error';
+                            } else {
+                                target.status = isToolErrorResult(target.result) ? 'error' : 'done';
+                            }
+
+                            // 工具进度跟踪
+                            toolTracker.finish(target.id, target.status === 'done');
                         } else {
                             activeStreamState.toolSeq += 1;
                             const toolId = event.id || `tool-${Date.now()}-${activeStreamState.toolSeq}`;
+
+                            // 企业级错误处理：解析后端错误码
+                            const parsedError = errorHandler.parse(event.result);
+                            const status = parsedError.isError ? 'error' :
+                                (isToolErrorResult(event.result) ? 'error' : 'done');
+
+                            if (parsedError.isError) {
+                                errorHandler.show(parsedError);
+                            }
+
                             const item = {
                                 id: toolId,
                                 tool: event.tool,
                                 args: '',
                                 result: event.result || '',
-                                status: isToolErrorResult(event.result) ? 'error' : 'done',
+                                status: status,
                                 open: false,
                             };
                             activeStreamState.toolEvents.push(item);
@@ -549,8 +729,9 @@ async function sendMessage(messageOverride = null, options = {}) {
 
                     } else if (event.type === 'code_update') {
                         if (editor && event.code) {
-                            editor.setValue(event.code);
-                            runGame();
+                            // 流式期间只更新编辑器文本，不在此刷新预览（避免多段编辑反复重载/闪屏），
+                            // 统一在 done 时跑一次
+                            applyEditorCode(event.code);
                             activeStreamState.codeUpdated = true;
                         }
                         renderStreamMessage(activeStreamState, true);
@@ -561,9 +742,11 @@ async function sendMessage(messageOverride = null, options = {}) {
 
                         if (event.code && !activeStreamState.codeUpdated) {
                             // 没有收到过 code_update 时，done 保留兜底同步
-                            editor.setValue(event.code);
-                            runGame();
+                            applyEditorCode(event.code);
                         }
+                        // 整轮结束后统一刷新一次预览（保证渲染的是完整代码，而非分段半成品）
+                        if (activeStreamState.codeUpdated || event.code) runGame();
+                        codeDirty = false;  // 本回合已完成，编辑器内容已随请求送达服务端，重置脏标记
 
                         // 显示编辑日志，不依赖 editor 是否需要兜底同步
                         if (event.action === 'edit' && event.edit_logs) {
@@ -636,7 +819,7 @@ async function resetCurrentWorkspace(message = '👋 已创建新项目。告诉
     updateContextMeter();  // 重置上下文圆环
     const starterCode = '<!-- 新项目 - 开始设计你的游戏 -->\n';
     if (editor) {
-        editor.setValue(starterCode);
+        applyEditorCode(starterCode);
         document.getElementById('game-preview').srcdoc = '';
     } else {
         pendingLatestCode = starterCode;
@@ -914,7 +1097,7 @@ async function loadProject(id) {
         const res = await fetch(`/api/projects/${id}`);
         const data = await res.json();
         currentProjectId = id;
-        editor.setValue(data.code || '');
+        applyEditorCode(data.code || '');
         closeModal('modal-projects');
         runGame();
     } catch (err) {

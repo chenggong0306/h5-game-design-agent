@@ -12,8 +12,7 @@ from langchain.tools import tool
 from langchain.agents import AgentState, create_agent
 from langchain.agents.middleware import before_model, SummarizationMiddleware, ContextEditingMiddleware, ClearToolUsesEdit, AgentMiddleware, ModelRequest
 from langchain.chat_models import init_chat_model
-from langchain_core.messages import AIMessageChunk, HumanMessage
-from langchain_core.messages.utils import count_tokens_approximately
+from langchain_core.messages import AIMessageChunk
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.runtime import Runtime
 
@@ -21,15 +20,44 @@ from src.config import settings
 from src.knowledge.knowledge_base import KnowledgeBase
 from src.knowledge.phaser_skills import H5_GAME_SKILLS
 from src.agent.code_editor import CodeEditor
+from src.utils.logger import logger, log_tool_call, log_error, log_session_event
+from src.utils.persistence import save_session_code, load_session_code, delete_session_code
+
+# -------- 企业级：错误码定义 --------
+class ErrorCode:
+    """工具调用错误码枚举"""
+    INPUT_TOO_LARGE = "INPUT_TOO_LARGE"
+    CODE_SIZE_EXCEEDED = "CODE_SIZE_EXCEEDED"
+    INVALID_PARAMS = "INVALID_PARAMS"
+    NOT_FOUND = "NOT_FOUND"
+    RATE_LIMIT_EXCEEDED = "RATE_LIMIT_EXCEEDED"
+    APPEND_TO_EMPTY = "APPEND_TO_EMPTY"
+    MULTIPLE_MATCHES = "MULTIPLE_MATCHES"
+    SYSTEM_ERROR = "SYSTEM_ERROR"
+
+
+def format_error(code: str, message: str) -> str:
+    """格式化错误返回。格式：[ERROR:CODE] message
+    前端可通过正则 \\[ERROR:(\\w+)\\] 提取错误码做不同处理。
+    """
+    return f"[ERROR:{code}] {message}"
 
 # -------- 全局知识库实例（工具函数需要访问） --------
 _kb: KnowledgeBase | None = None
 _current_session_id: ContextVar[str] = ContextVar("current_session_id", default="")
 _code_by_session: dict[str, str] = {}
+_staging_by_session: dict[str, str] = {}  # 分段写入新游戏的暂存区，校验通过后才提交到 _code_by_session
 _code_session_last_access: dict[str, float] = {}  # 记录最后访问时间，用于清理
-_code_write_buffer: dict[str, list[str]] = {}  # 分块写入临时缓冲区
-_last_write_session_id: str = ""  # ContextVar 丢失时的 fallback
 CODE_SESSION_TIMEOUT = 3600  # 1小时未访问的会话代码将被清理
+
+# -------- 企业级配置：资源限制 --------
+MAX_CODE_SIZE = 5 * 1024 * 1024  # 单个代码文件最大 5MB
+MAX_OLD_STR_SIZE = 100 * 1024  # str_replace 的 old_str 最大 100KB
+MAX_TOTAL_CACHE_SIZE = 100 * 1024 * 1024  # 所有会话代码总缓存最大 100MB
+MAX_SESSIONS = 1000  # 最多同时缓存 1000 个会话
+
+# 限流已上移到 HTTP 层（src/api/routes.py）。原先按工具调用计数的限流会卡断长游戏的
+# 分段写入，且层级不对；ErrorCode.RATE_LIMIT_EXCEEDED 保留给 HTTP 层使用。
 
 
 def _get_current_code() -> str:
@@ -42,19 +70,98 @@ def _get_current_code() -> str:
 
 
 def _set_current_code(code: str) -> None:
-    """写入当前会话的编辑器代码。"""
+    """写入当前会话的编辑器代码，并自动持久化到磁盘。"""
     session_id = _current_session_id.get()
     if session_id:
         _code_by_session[session_id] = code
         _code_session_last_access[session_id] = time.time()
+        _enforce_cache_limits()
+
+        # 异步持久化（不阻塞主流程）
+        try:
+            save_session_code(session_id, code)
+        except Exception as e:
+            logger.warning("persist_failed", session_id=session_id, error=str(e))
 
 
-def _begin_code_session(session_id: str, code: str):
-    """绑定当前 async 上下文的会话 ID，并初始化该会话代码。"""
+def _enforce_cache_limits() -> None:
+    """强制执行缓存限制：总大小不超过 MAX_TOTAL_CACHE_SIZE，会话数不超过 MAX_SESSIONS。
+    使用 LRU 策略：优先清理最久未访问的会话。
+    """
+    # 1. 检查会话数量限制
+    if len(_code_by_session) > MAX_SESSIONS:
+        # 按最后访问时间排序，删除最旧的
+        sorted_sessions = sorted(
+            _code_session_last_access.items(),
+            key=lambda x: x[1]
+        )
+        to_remove = len(_code_by_session) - MAX_SESSIONS
+        for session_id, _ in sorted_sessions[:to_remove]:
+            _code_by_session.pop(session_id, None)
+            _code_session_last_access.pop(session_id, None)
+
+    # 2. 检查总大小限制
+    total_size = sum(len(code) for code in _code_by_session.values())
+    if total_size > MAX_TOTAL_CACHE_SIZE:
+        # 按最后访问时间排序，逐个删除直到总大小低于限制
+        sorted_sessions = sorted(
+            _code_session_last_access.items(),
+            key=lambda x: x[1]
+        )
+        for session_id, _ in sorted_sessions:
+            if total_size <= MAX_TOTAL_CACHE_SIZE:
+                break
+            code_size = len(_code_by_session.get(session_id, ""))
+            _code_by_session.pop(session_id, None)
+            _code_session_last_access.pop(session_id, None)
+            total_size -= code_size
+
+
+def _begin_code_session(session_id: str, code: str, client_dirty: bool = False):
+    """绑定当前 async 上下文的会话 ID，并协调出本回合的基准代码。
+
+    数据源唯一化：服务端权威代码 = 内存缓冲优先、其次磁盘 .html。前端传入的
+    current_code 不再无脑覆盖服务端，而是按下列规则协调，避免 stale 标签页 / 渲染
+    失败 / 多标签共享会话时用旧代码冲掉工具刚写好的权威代码：
+    - 服务端没有代码 → 采用前端传入（新会话 / 新建场景）
+    - client_dirty=True（用户确实在编辑器里手改过）→ 以前端为准
+    - 前端没声明手改、但内容与服务端不一致 → 判为 stale，保留服务端权威代码并告警
+    - 其余情况 → 两者一致或前端为空，取非空的一方
+    """
     token = _current_session_id.set(session_id)
-    _code_by_session[session_id] = code
+
+    # 每个回合开始时清空残留的分段写入暂存区（上一回合应已提交或丢弃）
+    _staging_by_session.pop(session_id, None)
+
+    server_code = _code_by_session.get(session_id)
+    if server_code is None:
+        server_code = load_session_code(session_id) or ""
+        if server_code:
+            logger.info("session_restored_from_disk", session_id=session_id, size=len(server_code))
+
+    if not server_code:
+        chosen = code
+    elif client_dirty:
+        chosen = code if code else server_code
+    elif code and code != server_code:
+        logger.warning("frontend_code_diverged_kept_server",
+            session_id=session_id, client_len=len(code), server_len=len(server_code))
+        chosen = server_code
+    else:
+        chosen = code or server_code
+
+    _code_by_session[session_id] = chosen
     _code_session_last_access[session_id] = time.time()
     _cleanup_old_sessions()
+
+    if chosen:
+        try:
+            save_session_code(session_id, chosen)
+        except Exception as e:
+            logger.warning("persist_initial_code_failed", session_id=session_id, error=str(e))
+
+    log_session_event(session_id, "session_started", code_size=len(chosen))
+
     return token
 
 
@@ -70,61 +177,66 @@ def _cleanup_old_sessions() -> None:
         sid for sid, last_access in _code_session_last_access.items()
         if current_time - last_access > CODE_SESSION_TIMEOUT
     ]
+
+    if expired_sessions:
+        logger.info("session_cleanup",
+            expired_count=len(expired_sessions),
+            total_sessions=len(_code_by_session))
+
     for sid in expired_sessions:
         _code_by_session.pop(sid, None)
         _code_session_last_access.pop(sid, None)
-        _code_write_buffer.pop(sid, None)  # 同时清理未完成的分块写入缓冲区
+        log_session_event(sid, "session_expired")
 
 
 CONTEXT_WINDOW_TOKENS = 131_072          # 默认（openai/qwen 128K）
 CONTEXT_WINDOW_TOKENS_DEEPSEEK = 1_000_000  # deepseek 1M 上下文
 MODEL_OUTPUT_TOKEN_BUDGET = 16_000   # 与 max_tokens 保持一致
 CONTEXT_SAFETY_MARGIN_TOKENS = 8_000
-SYSTEM_AND_TOOLS_OVERHEAD_TOKENS = 24_000
+# 可用输入预算 = 窗口 - 输出预留 - 安全余量。
+# 注意：system prompt / 工具 schema / 技能列表 / 注入代码 等"固定开销"不再从这里写死扣除，
+# 而是由 _get_system_overhead_tokens() 实测后计入圆环分子（见 track_context_usage），更准确。
 CONTEXT_INPUT_BUDGET_TOKENS = (
-    CONTEXT_WINDOW_TOKENS
-    - MODEL_OUTPUT_TOKEN_BUDGET
-    - CONTEXT_SAFETY_MARGIN_TOKENS
-    - SYSTEM_AND_TOOLS_OVERHEAD_TOKENS
+    CONTEXT_WINDOW_TOKENS - MODEL_OUTPUT_TOKEN_BUDGET - CONTEXT_SAFETY_MARGIN_TOKENS
 )
 CONTEXT_INPUT_BUDGET_TOKENS_DEEPSEEK = (
-    CONTEXT_WINDOW_TOKENS_DEEPSEEK
-    - MODEL_OUTPUT_TOKEN_BUDGET
-    - CONTEXT_SAFETY_MARGIN_TOKENS
-    - SYSTEM_AND_TOOLS_OVERHEAD_TOKENS
+    CONTEXT_WINDOW_TOKENS_DEEPSEEK - MODEL_OUTPUT_TOKEN_BUDGET - CONTEXT_SAFETY_MARGIN_TOKENS
 )
 # 运行时根据 provider 动态设置，供 track_context_usage 使用
 _active_context_window: int = CONTEXT_WINDOW_TOKENS
 _active_input_budget: int = CONTEXT_INPUT_BUDGET_TOKENS
-# SummarizationMiddleware 配置
+# SummarizationMiddleware 配置（触发阈值会被 LangChain 用 usage_metadata 校正为真实 token，故按窗口比例即可）
 SUMMARIZATION_KEEP_MESSAGES = 10  # 总结后保留最近10条消息
-# fraction 需要 langchain 支持 profile 参数，当前版本不支持，改用绝对 token 数
-# deepseek 1M 上下文触发阈值：(1,000,000 - 开销) * 0.70
-SUMMARIZATION_TRIGGER_TOKENS_DEEPSEEK = int((1_000_000 - MODEL_OUTPUT_TOKEN_BUDGET - CONTEXT_SAFETY_MARGIN_TOKENS - SYSTEM_AND_TOOLS_OVERHEAD_TOKENS) * 0.70)
-# qwen/openai 128K 上下文触发阈值：CONTEXT_INPUT_BUDGET_TOKENS * 0.70
+SUMMARIZATION_TRIGGER_TOKENS_DEEPSEEK = int(CONTEXT_INPUT_BUDGET_TOKENS_DEEPSEEK * 0.70)
 SUMMARIZATION_TRIGGER_TOKENS_DEFAULT = int(CONTEXT_INPUT_BUDGET_TOKENS * 0.70)
+# ClearToolUsesEdit 触发阈值：按 provider 缩放（旧的写死 40000 在 1M 上只占 4%，几乎每回合
+# 都把工具输出清成占位符，致盲模型）。设在总结阈值之下、作为更便宜的第一道防线；keep 放大到 20，
+# 给"搜索→查看→编辑"留足可见窗口。
+CLEAR_TOOL_TRIGGER_TOKENS_DEEPSEEK = int(CONTEXT_INPUT_BUDGET_TOKENS_DEEPSEEK * 0.50)
+CLEAR_TOOL_TRIGGER_TOKENS_DEFAULT = int(CONTEXT_INPUT_BUDGET_TOKENS * 0.50)
+CLEAR_TOOL_KEEP = 20
 _context_usage_by_session: dict[str, dict[str, int | bool]] = {}
 
 
 def _estimate_tokens(text: str) -> int:
-    """使用 LangChain 的近似 token 计数。
+    """CJK 感知的近似 token 估算。
 
-    注意：这是快速估算，真实 token 数可能略有偏差。
-    对于精确计数，应使用 model.get_num_tokens_from_messages()。
+    count_tokens_approximately 默认 ~4 字符/token（按英文调），会把中文低估 2-3 倍
+    （中文约 1 字 ≈ 1 token）。本项目大量中文（system prompt / 技能 / 代码注释），
+    故按字符类别分别估算：CJK 约 1 token/字，其余约 3.5 字符/token。
     """
     if not text:
         return 0
-    # 使用 LangChain 的官方近似计数
-    # 这比自定义的字符计数更准确
-    try:
-        msg = HumanMessage(content=text)
-        return count_tokens_approximately([msg])
-    except Exception:
-        # 降级到简单估算
-        ascii_chars = sum(1 for ch in text if ord(ch) < 128)
-        non_ascii_chars = len(text) - ascii_chars
-        base = ascii_chars / 2.5 + non_ascii_chars
-        return max(1, int(base * 1.25))
+    cjk = 0
+    for ch in text:
+        o = ord(ch)
+        if (0x4E00 <= o <= 0x9FFF or 0x3400 <= o <= 0x4DBF   # 中日韩统一表意
+                or 0x3040 <= o <= 0x30FF                       # 日文假名
+                or 0xAC00 <= o <= 0xD7A3                       # 韩文音节
+                or 0xFF00 <= o <= 0xFFEF):                     # 全角符号
+            cjk += 1
+    other = len(text) - cjk
+    return max(1, int(cjk + other / 3.5))
 
 
 def _message_text_for_budget(message) -> str:
@@ -134,20 +246,59 @@ def _message_text_for_budget(message) -> str:
     return "\n".join(parts)
 
 
+# -------- 每次调用的固定开销（system prompt + 技能列表 + 工具 schema），实测并缓存 --------
+_system_overhead_tokens: int | None = None
+
+
+def _compute_system_overhead_tokens() -> int:
+    """估算每次模型调用都会发送的固定开销，用作上下文圆环分子的一部分，
+    取代以前写死的 SYSTEM_AND_TOOLS_OVERHEAD_TOKENS（对内置情形高估十几倍，
+    又看不见自定义技能带来的增长）。"""
+    overhead = _estimate_tokens(SYSTEM_PROMPT)
+    overhead += _estimate_tokens(_skills_prompt) + 60  # SkillMiddleware 每次注入技能列表
+    try:
+        for t in ALL_TOOLS + [load_skill]:
+            desc = getattr(t, "description", "") or ""
+            overhead += int(_estimate_tokens(desc) * 1.4) + 20  # 描述 + 参数 schema 放大
+    except Exception:
+        pass
+    return overhead
+
+
+def _get_system_overhead_tokens() -> int:
+    global _system_overhead_tokens
+    if _system_overhead_tokens is None:
+        try:
+            _system_overhead_tokens = _compute_system_overhead_tokens()
+        except Exception:
+            _system_overhead_tokens = 2000  # 兜底
+    return _system_overhead_tokens
+
+
+def _invalidate_system_overhead() -> None:
+    """技能增删后调用（自定义技能会改变 system 注入大小），让开销下次重新计算。"""
+    global _system_overhead_tokens
+    _system_overhead_tokens = None
+
+
 @before_model
 def track_context_usage(state: AgentState, runtime: Runtime) -> dict[str, Any] | None:
     """跟踪上下文使用情况，用于前端显示。不再手动压缩，由 SummarizationMiddleware 自动处理。"""
     messages = state["messages"]
 
-    # 使用 LangChain 的官方 token 计数（更准确）
-    try:
-        used_tokens = count_tokens_approximately(messages)
-    except Exception:
-        # 降级到自定义估算
-        used_tokens = sum(_estimate_tokens(_message_text_for_budget(m)) for m in messages)
+    # CJK 感知地统计消息 token（count_tokens_approximately 会把中文低估 2-3 倍）。
+    # 每条消息再加 ~4 token 估算 role/结构开销。
+    used_tokens = sum(_estimate_tokens(_message_text_for_budget(m)) + 4 for m in messages)
 
-    # used_tokens 是纯消息 tokens，max_tokens 已经扣除了系统开销，直接对比即可
-    effective_used_tokens = used_tokens
+    # 真实占用 = 消息 + 注入代码（CodeContextMiddleware 放在 system，不在 messages 里）
+    #          + 固定开销（system prompt / 技能列表 / 工具 schema）。
+    # 三者都计入分子，分母为窗口-输出-安全余量（不再写死扣开销），圆环才反映真实占用。
+    overhead_tokens = _get_system_overhead_tokens()
+    try:
+        code_tokens = _estimate_tokens(_get_current_code())
+    except Exception:
+        code_tokens = 0
+    effective_used_tokens = used_tokens + code_tokens + overhead_tokens
 
     session_id = ""
     try:
@@ -155,19 +306,14 @@ def track_context_usage(state: AgentState, runtime: Runtime) -> dict[str, Any] |
     except Exception:
         session_id = _current_session_id.get()
 
-    # 检测是否已总结：通过消息数量和 token 使用率的变化
-    prev_usage = _context_usage_by_session.get(session_id, {})
-    prev_percent = prev_usage.get("percent", 0)
-    prev_msg_count = prev_usage.get("message_count", 0)
-    current_percent = round(effective_used_tokens / _active_input_budget * 100)
-    current_msg_count = len(messages)
+    current_percent = round(effective_used_tokens / max(1, _active_input_budget) * 100)
 
-    # 启发式检测：
-    # 1. 消息数量突然减少到接近 KEEP 阈值
-    # 2. 或者之前超过70%，现在降到60%以下
-    msg_dropped = prev_msg_count > SUMMARIZATION_KEEP_MESSAGES + 5 and current_msg_count <= SUMMARIZATION_KEEP_MESSAGES + 3
-    token_dropped = prev_percent >= 70 and current_percent < prev_percent * 0.6
-    summarized = msg_dropped or token_dropped
+    # 是否已压缩：直接检测 SummarizationMiddleware 插入摘要时打的标记，
+    # 取代之前靠"消息数/百分比骤降"猜测的脆弱启发式（会误报/漏报）。
+    summarized = any(
+        getattr(m, "additional_kwargs", {}).get("lc_source") == "summarization"
+        for m in messages
+    )
 
     if session_id:
         _context_usage_by_session[session_id] = {
@@ -176,9 +322,9 @@ def track_context_usage(state: AgentState, runtime: Runtime) -> dict[str, Any] |
             "max_tokens": _active_input_budget,
             "context_window_tokens": _active_context_window,
             "reserved_output_tokens": MODEL_OUTPUT_TOKEN_BUDGET,
-            "reserved_overhead_tokens": SYSTEM_AND_TOOLS_OVERHEAD_TOKENS + CONTEXT_SAFETY_MARGIN_TOKENS,
+            "reserved_overhead_tokens": overhead_tokens + CONTEXT_SAFETY_MARGIN_TOKENS,
             "percent": current_percent,
-            "message_count": current_msg_count,  # 记录消息数量
+            "message_count": len(messages),
             "compacted": summarized,
         }
 
@@ -193,7 +339,7 @@ def _get_context_usage(session_id: str) -> dict[str, int | bool]:
         "max_tokens": _active_input_budget,
         "context_window_tokens": _active_context_window,
         "reserved_output_tokens": MODEL_OUTPUT_TOKEN_BUDGET,
-        "reserved_overhead_tokens": SYSTEM_AND_TOOLS_OVERHEAD_TOKENS + CONTEXT_SAFETY_MARGIN_TOKENS,
+        "reserved_overhead_tokens": _get_system_overhead_tokens() + CONTEXT_SAFETY_MARGIN_TOKENS,
         "percent": 0,
         "message_count": 0,
         "compacted": False,
@@ -213,7 +359,7 @@ def search_assets(query: str) -> str:
         return "知识库未初始化"
     results = _kb.search_assets(query, top_k=5)
     if not results:
-        return "未找到匹配的素材。请使用 Canvas 2D API 绘制图形。"
+        return "知识库中暂无素材。"
     lines = []
     for a in results:
         atype = a.get("asset_type", "image")
@@ -309,165 +455,249 @@ class SkillMiddleware(AgentMiddleware):
         return await handler(_inject_skills_into_request(request))
 
 
+# ============ 代码上下文中间件（临时注入，不写入持久化历史） ============
+
+_CODE_INJECT_MARKER = "【当前编辑器中的完整代码】"
+_CODE_INJECT_HEADER = "## 当前编辑器中的完整代码"
+
+
+def _strip_persisted_code_blocks(messages: list) -> tuple[list, bool]:
+    """剥离历史消息里旧版本注入的整份代码块（兼容旧会话，避免重复累积）。
+
+    旧实现把代码拼进用户消息（marker=【当前编辑器中的完整代码】）并被 checkpointer
+    持久化，导致每回合多存一份。这里在请求副本上把这些块还原成纯用户输入，
+    使得即便是改造前创建的老会话，也不会把多份历史代码喂给模型。
+    """
+    cleaned = []
+    changed = False
+    for m in messages:
+        content = getattr(m, "content", None)
+        if isinstance(content, str) and _CODE_INJECT_MARKER in content:
+            idx = content.find("【用户消息】")
+            new_content = content[idx + len("【用户消息】"):].strip() if idx != -1 else ""
+            try:
+                cleaned.append(m.model_copy(update={"content": new_content}))
+            except Exception:
+                cleaned.append(m)
+            changed = True
+        else:
+            cleaned.append(m)
+    return cleaned, changed
+
+
+def _inject_code_into_request(request: ModelRequest) -> ModelRequest:
+    """把当前会话的实时代码临时注入到 system message，仅本次模型调用可见。
+
+    关键：注入发生在 wrap_model_call，作用于请求对象而非 AgentState，因此不会被
+    checkpointer 持久化——历史里永远 0 份代码，每次调用最多 1 份，彻底消除累积。
+    """
+    req = request
+    # 1) 清理旧会话遗留在历史里的代码块（防止历史残留多份）
+    messages, changed = _strip_persisted_code_blocks(list(request.messages))
+    if changed:
+        req = req.override(messages=messages)
+
+    # 2) 注入当前实时代码到 system message（临时、不持久化）
+    code = _get_current_code()
+    if not code or not code.strip():
+        return req
+
+    from langchain_core.messages import SystemMessage
+    code_addendum = (
+        f"\n\n{_CODE_INJECT_HEADER}\n```html\n{code}\n```\n"
+        "（以上为编辑器实时代码，仅本次回答可见、不计入对话历史。"
+        "修改时直接基于它定位，用 replace_code/insert_code/delete_code 写回；不要把它复述到聊天正文。）"
+    )
+    new_content = list(req.system_message.content_blocks) + [
+        {"type": "text", "text": code_addendum}
+    ]
+    return req.override(system_message=SystemMessage(content=new_content))
+
+
+class CodeContextMiddleware(AgentMiddleware):
+    """每次模型调用前把当前编辑器代码临时注入 system message。
+
+    取代旧的 _build_message 持久化注入：代码不再写进消息历史，从根本上消除
+    「整份代码在 checkpoint 里累积 N 份」造成的上下文膨胀。
+    """
+
+    def wrap_model_call(self, request, handler):
+        return handler(_inject_code_into_request(request))
+
+    async def awrap_model_call(self, request, handler):
+        return await handler(_inject_code_into_request(request))
+
+
 # ============ 代码编辑工具 ============
 
 
+# -------- 新建/重写游戏的事务化分段写入 --------
+
+def _validate_staged_html(html: str) -> tuple[bool, str]:
+    """判断暂存的 HTML 是否是一份写完整的文档（提交前的完整性校验）。"""
+    low = html.lower()
+    if not (low.lstrip().startswith("<!doctype") or "<html" in low):
+        return False, "缺少 <!DOCTYPE html> / <html> 文档头"
+    if "</html>" not in low:
+        return False, "缺少 </html> 结束标签，文档可能尚未写完"
+    return True, ""
+
+
+def _commit_staging(session_id: str) -> str:
+    """校验并提交暂存区到生效代码；失败时保留暂存区不动当前代码。"""
+    staged = _staging_by_session.get(session_id, "")
+    if not staged.strip():
+        return format_error(ErrorCode.INVALID_PARAMS, "暂存区为空，没有可提交的内容")
+    ok, reason = _validate_staged_html(staged)
+    if not ok:
+        return format_error(ErrorCode.INVALID_PARAMS,
+            f"游戏代码尚不完整：{reason}。请用 append_game(html=..., more=True) 继续补全，"
+            "并在最后一段传 more=False 再提交。")
+    _set_current_code(staged)
+    _staging_by_session.pop(session_id, None)
+    lines = staged.count(chr(10)) + 1
+    log_tool_call(session_id or "unknown", "write_game/commit", True, f"lines={lines}")
+    return f"游戏代码已写入并生效，共 {lines} 行。"
+
+
+def _autocommit_staging(session_id: str) -> None:
+    """回合结束兜底：模型写了游戏到暂存区却忘了最后一段 more=False 时，
+    文档完整则自动提交；不完整（生成被中断）则丢弃，保留原有代码不被半成品覆盖。
+    """
+    staged = _staging_by_session.pop(session_id, None)
+    if not staged or not staged.strip():
+        return
+    ok, _ = _validate_staged_html(staged)
+    if ok:
+        _set_current_code(staged)
+        logger.info("staging_autocommitted", session_id=session_id, size=len(staged))
+    else:
+        logger.warning("staging_discarded_incomplete", session_id=session_id, size=len(staged))
+
+
 @tool
-def str_replace_code(old_str: str, new_str: str) -> str:
-    """替换当前游戏代码中的一段内容。用于修 bug、改参数、小范围修改。
-    支持空白归一化匹配：缩进不完全一致也能匹配，匹配后保留原始缩进。
-    插入新代码：将 new_str 设为 old_str + 新内容 即可在目标位置后追加。
-    删除代码：将 new_str 设为空字符串即可。
+def write_game(html: str, more: bool = False) -> str:
+    """写入一个全新的游戏，覆盖当前代码。新建游戏 / 整体重写时用它。
+
+    高质量游戏代码很长，单次输出会被截断，所以支持分段写入：
+    - 一次写完（短游戏）：write_game(html="<!DOCTYPE html>...完整...</html>")
+    - 分段写入（长游戏）：
+        write_game(html="<!DOCTYPE html>...<head>...<style>...", more=True)  ← 第1段
+        append_game(html="<script>...游戏逻辑...", more=True)                 ← 续写，可多次
+        append_game(html="...</script></body></html>", more=False)           ← 最后一段
+    分段期间右侧预览不会刷新、原有代码不受影响；只有最后一段（more=False）
+    通过完整性校验后，整份代码才会一次性生效——避免半成品覆盖。
 
     Args:
-        old_str: 要被替换的原始代码片段
-        new_str: 替换后的新代码（空字符串表示删除）
+        html: 这一段 HTML 文本（第1段应以 <!DOCTYPE html> 开头）
+        more: True=后面还有续写段（用 append_game 续写）；False=已写完，立即校验并生效
     """
-    result = CodeEditor.str_replace(_get_current_code(), old_str, new_str)
+    session_id = _current_session_id.get()
+    if len(html) > MAX_CODE_SIZE:
+        return format_error(ErrorCode.INPUT_TOO_LARGE,
+            f"html 超过 {MAX_CODE_SIZE // (1024*1024)}MB 限制")
+    _staging_by_session[session_id] = html
+    if more:
+        return f"已写入第1段（暂存，尚未生效），共 {html.count(chr(10)) + 1} 行。续写请用 append_game。"
+    return _commit_staging(session_id)
+
+
+@tool
+def append_game(html: str, more: bool = False) -> str:
+    """续写正在分段写入的游戏（接在 write_game 之后）。
+
+    Args:
+        html: 这一段 HTML 文本
+        more: True=后面还有续写段；False=已写完，立即校验并生效
+    """
+    session_id = _current_session_id.get()
+    staged = _staging_by_session.get(session_id, "")
+    if not staged:
+        return format_error(ErrorCode.APPEND_TO_EMPTY,
+            "当前没有正在写入的游戏。请先调用 write_game(html=第1段, more=True)。")
+    if len(staged) + len(html) > MAX_CODE_SIZE:
+        return format_error(ErrorCode.CODE_SIZE_EXCEEDED,
+            f"代码总大小将超过 {MAX_CODE_SIZE // (1024*1024)}MB 限制")
+    _staging_by_session[session_id] = staged + html
+    if more:
+        total = _staging_by_session[session_id]
+        return f"已续写（暂存，尚未生效），当前共 {total.count(chr(10)) + 1} 行。"
+    return _commit_staging(session_id)
+
+
+# -------- 修改已有代码的工具（直接作用于生效代码） --------
+
+@tool
+def replace_code(old_str: str, new_str: str = "", replace_all: bool = False) -> str:
+    """在当前游戏代码中查找并替换片段——修 bug / 改参数 / 删片段的主力工具。
+
+    - 修改：old_str=要替换的原片段，new_str=新内容
+    - 删除：old_str=要删的片段，new_str="" (留空)
+    - 替换全部匹配：replace_all=True
+    支持空白归一化匹配（缩进不必完全一致，替换后保留原缩进）。
+    若匹配到多处且未开 replace_all，会报错要求提供更精确的片段。
+
+    Args:
+        old_str: 要替换/删除的原始片段（必填、非空）
+        new_str: 新内容；留空表示删除 old_str
+        replace_all: True=替换所有匹配，False=只替换第一处（默认）
+    """
+    session_id = _current_session_id.get()
+    start_time = time.time()
+    if not old_str:
+        return format_error(ErrorCode.INVALID_PARAMS, "old_str 不能为空；新建游戏请用 write_game。")
+    if len(old_str) > MAX_OLD_STR_SIZE:
+        return format_error(ErrorCode.INPUT_TOO_LARGE, f"old_str 超过 {MAX_OLD_STR_SIZE // 1024}KB 限制")
+    if len(new_str) > MAX_CODE_SIZE:
+        return format_error(ErrorCode.INPUT_TOO_LARGE, f"new_str 超过 {MAX_CODE_SIZE // (1024*1024)}MB 限制")
+
+    result = CodeEditor.str_replace(_get_current_code(), old_str, new_str, replace_all=replace_all)
     if result["success"]:
         _set_current_code(result["code"])
+    log_tool_call(session_id or "unknown", "replace_code", result["success"],
+        f"old_len={len(old_str)}, new_len={len(new_str)}, replace_all={replace_all}",
+        error=None if result["success"] else result["message"],
+        duration_ms=(time.time() - start_time) * 1000)
     return result["message"]
 
 
-def _detect_startup_order_issues(code: str) -> list[str]:
-    """检测常见黑屏启动顺序问题，尤其是 let/const 变量声明前被顶层调用访问。
-    只检测顶层调用（script 标签内缩进为0的行），忽略函数体内的调用。"""
-    issues = []
-    startup_calls = ["resize()", "init()", "resetGame()", "gameLoop()", "loop()", "requestAnimationFrame("]
-    guarded_vars = ["player", "state", "canvas", "ctx"]
-
-    lines = code.split('\n')
-
-    # 找每个变量的首次顶层声明行号
-    var_declared_line: dict[str, int] = {}
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-        for var_name in guarded_vars:
-            if var_name not in var_declared_line:
-                if stripped.startswith(f"let {var_name}") or stripped.startswith(f"const {var_name}") or stripped.startswith(f"var {var_name}"):
-                    var_declared_line[var_name] = i
-
-    # 找每个启动调用的首次顶层出现行号（缩进为0，不在函数体内）
-    for call in startup_calls:
-        for i, line in enumerate(lines):
-            stripped = line.strip()
-            # 只检测顶层调用：行首无缩进（或只有0-1层缩进），且不在函数/if/for 块内
-            if call in stripped and not line.startswith(' ') and not line.startswith('\t'):
-                for var_name, decl_line in var_declared_line.items():
-                    if i < decl_line:
-                        issues.append(f"顶层 {call} (第{i+1}行) 出现在 {var_name} 声明 (第{decl_line+1}行) 之前，可能触发 Cannot access '{var_name}' before initialization")
-
-    if "ctx.scale(" in code and "ctx.setTransform(" not in code:
-        issues.append("resize 中使用 ctx.scale() 可能重复叠加缩放，请改用 ctx.setTransform(dpr,0,0,dpr,0,0)")
-    return issues
-
-
 @tool
-def start_code_write(reason: str = "") -> str:
-    """开始分块写入游戏代码。用于写入超长代码（>500行）时，先调用此工具初始化。
+def insert_code(after_line: int, new_str: str) -> str:
+    """在指定行号之后插入代码（after_line=0 表示插到文件最前面）。
+    建议先用 view_code / search_code 确认行号再插入。
 
     Args:
-        reason: 本次写入代码的原因或摘要
+        after_line: 在第几行之后插入（0=最前面）
+        new_str: 要插入的代码
     """
-    global _last_write_session_id
     session_id = _current_session_id.get()
-    if not session_id:
-        return "错误：无法获取会话ID"
-    _last_write_session_id = session_id
-    _code_write_buffer[session_id] = []
-    return f"已初始化代码写入缓冲区。{f'原因：{reason}' if reason else ''}\n请依次调用 append_code_chunk 写入代码块，最后调用 finish_code_write 完成。"
+    if len(new_str) > MAX_CODE_SIZE:
+        return format_error(ErrorCode.INPUT_TOO_LARGE, "new_str 过大")
+    result = CodeEditor.insert_after(_get_current_code(), after_line, new_str)
+    if result["success"]:
+        _set_current_code(result["code"])
+    log_tool_call(session_id or "unknown", "insert_code", result["success"],
+        f"after_line={after_line}, new_len={len(new_str)}",
+        error=None if result["success"] else result["message"])
+    return result["message"]
+
 
 @tool
-def append_code_chunk(chunk: str) -> str:
-    """追加一块代码到缓冲区。用于分块写入长代码。
+def delete_code(start_line: int, end_line: int) -> str:
+    """删除指定行范围（含两端，行号从 1 开始）。建议先用 view_code 确认行号。
 
     Args:
-        chunk: 代码片段（可以是 HTML 的一部分）
+        start_line: 起始行号（1-based）
+        end_line: 结束行号（1-based，包含此行）
     """
-    session_id = _current_session_id.get() or _last_write_session_id
-    if not session_id:
-        return "错误：无法获取会话ID"
-    if session_id not in _code_write_buffer:
-        return "错误：请先调用 start_code_write 初始化缓冲区"
-
-    _code_write_buffer[session_id].append(chunk)
-    total_chars = sum(len(c) for c in _code_write_buffer[session_id])
-    return f"已追加 {len(chunk)} 字符，当前缓冲区共 {total_chars} 字符。继续调用 append_code_chunk 或调用 finish_code_write 完成。"
-
-@tool
-def finish_code_write() -> str:
-    """完成分块写入，将缓冲区的所有代码块合并并写入编辑器。"""
-    session_id = _current_session_id.get() or _last_write_session_id
-    if not session_id:
-        return "错误：无法获取会话ID"
-    if session_id not in _code_write_buffer:
-        return "错误：请先调用 start_code_write 初始化缓冲区"
-
-    chunks = _code_write_buffer.pop(session_id)
-    if not chunks:
-        return "错误：缓冲区为空，没有代码可写入"
-
-    clean_code = "".join(chunks).strip()
-    startup_issues = _detect_startup_order_issues(clean_code)
-    if startup_issues:
-        # 放回缓冲区，让 AI 可以用 str_replace_code 修复后重新 finish
-        _code_write_buffer[session_id] = chunks
-        return (
-            "写入失败：生成的 HTML 可能黑屏，必须先修复启动顺序问题：\n"
-            + "\n".join(f"- {issue}" for issue in startup_issues)
-            + "\n\n缓冲区已保留，请修正代码后重新调用 finish_code_write()"
-        )
-
-    _set_current_code(clean_code)
-    lines = clean_code.count("\n") + 1
-    return f"✅ 已成功写入右侧编辑器 game.html，共 {lines} 行。"
-
-@tool
-def write_game_code(code: str = "", reason: str = "") -> str:
-    """将完整 H5 游戏代码写入当前会话的右侧代码编辑器。
-
-    ⚠️ 重要：如果代码超过 500 行或生成时被截断，请改用分块写入：
-    1. start_code_write(reason) - 初始化
-    2. append_code_chunk(chunk) - 多次调用，每次传入一部分代码
-    3. finish_code_write() - 完成写入
-
-    Args:
-        code: 完整 HTML 代码，必须可直接在浏览器运行。不可为空。
-        reason: 本次写入代码的原因或摘要
-    """
-    clean_code = code.strip()
-    if not clean_code:
-        return (
-            "写入失败：缺少 code 参数。\n\n"
-            "💡 提示：如果代码太长导致被截断，请使用分块写入：\n"
-            "1. start_code_write(reason)\n"
-            "2. append_code_chunk(chunk) × N\n"
-            "3. finish_code_write()"
-        )
-
-    # 检查是否可能被截断：行数少且没有闭合的 </html> 标签
-    lines = clean_code.count("\n") + 1
-    if not clean_code.rstrip().endswith("</html>") and lines < 50:
-        return (
-            f"⚠️ 代码似乎被截断了（只有 {lines} 行，且未以 </html> 结尾）。\n\n"
-            "请使用分块写入机制：\n"
-            "1. start_code_write(reason='重新生成完整游戏')\n"
-            "2. append_code_chunk(chunk) - 多次调用，每次传入一部分代码\n"
-            "3. finish_code_write()\n\n"
-            "示例：先传 <!DOCTYPE html>...<style>...</style>，再传 <script>...</script>，最后传 </body></html>"
-        )
-
-    startup_issues = _detect_startup_order_issues(clean_code)
-    if startup_issues:
-        return (
-            "写入失败：生成的 HTML 可能黑屏，必须先修复启动顺序问题后重新调用 write_game_code：\n"
-            + "\n".join(f"- {issue}" for issue in startup_issues)
-        )
-    _set_current_code(clean_code)
-    suffix = f"\n原因：{reason}" if reason else ""
-    return f"已写入右侧编辑器 game.html，共 {lines} 行。{suffix}"
-
-
+    session_id = _current_session_id.get()
+    result = CodeEditor.delete_lines(_get_current_code(), start_line, end_line)
+    if result["success"]:
+        _set_current_code(result["code"])
+    log_tool_call(session_id or "unknown", "delete_code", result["success"],
+        f"range={start_line}-{end_line}",
+        error=None if result["success"] else result["message"])
+    return result["message"]
 
 
 @tool
@@ -533,82 +763,63 @@ def view_code(start_line: int = 1, end_line: int = -1) -> str:
 
 # ============ System Prompt ============
 
-SYSTEM_PROMPT = """你是一个专业的 H5 页面游戏设计 AI 助手，帮用户设计可在手机浏览器中运行的 H5 小游戏。
+SYSTEM_PROMPT = """你是一个专业的 H5 页面游戏设计 AI 助手，帮用户设计可在手机浏览器中运行的 H5 高质量游戏。
 
-## 【强制工作流 - 必须按顺序执行】
+## 【工作流】
 
 ### 新建游戏时（用户首次描述游戏）：
-1. **必须调用 `search_assets("图片 音频 素材")`** → 搜索可用素材，有素材就用，没有就用 Canvas 绘图
-2. **必须调用 `load_skill("base")`** → 加载基础游戏模板
-3. **必须调用 `load_skill("startup")`** → 加载启动顺序规则（防黑屏）
-4. **必须调用 `load_skill("quality")`** → 加载代码质量规则集
-5. **必须调用 `load_skill("bugfix")`** → 加载防 bug 规则
-6. 根据游戏类型按需加载其他技能（如 `load_skill("physics")` 获取碰撞检测）
-7. 综合以上信息生成完整 HTML，然后：
-    - **如果代码较短（<500行）**：调用 `write_game_code(code, reason)` 一次性写入
-    - **如果代码较长（≥500行）或生成时被截断**：使用分块写入机制：
-      1. `start_code_write(reason)` - 初始化缓冲区
-      2. `append_code_chunk(chunk)` - 多次调用，每次传入一部分代码
-      3. `finish_code_write()` - 完成写入并检查
-    - 禁止用空 `code` 或 `{}` 调用工具
-    - 如果 `write_game_code` 返回"代码似乎被截断"，立即改用分块写入
-8. 最终回复只总结游戏玩法、操作方式和完成内容，**不要在聊天中输出完整 HTML 代码块**
+1. **必须调用 `search_assets("图片 音频 素材")`** → 搜索可用素材
+   - **有素材** → 调用 `load_skill("assets")` 获取 loadImages/loadSounds/drawSprite 用法，用图片渲染游戏对象
+   - **暂无素材** → 自行用 Canvas API 绘制
+2. 明确用户需求后再写 HTML，且必须满足下方【质量底线】
+3. 需要可直接复用的**完整代码模板**时，按需调用 `load_skill("gameloop"|"polish"|"gamedesign")`（不强制；下方底线已含关键规则，简单游戏可不加载）。
+4. **写入完整 HTML**（高质量游戏代码很长，单次输出会被截断，需分段）：
+   - 一次写完（短游戏）：`write_game(html="<!DOCTYPE html>...完整...</html>")`
+   - 分段写入（长游戏，推荐）：
+     - 第1段：`write_game(html="<!DOCTYPE html>...<head>...<style>...", more=True)`
+     - 续写段：`append_game(html="<script>...游戏逻辑...", more=True)`（可多次）
+     - 最后一段：`append_game(html="...</script></body></html>", more=False)` ← **最后一段必须 `more=False`**
+   - 分段期间预览不刷新、旧代码不受影响；最后一段通过完整性校验后整份才生效
+5. 最终回复只总结游戏玩法、操作方式和完成内容，**不要在聊天中输出完整 HTML 代码块**
+
+## 【质量底线】（每个游戏都必须做到，否则黑屏或手感差；需要完整模板时 load_skill）
+- **结构顺序（不可乱，否则黑屏）**：canvas/ctx → `resize()` 定义并立即调用（DPR 适配用 `ctx.setTransform(dpr,0,0,dpr,0,0)`，**禁止 `ctx.scale`**）→ 全局状态(`state`/`score`/`lastTime`) → 工具函数 → update/draw → `resetGame` → 输入事件绑定 → 主循环 `loop` → 最后一行启动（图片加载完成才进 start）
+- **正确性**：移动一律乘 dt（`x += speed*dt`，禁止 `x += 5`）；`dt` 上限 0.05；`arc/ellipse` 半径用 `Math.max(1,r)`；删数组元素用 `filter`，**禁止 for 循环里 `splice`**；触摸坐标要按 `canvas.width/rect.width` 换算，`touchstart/touchmove` 加 `preventDefault()` 且 `{passive:false}`
+- **手感**：粒子、屏幕震动、缓动、得分浮动文字、渐变/光效背景、分数平滑滚动——击中/得分/死亡都要有视觉反馈
+- **设计**：难度随 `gameTime` 提升；完整 start/over 界面（标题 + 操作说明 + 本局得分 + 最高分 + 重玩提示）；HUD（分数左上、最高分右上）
 
 ### 修改/修 bug 时：
-1. 调用 `search_code("关键字")` → 搜索定位，返回匹配行及上下文，无需再调用 view_code
-2. 如需查看更多上下文，调用 `view_code(start_line, end_line)`（每次最多100行）
-3. 调用 `str_replace_code(old_str, new_str)` 替换，支持空白归一化匹配，无需缩进完全一致
-4. **绝不重新输出全部代码**
+当前完整代码已在上下文中（system 区可见），直接定位后修改：
+1. 改内容/参数：`replace_code(old_str=原片段, new_str=新内容)`，支持空白归一化匹配，无需缩进完全一致
+2. 删片段：`replace_code(old_str=要删的片段, new_str="")`
+3. 按行号增删：先 `view_code`/`search_code` 拿到行号，再 `insert_code(after_line, 新代码)` 或 `delete_code(start, end)`
+4. 整体重做（仅当用户明确要求时）：用 `write_game` + `append_game` 重写
+5. **绝不把完整代码输出到聊天正文**
 
 ### 加新功能时：
-1. 调用 `search_code("插入点关键字")` → 定位插入位置
-2. 调用 `str_replace_code(old_str, old_str + new_str)` → 在目标内容后追加新代码
-
----
-
-## 【代码质量 - 通过技能加载详细规则】
-
-生成代码前**必须**调用以下技能获取完整规则（不要凭记忆写，规则很多）：
-- `load_skill("startup")` → 启动顺序与黑屏防护（**最常出 bug 的地方**）
-- `load_skill("quality")` → 代码质量完整规则集（状态机/deltaTime/数值安全/数组/触摸/绘制）
-- `load_skill("bugfix")` → 常见 Bug 预防（ellipse半径/NaN/splice/图片加载）
-
-**核心禁令（即使不加载技能也必须遵守）：**
-- ❌ 所有 let/const 全局变量必须在 resize()/init()/resetGame() 调用之前声明
-- ❌ resize 中必须用 ctx.setTransform(dpr,0,0,dpr,0,0)，禁止 ctx.scale
-- ❌ 所有移动必须用 deltaTime：obj.x += speed * dt，禁止固定像素
-- ❌ ctx.arc/ellipse 半径必须 Math.max(1, value)
-
----
-
-## 【素材使用规则】
-- 生成游戏前**必须先调用 `search_assets("图片 音频 素材")`** 搜索可用素材
-- 有素材 → 用 `loadImages()` 预加载，用 `drawObj()` 绘制，绘制失败自动降级为图形
-- 无素材 → 用 Canvas 图形代替（矩形/圆形/三角形），用颜色区分不同对象
+1. `search_code("插入点关键字")` 或 `view_code(...)` → 定位行号
+2. `insert_code(after_line, 新代码)` 在该行之后插入；或用 `replace_code` 在某片段后扩写
 
 ---
 
 ## 【禁止事项】
-- ❌ 新建游戏时禁止把完整 HTML 作为聊天正文输出，必须用 `write_game_code` 写入右侧编辑器
-- ❌ 修改代码时禁止重新输出全部代码，必须用 view_code 查看后配合 str_replace_code 工具修改
+- ❌ 新建游戏时禁止把完整 HTML 作为聊天正文输出，必须用 `write_game`/`append_game` 写入右侧编辑器
+- ❌ 分段写入时，最后一段必须传 `more=False`，否则代码不会生效
 
----
-
-## 【工具调用行为规则 - 必须严格遵守】
+## 【行为规则】
 - ✅ 修改代码时必须一次性完成所有步骤（搜索→查看→替换），不要中途停下来回复用户等"继续"
 - ✅ 如果需要多处修改，在一轮对话中连续调用工具完成全部修改，最后再统一回复
-- ✅ 只有全部修改完成后，才输出文字总结修改内容
 - ❌ 禁止调用一两个工具后就停下来告诉用户"我已经找到问题了"或"接下来我会..."——直接做完"""
 
 # ============ Agent 类 ============
 
 ALL_TOOLS = [
     search_assets,
-    str_replace_code,
-    write_game_code,
-    start_code_write,
-    append_code_chunk,
-    finish_code_write,
+    write_game,
+    append_game,
+    replace_code,
+    insert_code,
+    delete_code,
     view_code,
     search_code,
 ]
@@ -695,11 +906,21 @@ class GameDesignAgent:
         self.checkpointer: AsyncSqliteSaver | None = None
         self.agent = None
         self._agent_lock: asyncio.Lock | None = None
+        self._session_locks: dict[str, asyncio.Lock] = {}
         self._provider = provider
 
     def _detect_provider(self) -> str:
         """返回当前使用的 LLM provider"""
         return self._provider
+
+    def _get_session_lock(self, session_id: str) -> asyncio.Lock:
+        """每会话一把锁，串行化同一会话的并发回合，防止读改写竞态与基准代码被冲掉。
+        懒创建在单线程 asyncio 下无竞态（创建到使用之间无 await）。"""
+        lock = self._session_locks.get(session_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._session_locks[session_id] = lock
+        return lock
 
     async def _ensure_agent(self) -> None:
         """懒初始化持久化 LangGraph agent，避免 MemorySaver 重启丢上下文。"""
@@ -714,16 +935,26 @@ class GameDesignAgent:
             self.checkpointer = AsyncSqliteSaver(self.checkpoint_conn)
             await self.checkpointer.setup()
 
-            # 统一使用 DeepSeek 作为总结模型
+            # 总结模型：仅在确实配置了 DeepSeek key 时用 DeepSeek（便宜、长上下文）；
+            # 否则回退到主模型。避免用空 key 调 DeepSeek 失败 → 总结返回错误字符串
+            # → RemoveMessage 把历史替换成报错（上下文最满时的灾难性丢失）。
             provider = self._detect_provider()
-            summarization_model = init_chat_model(
-                model=settings.deepseek_model or "deepseek-v4-flash",
-                model_provider="openai",
-                api_key=settings.deepseek_api_key,
-                base_url=settings.deepseek_base_url or "https://api.deepseek.com",
-                temperature=0.3,
-                max_tokens=2000,
-            )
+            if settings.deepseek_api_key:
+                summarization_model = init_chat_model(
+                    model=settings.deepseek_model or "deepseek-v4-flash",
+                    model_provider="openai",
+                    api_key=settings.deepseek_api_key,
+                    base_url=settings.deepseek_base_url or "https://api.deepseek.com",
+                    temperature=0.3,
+                    max_tokens=8000,
+                )
+            else:
+                summarization_model = self.model
+
+            # 触发阈值按 provider 缩放（DeepSeek 1M vs 128K 差 7 倍，写死一个值必然失衡）
+            is_deepseek = provider == "deepseek"
+            clear_trigger = CLEAR_TOOL_TRIGGER_TOKENS_DEEPSEEK if is_deepseek else CLEAR_TOOL_TRIGGER_TOKENS_DEFAULT
+            summ_trigger = SUMMARIZATION_TRIGGER_TOKENS_DEEPSEEK if is_deepseek else SUMMARIZATION_TRIGGER_TOKENS_DEFAULT
 
             self.agent = create_agent(
                 self.model,
@@ -732,18 +963,20 @@ class GameDesignAgent:
                 middleware=[
                     track_context_usage,
                     SkillMiddleware(),
+                    CodeContextMiddleware(),
                     ContextEditingMiddleware(
                         edits=[
                             ClearToolUsesEdit(
-                                trigger=40000,
-                                keep=5,
+                                trigger=clear_trigger,
+                                keep=CLEAR_TOOL_KEEP,
+                                clear_tool_inputs=True,  # 同时清理旧工具调用入参（write_game 的整份 HTML），生效代码已在编辑器/磁盘
                                 placeholder="[已清理]",
                             ),
                         ],
                     ),
                     SummarizationMiddleware(
                         model=summarization_model,
-                        trigger=("tokens", SUMMARIZATION_TRIGGER_TOKENS_DEEPSEEK if provider == "deepseek" else SUMMARIZATION_TRIGGER_TOKENS_DEFAULT),
+                        trigger=("tokens", summ_trigger),
                         keep=("messages", SUMMARIZATION_KEEP_MESSAGES),
                         trim_tokens_to_summarize=32000,
                     ),
@@ -752,41 +985,72 @@ class GameDesignAgent:
             )
 
 
-    async def chat(self, session_id: str, user_message, current_code: str = "") -> dict:
+    @staticmethod
+    def _build_message(user_message, current_code: str = ""):
+        """直接透传用户消息，不再把代码拼进去。
+
+        当前代码改由 CodeContextMiddleware 在每次模型调用时临时注入到 system
+        message（不写入持久化历史），从根本上避免整份代码在 checkpoint 里累积。
+
+        user_message 可能是字符串，也可能是多模态 content 块列表（带图片）——
+        这里都原样返回，因此天然兼容「发截图 + 已有长代码」场景，
+        不会再触发 list.lower() 的 AttributeError 崩溃。
+        """
+        return user_message
+
+    async def chat(self, session_id: str, user_message, current_code: str = "", code_dirty: bool = False) -> dict:
         """非流式对话"""
-        token = _begin_code_session(session_id, current_code)
         await self._ensure_agent()
+        async with self._get_session_lock(session_id):  # 串行化同一会话的并发回合
+            token = _begin_code_session(session_id, current_code, code_dirty)
+            base_code = _get_current_code()  # 协调后的基准代码
+            try:
+                config = {"configurable": {"thread_id": session_id}, "recursion_limit": 500}
+                result = await self.agent.ainvoke(
+                    {"messages": [{"role": "user", "content": self._build_message(user_message, base_code)}]},
+                    config=config,
+                )
 
-        try:
-            config = {"configurable": {"thread_id": session_id}, "recursion_limit": 500}
-            result = await self.agent.ainvoke(
-                {"messages": [{"role": "user", "content": user_message}]},
-                config=config,
-            )
+                reply = result["messages"][-1].content
+                _autocommit_staging(session_id)  # 兜底提交忘了 more=False 的分段写入
+                code = self._resolve_final_code(base_code, reply)
 
-            reply = result["messages"][-1].content
-            edited_code = _get_current_code()
-            code = edited_code if edited_code != current_code else self._extract_code(reply)
+                action = "generate" if code and not base_code else "edit" if code else "chat"
+                return {"reply": reply, "code": code, "action": action}
+            finally:
+                _end_code_session(token)
 
-            action = "generate" if code and not current_code else "edit" if code else "chat"
-            return {"reply": reply, "code": code, "action": action}
-        finally:
-            _end_code_session(token)
+    @staticmethod
+    def _resolve_final_code(base_code: str, reply: str) -> str:
+        """回合结束后确定要返回/落库的代码，工具写好的缓冲区为唯一真相源。
 
-    async def chat_stream(self, session_id: str, user_message, current_code: str = ""):
+        仅当缓冲区为空且本会话此前也没有代码时，才用正则从聊天正文里兜底抢救一份
+        完整文档（模型违规把整份代码贴进聊天的情况）；缓冲区非空时绝不被聊天片段覆盖。
+        """
+        edited_code = _get_current_code()
+        if edited_code:
+            return edited_code
+        if not base_code:  # 全新空会话才允许兜底抢救
+            return GameDesignAgent._extract_code(reply) or ""
+        return ""  # 缓冲区为空但会话本有代码 → 纯聊天，不要凭空生成代码
+
+    async def chat_stream(self, session_id: str, user_message, current_code: str = "", code_dirty: bool = False):
         """流式对话 - 逐 token 返回"""
-        token = _begin_code_session(session_id, current_code)
         await self._ensure_agent()
+        lock = self._get_session_lock(session_id)  # 串行化同一会话的并发回合
+        await lock.acquire()
 
         config = {"configurable": {"thread_id": session_id}, "recursion_limit": 500}
         full_reply = ""
-
-        last_code_sent = current_code
+        token = None
         last_context_usage_key = None
 
         try:
+            token = _begin_code_session(session_id, current_code, code_dirty)
+            base_code = _get_current_code()  # 协调后的基准代码
+            last_code_sent = base_code
             async for chunk in self.agent.astream(
-                {"messages": [{"role": "user", "content": user_message}]},
+                {"messages": [{"role": "user", "content": self._build_message(user_message, base_code)}]},
                 config=config,
                 stream_mode=["messages", "updates"],
                 version="v2",
@@ -856,31 +1120,53 @@ class GameDesignAgent:
                                             "source": tool_name,
                                         }
 
-            # 流结束：优先使用工具写入/编辑后的代码；仅在未使用工具时保留文本提取兜底
+            # 流结束：兜底提交忘了 more=False 的分段写入，再取最终代码
+            _autocommit_staging(session_id)
             edited_code = _get_current_code()
-            code = edited_code if edited_code != current_code else self._extract_code(full_reply)
+            if edited_code != last_code_sent and edited_code != base_code:
+                # 兜底提交产生的新代码，补发一次 code_update 让前端渲染
+                yield {"type": "code_update", "code": edited_code, "source": "write_game"}
+            code = self._resolve_final_code(base_code, full_reply)
 
-            action = "generate" if code and not current_code else "edit" if code else "chat"
+            action = "generate" if code and not base_code else "edit" if code else "chat"
             yield {"type": "done", "code": code, "action": action}
 
+        except asyncio.CancelledError:
+            # 用户取消请求，正常情况
+            yield {"type": "error", "content": "请求已取消", "error_code": "CANCELLED"}
+        except MemoryError as e:
+            # 内存不足
+            log_error(session_id, ErrorCode.SYSTEM_ERROR, "内存不足", e)
+            yield {"type": "error", "content": "内存不足，请减少代码长度或重启服务", "error_code": ErrorCode.SYSTEM_ERROR}
+        except TimeoutError as e:
+            # 超时
+            log_error(session_id, "TIMEOUT", "请求超时", e)
+            yield {"type": "error", "content": "请求超时，请稍后重试", "error_code": "TIMEOUT"}
         except Exception as e:
-            yield {"type": "error", "content": str(e)}
+            # 其他未知错误，记录详细信息
+            log_error(session_id, ErrorCode.SYSTEM_ERROR, f"chat_stream 异常: {str(e)}", e)
+            yield {"type": "error", "content": f"系统错误: {str(e)}", "error_code": ErrorCode.SYSTEM_ERROR}
         finally:
-            _end_code_session(token)
+            if token is not None:
+                _end_code_session(token)
+            lock.release()
 
     @staticmethod
     def _extract_code(text: str) -> str | None:
-        """从回复中提取完整 HTML 代码"""
-        matches = re.findall(r"```html\s*\n(.*?)```", text, re.DOTALL)
-        if matches:
-            code = max(matches, key=len).strip()
-            if "<html" in code or "<!DOCTYPE" in code.upper() or "<canvas" in code:
-                return code
-        matches = re.findall(r"```\s*\n(.*?)```", text, re.DOTALL)
-        for m in matches:
-            code = m.strip()
-            if ("<html" in code or "<!DOCTYPE" in code.upper()) and "<script" in code:
-                return code
+        """从回复中抢救一份完整 HTML 文档（仅用于全新空会话的兜底）。
+
+        要求是写完整的文档（有文档头 + </html>），不再接受裸 <canvas> 或半截片段，
+        避免把模型贴在聊天里的局部示例当成完整代码覆盖编辑器。
+        """
+        def _is_complete(code: str) -> bool:
+            low = code.lower()
+            return ("<!doctype" in low or "<html" in low) and "</html>" in low
+
+        for pattern in (r"```html\s*\n(.*?)```", r"```\s*\n(.*?)```"):
+            matches = [m.strip() for m in re.findall(pattern, text, re.DOTALL)]
+            complete = [m for m in matches if _is_complete(m)]
+            if complete:
+                return max(complete, key=len)
         return None
 
     async def clear_session(self, session_id: str):
@@ -890,8 +1176,13 @@ class GameDesignAgent:
                 await self.checkpointer.adelete_thread(session_id)
         except Exception:
             pass
-        # 清理上下文使用率缓存，让前端圆环归零
+        # 原子清理全部存储位置：上下文圆环缓存 / 内存代码 / 暂存区 / 访问时间 / 会话锁 / 磁盘 .html
         _context_usage_by_session.pop(session_id, None)
         _code_by_session.pop(session_id, None)
+        _staging_by_session.pop(session_id, None)
         _code_session_last_access.pop(session_id, None)
-        _code_write_buffer.pop(session_id, None)
+        self._session_locks.pop(session_id, None)
+        try:
+            delete_session_code(session_id)  # 删磁盘文件，否则清空后重开会"复活"旧代码
+        except Exception as e:
+            logger.warning("delete_session_code_failed", session_id=session_id, error=str(e))

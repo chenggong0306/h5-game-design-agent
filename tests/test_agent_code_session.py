@@ -1,13 +1,40 @@
 import unittest
 
 import src.agent.game_agent as game_agent
+import src.utils.persistence as persistence
+
+
+# 所有测试用到的会话 id，setUp/tearDown 统一清理（内存 + 磁盘），保证用例间隔离
+_TEST_SESSIONS = [
+    "session-a", "session-b", "view-session", "write-once", "write-chunked",
+    "write-incomplete", "append-empty", "replace-empty", "doctype-frag",
+    "autocommit", "autocommit-bad", "reconcile", "reconcile2", "resurrect",
+    "resolve", "resolve-empty",
+]
 
 
 class AgentCodeSessionTests(unittest.TestCase):
-    def test_code_tools_are_isolated_by_context_session(self):
+    """覆盖根因2（工具面）与根因4（唯一真相源 / 协调 / 原子清理）。"""
+
+    def _clean(self):
+        for sid in _TEST_SESSIONS:
+            game_agent._code_by_session.pop(sid, None)
+            game_agent._staging_by_session.pop(sid, None)
+            game_agent._code_session_last_access.pop(sid, None)
+            try:
+                persistence.delete_session_code(sid)
+            except Exception:
+                pass
+
+    setUp = _clean
+    tearDown = _clean
+
+    # ---------- 根因2：工具面 ----------
+
+    def test_edit_tools_are_isolated_by_context_session(self):
         token_a = game_agent._begin_code_session("session-a", "let speed = 100;\ndrawA();")
         try:
-            message_a = game_agent.str_replace_code.invoke({
+            message_a = game_agent.replace_code.invoke({
                 "old_str": "let speed = 100;",
                 "new_str": "let speed = 200;",
             })
@@ -16,13 +43,9 @@ class AgentCodeSessionTests(unittest.TestCase):
 
             token_b = game_agent._begin_code_session("session-b", "let speed = 50;\ndrawB();")
             try:
-                message_b = game_agent.replace_code_lines.invoke({
-                    "start_line": 2,
-                    "end_line": 2,
-                    "new_str": "drawB2();",
-                })
-                self.assertIn("已替换", message_b)
-                self.assertEqual(game_agent._get_current_code(), "let speed = 50;\ndrawB2();")
+                message_b = game_agent.delete_code.invoke({"start_line": 2, "end_line": 2})
+                self.assertIn("已删除", message_b)
+                self.assertEqual(game_agent._get_current_code(), "let speed = 50;")
             finally:
                 game_agent._end_code_session(token_b)
 
@@ -34,60 +57,152 @@ class AgentCodeSessionTests(unittest.TestCase):
         token = game_agent._begin_code_session("view-session", "a\nb\nc")
         try:
             content = game_agent.view_code.invoke({"start_line": 2, "end_line": 2})
-
             self.assertIn("共 3 行", content)
             self.assertIn("   2 | b", content)
             self.assertNotIn("   1 | a", content)
         finally:
             game_agent._end_code_session(token)
 
-    def test_write_game_code_updates_current_session_code(self):
-        token = game_agent._begin_code_session("write-session", "old code")
+    def test_write_game_single_call_commits(self):
+        token = game_agent._begin_code_session("write-once", "")
         try:
-            content = "<!DOCTYPE html>\n<html><body><canvas></canvas></body></html>"
-            message = game_agent.write_game_code.invoke({
-                "code": content,
-                "reason": "创建测试游戏",
-            })
-
-            self.assertIn("已写入右侧编辑器 game.html", message)
-            self.assertIn("共 2 行", message)
-            self.assertEqual(game_agent._get_current_code(), content)
+            html = "<!DOCTYPE html>\n<html><body><canvas></canvas></body></html>"
+            message = game_agent.write_game.invoke({"html": html})
+            self.assertIn("已写入并生效", message)
+            self.assertEqual(game_agent._get_current_code(), html)
         finally:
             game_agent._end_code_session(token)
 
-    def test_write_game_code_handles_missing_code_argument(self):
-        token = game_agent._begin_code_session("write-missing-code-session", "old code")
+    def test_chunked_write_stages_until_final_segment(self):
+        token = game_agent._begin_code_session("write-chunked", "OLD GAME")
         try:
-            message = game_agent.write_game_code.invoke({})
+            seg1 = "<!DOCTYPE html>\n<html><head><style>x</style></head>"
+            msg1 = game_agent.write_game.invoke({"html": seg1, "more": True})
+            self.assertIn("暂存", msg1)
+            self.assertEqual(game_agent._get_current_code(), "OLD GAME")  # 暂存期间不动生效代码
 
-            self.assertIn("写入失败：缺少 code 参数", message)
+            seg2 = "<body><script>game()</script></body></html>"
+            msg2 = game_agent.append_game.invoke({"html": seg2, "more": False})
+            self.assertIn("已写入并生效", msg2)
+            self.assertEqual(game_agent._get_current_code(), seg1 + seg2)
+        finally:
+            game_agent._end_code_session(token)
+
+    def test_incomplete_final_segment_is_rejected_and_keeps_old_code(self):
+        token = game_agent._begin_code_session("write-incomplete", "OLD GAME")
+        try:
+            msg = game_agent.write_game.invoke({"html": "<!DOCTYPE html>\n<html><body>", "more": False})
+            self.assertIn("尚不完整", msg)
+            self.assertEqual(game_agent._get_current_code(), "OLD GAME")
+        finally:
+            game_agent._end_code_session(token)
+
+    def test_append_without_start_returns_actionable_error(self):
+        token = game_agent._begin_code_session("append-empty", "OLD GAME")
+        try:
+            msg = game_agent.append_game.invoke({"html": "<x>", "more": False})
+            self.assertIn("先调用 write_game", msg)
+            self.assertEqual(game_agent._get_current_code(), "OLD GAME")
+        finally:
+            game_agent._end_code_session(token)
+
+    def test_replace_code_requires_old_str(self):
+        token = game_agent._begin_code_session("replace-empty", "old code")
+        try:
+            msg = game_agent.replace_code.invoke({"old_str": "", "new_str": "x"})
+            self.assertIn("old_str 不能为空", msg)
             self.assertEqual(game_agent._get_current_code(), "old code")
         finally:
             game_agent._end_code_session(token)
 
-
-    def test_write_game_code_rejects_startup_order_black_screen_risk(self):
-        token = game_agent._begin_code_session("startup-order-session", "old code")
+    def test_replace_code_with_doctype_fragment_does_not_wipe_file(self):
+        token = game_agent._begin_code_session("doctype-frag", "<!DOCTYPE html><html><body>OLD FULL GAME</body></html>")
         try:
-            bad_code = """<!DOCTYPE html>
-<html><body><canvas id=\"c\"></canvas><script>
-const canvas=document.getElementById('c');
-const ctx=canvas.getContext('2d');
-function resize(){ if(player){ player.x=1; } ctx.scale(2,2); }
-resize();
-let player=null;
-requestAnimationFrame(()=>{});
-</script></body></html>"""
-            message = game_agent.write_game_code.invoke({"code": bad_code})
-
-            self.assertIn("写入失败：生成的 HTML 可能黑屏", message)
-            self.assertIn("resize(); 出现在 player 声明之前", message)
-            self.assertIn("ctx.scale()", message)
-            self.assertEqual(game_agent._get_current_code(), "old code")
+            game_agent.replace_code.invoke({"old_str": "OLD FULL GAME", "new_str": "<!DOCTYPE new fragment"})
+            code = game_agent._get_current_code()
+            self.assertIn("<html>", code)
+            self.assertIn("<body>", code)
+            self.assertIn("<!DOCTYPE new fragment", code)
         finally:
             game_agent._end_code_session(token)
 
+    def test_autocommit_staging_commits_complete_doc(self):
+        token = game_agent._begin_code_session("autocommit", "OLD")
+        try:
+            game_agent.write_game.invoke({"html": "<!DOCTYPE html><html></html>", "more": True})
+            self.assertEqual(game_agent._get_current_code(), "OLD")  # 未提交
+            game_agent._autocommit_staging("autocommit")
+            self.assertEqual(game_agent._get_current_code(), "<!DOCTYPE html><html></html>")
+        finally:
+            game_agent._end_code_session(token)
+
+    def test_autocommit_discards_incomplete_doc(self):
+        token = game_agent._begin_code_session("autocommit-bad", "OLD GAME")
+        try:
+            game_agent.write_game.invoke({"html": "<!DOCTYPE html><html><body>", "more": True})
+            game_agent._autocommit_staging("autocommit-bad")
+            self.assertEqual(game_agent._get_current_code(), "OLD GAME")  # 不完整 → 丢弃，保留旧代码
+        finally:
+            game_agent._end_code_session(token)
+
+    # ---------- 根因4：唯一真相源 / 协调 / 原子清理 ----------
+
+    def test_stale_client_code_does_not_clobber_server(self):
+        # 服务端已有权威代码；下一回合前端发来不一致的旧代码但未声明手改 → 保留服务端
+        t1 = game_agent._begin_code_session("reconcile", "SERVER AUTH CODE", client_dirty=True)
+        game_agent._end_code_session(t1)
+        t2 = game_agent._begin_code_session("reconcile", "STALE CLIENT CODE", client_dirty=False)
+        try:
+            self.assertEqual(game_agent._get_current_code(), "SERVER AUTH CODE")
+        finally:
+            game_agent._end_code_session(t2)
+
+    def test_dirty_client_code_is_adopted(self):
+        t1 = game_agent._begin_code_session("reconcile2", "SERVER AUTH CODE", client_dirty=True)
+        game_agent._end_code_session(t1)
+        t2 = game_agent._begin_code_session("reconcile2", "USER EDITED CODE", client_dirty=True)
+        try:
+            self.assertEqual(game_agent._get_current_code(), "USER EDITED CODE")
+        finally:
+            game_agent._end_code_session(t2)
+
+    def test_no_resurrection_after_disk_delete(self):
+        # 模拟 clear_session：删内存 + 删磁盘后，空 current_code 的新会话不应复活旧代码
+        t = game_agent._begin_code_session("resurrect", "OLD GAME", client_dirty=True)
+        game_agent._end_code_session(t)
+        self.assertEqual(persistence.load_session_code("resurrect"), "OLD GAME")
+        game_agent._code_by_session.pop("resurrect", None)
+        persistence.delete_session_code("resurrect")
+        t2 = game_agent._begin_code_session("resurrect", "", client_dirty=False)
+        try:
+            self.assertEqual(game_agent._get_current_code(), "")
+        finally:
+            game_agent._end_code_session(t2)
+
+    def test_resolve_final_code_does_not_scrape_when_buffer_present(self):
+        token = game_agent._begin_code_session("resolve", "<html>EXISTING</html>", client_dirty=True)
+        try:
+            reply = "顺便给你看段示例\n```html\n<!DOCTYPE html><html>SNIPPET</html>\n```"
+            code = game_agent.GameDesignAgent._resolve_final_code("<html>EXISTING</html>", reply)
+            self.assertEqual(code, "<html>EXISTING</html>")  # 返回缓冲区真值
+            self.assertNotIn("SNIPPET", code)               # 绝不被聊天片段覆盖
+        finally:
+            game_agent._end_code_session(token)
+
+    def test_resolve_final_code_rescues_full_doc_on_empty_session(self):
+        token = game_agent._begin_code_session("resolve-empty", "", client_dirty=False)
+        try:
+            reply = "```html\n<!DOCTYPE html><html>FULL</html>\n```"
+            code = game_agent.GameDesignAgent._resolve_final_code("", reply)
+            self.assertIn("FULL", code)
+        finally:
+            game_agent._end_code_session(token)
+
+    def test_extract_code_requires_complete_document(self):
+        partial = "这是说明\n```html\n<canvas id='c'></canvas>\n```\n"
+        self.assertIsNone(game_agent.GameDesignAgent._extract_code(partial))
+        complete = "好的\n```html\n<!DOCTYPE html><html><body></body></html>\n```\n"
+        self.assertIn("</html>", game_agent.GameDesignAgent._extract_code(complete) or "")
 
 
 if __name__ == "__main__":

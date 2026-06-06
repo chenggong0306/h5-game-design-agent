@@ -38,7 +38,7 @@ class CodeEditor:
         }
 
     @staticmethod
-    def str_replace(code: str, old_str: str, new_str: str) -> dict:
+    def str_replace(code: str, old_str: str, new_str: str, replace_all: bool = False) -> dict:
         """替换代码中的指定片段。
 
         移植自 MCP filesystem server 的 applyFileEdits 逻辑：
@@ -50,6 +50,7 @@ class CodeEditor:
             code: 完整代码
             old_str: 要替换的原始代码片段
             new_str: 替换后的新代码片段（空字符串=删除）
+            replace_all: True 时替换所有匹配，False 时只替换第一个（默认）
         Returns:
             {"success": True/False, "code": "修改后代码", "message": "..."}
         """
@@ -62,22 +63,23 @@ class CodeEditor:
 
         # 1. 先尝试精确匹配
         count = content.count(normalized_old)
-        if count > 1:
+        if count > 1 and not replace_all:
             return {
                 "success": False,
                 "code": code,
-                "message": f"找到 {count} 处匹配，请提供更精确的代码片段以避免歧义",
+                "message": f"找到 {count} 处匹配，请提供更精确的代码片段，或在工具中传 replace_all=True 替换全部",
             }
-        if count == 1:
-            new_code = content.replace(normalized_old, normalized_new, 1)
+        if count >= 1:
+            new_code = content.replace(normalized_old, normalized_new) if replace_all else content.replace(normalized_old, normalized_new, 1)
             before_lines = content[:content.index(normalized_old)].count('\n') + 1
             old_line_count = normalized_old.count('\n') + 1
             new_line_count = normalized_new.count('\n') + 1 if normalized_new else 0
+            suffix = f"（共替换 {count} 处）" if replace_all and count > 1 else ""
             return {
                 "success": True,
                 "code": new_code,
                 "message": f"已替换第 {before_lines}-{before_lines + old_line_count - 1} 行"
-                           f"（{old_line_count} 行 → {new_line_count} 行）",
+                           f"（{old_line_count} 行 → {new_line_count} 行）{suffix}",
                 "line_start": before_lines,
                 "lines_removed": old_line_count,
                 "lines_added": new_line_count,

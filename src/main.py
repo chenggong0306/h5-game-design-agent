@@ -25,6 +25,8 @@ except Exception:
     pass
 
 
+from contextlib import asynccontextmanager
+
 import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import Response
@@ -38,11 +40,32 @@ from src.config import settings
 from src.api.routes import router, kb
 from src.agent.game_agent import SKILLS
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """启动时恢复素材索引 + 打印技能/知识库状态（取代已弃用的 @app.on_event）。"""
+    # 1. 自动恢复：扫描 data/assets/ 把已有文件重建索引（ChromaDB 被清空时救命用）
+    rebuilt = kb.rebuild_assets_index()
+    if rebuilt > 0:
+        print(f"[Startup] Rebuilt {rebuilt} asset records from disk")
+
+    # 2. 打印技能状态（内置 + 自定义已在 game_agent 模块加载时恢复）
+    from src.knowledge.phaser_skills import H5_GAME_SKILLS
+    builtin_names = {s["category"] for s in H5_GAME_SKILLS}
+    builtin = sum(1 for s in SKILLS if s["name"] in builtin_names)
+    custom = len(SKILLS) - builtin
+    print(f"[Startup] Skills: {builtin} builtin + {custom} custom = {len(SKILLS)} total")
+    print(f"[Startup] KB stats: {kb.get_stats()}")
+
+    yield
+
+
 # 创建 FastAPI 应用
 app = FastAPI(
     title=settings.project_name,
     version=settings.version,
     description="基于知识库的 AI 游戏设计智能体",
+    lifespan=lifespan,
 )
 
 # CORS
@@ -62,23 +85,6 @@ templates = Jinja2Templates(directory=str(_BASE / "templates"))
 
 # 注册路由
 app.include_router(router)
-
-
-@app.on_event("startup")
-async def startup():
-    """启动时恢复素材索引 + 打印技能状态"""
-    # 1. 自动恢复：扫描 data/assets/ 把已有文件重建索引（ChromaDB 被清空时救命用）
-    rebuilt = kb.rebuild_assets_index()
-    if rebuilt > 0:
-        print(f"[Startup] Rebuilt {rebuilt} asset records from disk")
-
-    # 2. 打印技能状态（内置 + 自定义已在 game_agent 模块加载时恢复）
-    builtin = sum(1 for s in SKILLS if s["name"] in {"base", "input", "physics", "bugfix", "assets", "template", "mobile"})
-    custom = len(SKILLS) - builtin
-    print(f"[Startup] Skills: {builtin} builtin + {custom} custom = {len(SKILLS)} total")
-
-    stats = kb.get_stats()
-    print(f"[Startup] KB stats: {stats}")
 
 
 @app.get("/")

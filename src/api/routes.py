@@ -24,6 +24,28 @@ kb = KnowledgeBase()
 agent = GameDesignAgent(kb)
 
 
+# ============ HTTP 层限流（取代旧的按工具调用限流，避免卡断分段写入） ============
+import time as _time
+from collections import defaultdict as _defaultdict
+
+_CHAT_RATE_WINDOW = 60   # 秒
+_CHAT_RATE_MAX = 30      # 每会话每窗口最多对话请求数
+_chat_request_times: dict[str, list[float]] = _defaultdict(list)
+
+
+def _check_chat_rate_limit(session_id: str) -> bool:
+    """按会话滑动窗口限流。未超限返回 True。"""
+    if not session_id:
+        return True
+    now = _time.time()
+    calls = _chat_request_times[session_id]
+    calls[:] = [t for t in calls if now - t < _CHAT_RATE_WINDOW]
+    if len(calls) >= _CHAT_RATE_MAX:
+        return False
+    calls.append(now)
+    return True
+
+
 # ============ 请求/响应模型 ============
 
 CHAT_HISTORY_DIR = Path(__file__).resolve().parents[2] / "data" / "chat_history"
@@ -132,6 +154,7 @@ class ChatRequest(BaseModel):
     session_id: str = ""
     message: str
     current_code: str = ""
+    code_dirty: bool = False  # 前端是否在编辑器里手动改过代码（决定服务端是否采用 current_code）
     images: list[ChatImage] = Field(default_factory=list)
 
 
@@ -163,6 +186,8 @@ class ProjectResponse(BaseModel):
 async def chat(req: ChatRequest):
     """与 AI 智能体对话"""
     session_id = req.session_id or str(uuid.uuid4())
+    if not _check_chat_rate_limit(session_id):
+        raise HTTPException(status_code=429, detail="请求过于频繁，请稍候再试")
     try:
         images = _validate_chat_images(req.images)
         user_content = _build_user_message_content(req.message, images)
@@ -170,6 +195,7 @@ async def chat(req: ChatRequest):
             session_id=session_id,
             user_message=user_content,
             current_code=req.current_code,
+            code_dirty=req.code_dirty,
         )
         _append_chat_history(session_id, "user", req.message, {"images": _image_history_meta(images)} if images else None)
         _append_chat_history(session_id, "ai", result.get("reply", ""), {"code": result.get("code") or ""})
@@ -196,16 +222,21 @@ async def chat_stream(req: ChatRequest):
     async def event_generator():
         assistant_text = ""
         latest_code = ""
+        # 先发送 session_id
+        yield f"data: {json.dumps({'type': 'session', 'session_id': session_id}, ensure_ascii=False)}\n\n"
+        if not _check_chat_rate_limit(session_id):
+            yield f"data: {json.dumps({'type': 'error', 'content': '请求过于频繁，请稍候再试', 'error_code': 'RATE_LIMIT_EXCEEDED'}, ensure_ascii=False)}\n\n"
+            yield "data: [DONE]\n\n"
+            return
         images = _validate_chat_images(req.images)
         user_content = _build_user_message_content(req.message, images)
         _append_chat_history(session_id, "user", req.message, {"images": _image_history_meta(images)} if images else None)
-        # 先发送 session_id
-        yield f"data: {json.dumps({'type': 'session', 'session_id': session_id}, ensure_ascii=False)}\n\n"
         try:
             async for chunk in agent.chat_stream(
                 session_id=session_id,
                 user_message=user_content,
                 current_code=req.current_code,
+                code_dirty=req.code_dirty,
             ):
                 if chunk.get("type") == "token":
                     assistant_text += chunk.get("content", "")
@@ -248,12 +279,18 @@ async def list_chat_history():
 
 @router.get("/api/chat/{session_id}/history")
 async def get_chat_history(session_id: str):
-    """获取指定会话的消息历史，并返回该会话最后一次代码快照。"""
+    """获取指定会话的消息历史，并返回该会话最后一次代码快照。
+
+    代码以磁盘 .html 为权威来源（每次编辑都会落盘，含被中断回合的最新代码），
+    仅当磁盘没有时才回退到聊天历史里的快照（兼容旧会话）。
+    """
+    from src.utils.persistence import load_session_code
     history = _load_chat_history(session_id)
+    latest_code = load_session_code(session_id) or _get_latest_code_from_history(history)
     return {
         "session_id": session_id,
         "messages": history,
-        "latest_code": _get_latest_code_from_history(history),
+        "latest_code": latest_code,
     }
 
 
@@ -385,6 +422,7 @@ def _sync_skills():
     """更新 SkillMiddleware 的 prompt 缓存 + 持久化到磁盘"""
     import src.agent.game_agent as ga
     ga._skills_prompt = "\n".join(f"- **{s['name']}**: {s['description']}" for s in SKILLS)
+    ga._invalidate_system_overhead()  # 技能变了，固定开销需重新计算（影响上下文圆环）
     _save_custom_skills()
 
 class SkillCreateRequest(BaseModel):

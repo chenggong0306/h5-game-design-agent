@@ -29,11 +29,6 @@ class KnowledgeBase:
             name="game_assets",
             metadata={"description": "游戏素材的元数据和描述"},
         )
-        # 游戏知识集合（Phaser Skills、模板、文档）
-        self.skills_collection = self.client.get_or_create_collection(
-            name="game_skills",
-            metadata={"description": "游戏开发知识、API文档、代码模板"},
-        )
         # 用户项目集合
         self.projects_collection = self.client.get_or_create_collection(
             name="user_projects",
@@ -185,33 +180,6 @@ class KnowledgeBase:
         except Exception:
             return False
 
-    # ============ 知识/技能管理 ============
-
-    def add_skill(self, title: str, content: str, category: str = "general", tags: list[str] | None = None) -> str:
-        """添加游戏开发知识/技能文档"""
-        skill_id = str(uuid.uuid4())
-        metadata = {
-            "title": title,
-            "category": category,
-            "tags": json.dumps(tags or [], ensure_ascii=False),
-        }
-        self.skills_collection.add(
-            ids=[skill_id],
-            documents=[f"[{category}] {title}\n\n{content}"],
-            metadatas=[metadata],
-        )
-        return skill_id
-
-    def search_skills(self, query: str, category: Optional[str] = None, top_k: int = 5) -> list[dict]:
-        """搜索知识库"""
-        where_filter = {"category": category} if category else None
-        results = self.skills_collection.query(
-            query_texts=[query],
-            n_results=top_k,
-            where=where_filter,
-        )
-        return self._format_results(results)
-
     # ============ 项目管理 ============
 
     def save_project(self, project_id: str, name: str, code: str, config: dict | None = None) -> str:
@@ -293,6 +261,5 @@ class KnowledgeBase:
         """获取知识库统计信息"""
         return {
             "assets_count": self.assets_collection.count(),
-            "skills_count": self.skills_collection.count(),
             "projects_count": self.projects_collection.count(),
         }
