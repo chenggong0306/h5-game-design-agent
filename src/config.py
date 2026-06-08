@@ -18,6 +18,13 @@ class Settings(BaseSettings):
     # 多模型服务配置：LLM_PROVIDER 可选 openai / deepseek / qwen
     llm_provider: str = "openai"
 
+    # 生成质量调参
+    # temperature：写代码宜偏低（0.2~0.4 更稳、bug 更少）；想要更多玩法/视觉变化可调高
+    temperature: float = 0.3
+    # 单次输出上限。务必 ≤ 你所用模型的真实最大输出（如 deepseek-chat≈8192、gpt-4o≈16384）。
+    # 太大可能被 provider 拒绝/截断；配合"分段写入"使用，单段建议 ≤300 行。
+    max_output_tokens: int = 8192
+
     # DeepSeek 配置（启用方式：LLM_PROVIDER=deepseek）
     deepseek_api_key: str = ""
     deepseek_base_url: str = "https://api.deepseek.com"
@@ -30,9 +37,14 @@ class Settings(BaseSettings):
 
 
     # 服务
-    host: str = "0.0.0.0"
+    # 默认只绑本机回环，避免把无鉴权的接口暴露到局域网；确需联网时再用 HOST=0.0.0.0 覆盖
+    host: str = "127.0.0.1"
     port: int = 8000
     debug: bool = True
+
+    # 可选 API 令牌：留空=本机自用、接口开放；设置后所有 /api/* 写操作需带 X-API-Token 头
+    # （配合 HOST=0.0.0.0 对外暴露时使用）
+    api_token: str = ""
 
     # 路径
     chroma_persist_dir: str = str(BASE_DIR / "data" / "chroma_db")

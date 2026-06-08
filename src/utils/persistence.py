@@ -1,6 +1,7 @@
 """会话代码持久化管理"""
 
 import json
+import re
 from pathlib import Path
 from typing import Optional
 from src.utils.logger import logger
@@ -11,6 +12,13 @@ SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
 
 # 会话元数据文件
 SESSIONS_META_FILE = SESSIONS_DIR / "_sessions.json"
+
+# 会话 id 安全校验（防穿越写到任意路径）；与 HTTP 层一致
+_SAFE_SESSION_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+
+
+def _is_safe_session_id(session_id: str) -> bool:
+    return bool(session_id) and bool(_SAFE_SESSION_ID.match(session_id))
 
 
 def save_session_code(session_id: str, code: str) -> bool:
@@ -24,10 +32,13 @@ def save_session_code(session_id: str, code: str) -> bool:
         True: 保存成功
         False: 保存失败
     """
+    if not _is_safe_session_id(session_id):
+        logger.warning("unsafe_session_id_rejected", op="save", session_id=str(session_id)[:64])
+        return False
     try:
         file_path = SESSIONS_DIR / f"{session_id}.html"
         file_path.write_text(code, encoding="utf-8")
-        
+
         # 更新元数据
         _update_session_meta(session_id, len(code))
         
@@ -47,6 +58,8 @@ def load_session_code(session_id: str) -> Optional[str]:
     Returns:
         代码内容，如果不存在返回 None
     """
+    if not _is_safe_session_id(session_id):
+        return None
     try:
         file_path = SESSIONS_DIR / f"{session_id}.html"
         if not file_path.exists():
@@ -70,6 +83,8 @@ def delete_session_code(session_id: str) -> bool:
         True: 删除成功
         False: 删除失败
     """
+    if not _is_safe_session_id(session_id):
+        return False
     try:
         file_path = SESSIONS_DIR / f"{session_id}.html"
         if file_path.exists():

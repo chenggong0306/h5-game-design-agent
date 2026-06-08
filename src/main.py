@@ -68,11 +68,14 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS
+# CORS：本地工具只允许同源（localhost）调用；不使用凭据，去掉 "*"+credentials 的无效组合
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=[
+        f"http://localhost:{settings.port}",
+        f"http://127.0.0.1:{settings.port}",
+    ],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -83,8 +86,23 @@ _BASE = Path(__file__).resolve().parent
 app.mount("/static", StaticFiles(directory=str(_BASE / "static")), name="static")
 templates = Jinja2Templates(directory=str(_BASE / "templates"))
 
+
+# 可选鉴权：设置了 API_TOKEN 时，/api/* 写操作需带 X-API-Token 头（只读素材放行，预览 iframe 才能加载）
+from fastapi import Depends, Header, HTTPException
+
+
+async def require_token(request: Request, x_api_token: str | None = Header(default=None)):
+    if not settings.api_token:
+        return  # 未配置令牌：本机自用模式，全部放行
+    path = request.url.path
+    if path.startswith("/assets/") or path.startswith("/api/assets/file/"):
+        return  # 只读媒体放行（已做路径校验），供 null-origin 预览 iframe 加载
+    if x_api_token != settings.api_token:
+        raise HTTPException(status_code=401, detail="缺少或无效的 API 令牌")
+
+
 # 注册路由
-app.include_router(router)
+app.include_router(router, dependencies=[Depends(require_token)])
 
 
 @app.get("/")

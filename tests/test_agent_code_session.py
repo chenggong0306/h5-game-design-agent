@@ -88,12 +88,47 @@ class AgentCodeSessionTests(unittest.TestCase):
         finally:
             game_agent._end_code_session(token)
 
-    def test_incomplete_final_segment_is_rejected_and_keeps_old_code(self):
+    def test_incomplete_segment_stages_without_error_and_keeps_old_code(self):
+        # 内容驱动：未出现 </html> → 暂存并提示继续（非错误），旧代码不动
         token = game_agent._begin_code_session("write-incomplete", "OLD GAME")
         try:
-            msg = game_agent.write_game.invoke({"html": "<!DOCTYPE html>\n<html><body>", "more": False})
-            self.assertIn("尚不完整", msg)
+            msg = game_agent.write_game.invoke({"html": "<!DOCTYPE html>\n<html><body>"})
+            self.assertNotIn("[ERROR", msg)            # 不再标记为失败
+            self.assertIn("尚未闭合", msg)
             self.assertEqual(game_agent._get_current_code(), "OLD GAME")
+            # 续写补上 </html> → 自动生效（无需 more 标志）
+            msg2 = game_agent.append_game.invoke({"html": "<canvas></canvas><script>1</script></body></html>"})
+            self.assertIn("已写入并生效", msg2)
+            self.assertIn("</html>", game_agent._get_current_code())
+        finally:
+            game_agent._end_code_session(token)
+
+    def test_staging_survives_across_turns_for_continuation(self):
+        # 回归：分段写入跨回合时，暂存不应在新回合开始被清空（否则 append 报 APPEND_TO_EMPTY）
+        t1 = game_agent._begin_code_session("write-chunked", "OLD GAME")
+        game_agent.write_game.invoke({"html": "<!DOCTYPE html>\n<html><head><style>x</style></head>"})
+        game_agent._autocommit_staging("write-chunked")          # 回合1结束：未闭合 → 保留暂存
+        self.assertEqual(game_agent._get_current_code(), "OLD GAME")
+        game_agent._end_code_session(t1)
+        # 回合2：新回合开始不清空暂存，append 续写补全 → 自动生效
+        t2 = game_agent._begin_code_session("write-chunked", "OLD GAME")
+        try:
+            msg = game_agent.append_game.invoke({"html": "<body><script>1</script></body></html>"})
+            self.assertIn("已写入并生效", msg)
+            self.assertIn("</html>", game_agent._get_current_code())
+        finally:
+            game_agent._end_code_session(t2)
+
+    def test_autocommit_salvages_truncated_game_with_script(self):
+        # 末段被截断（有文档头+脚本但缺 </html>）→ 回合结束兜底补全闭合并提交，不丢失整局
+        token = game_agent._begin_code_session("autocommit", "OLD")
+        try:
+            game_agent.write_game.invoke({"html": "<!DOCTYPE html><html><body><canvas></canvas><script>game()</script>"})
+            self.assertEqual(game_agent._get_current_code(), "OLD")  # 未闭合，暂存未提交
+            game_agent._autocommit_staging("autocommit")
+            code = game_agent._get_current_code()
+            self.assertIn("</html>", code)
+            self.assertIn("game()", code)
         finally:
             game_agent._end_code_session(token)
 
@@ -126,12 +161,12 @@ class AgentCodeSessionTests(unittest.TestCase):
         finally:
             game_agent._end_code_session(token)
 
-    def test_autocommit_staging_commits_complete_doc(self):
+    def test_complete_doc_commits_immediately(self):
+        # 内容驱动：出现 </html> 立即生效，不依赖 more 标志（即使误传 more=True）
         token = game_agent._begin_code_session("autocommit", "OLD")
         try:
-            game_agent.write_game.invoke({"html": "<!DOCTYPE html><html></html>", "more": True})
-            self.assertEqual(game_agent._get_current_code(), "OLD")  # 未提交
-            game_agent._autocommit_staging("autocommit")
+            msg = game_agent.write_game.invoke({"html": "<!DOCTYPE html><html></html>", "more": True})
+            self.assertIn("已写入并生效", msg)
             self.assertEqual(game_agent._get_current_code(), "<!DOCTYPE html><html></html>")
         finally:
             game_agent._end_code_session(token)

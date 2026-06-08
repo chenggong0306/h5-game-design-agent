@@ -86,7 +86,8 @@
                     <button id="btn-fullscreen" title="全屏">⛶</button>
                 </div>
             </div>
-            <iframe id="game-preview" sandbox="allow-scripts allow-same-origin"></iframe>
+            <!-- 仅 allow-scripts：预览以 null origin 运行，AI/用户代码无法读取本站 localStorage/会话或调用本站 API -->
+            <iframe id="game-preview" sandbox="allow-scripts"></iframe>
         </section>
     </main>
 

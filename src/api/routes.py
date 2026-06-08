@@ -46,6 +46,37 @@ def _check_chat_rate_limit(session_id: str) -> bool:
     return True
 
 
+# ============ 安全：路径 / 输入校验 ============
+import re as _re
+from src.config import settings as _settings
+
+# 素材类型白名单（防止 asset_type 任意建目录/写文件）
+_ALLOWED_ASSET_TYPES = {"image", "audio", "spritesheet", "tilemap", "font"}
+# 危险扩展名：浏览器可能当脚本/标记执行，同源内联返回会造成存储型 XSS，禁止上传
+_DANGEROUS_ASSET_EXTS = {".html", ".htm", ".svg", ".xml", ".js", ".mjs", ".css"}
+# 文件名：无前导点、无 ".."、仅限安全字符（防穿越）
+_SAFE_FILENAME = _re.compile(r"^(?!\.)(?!.*\.\.)[A-Za-z0-9_.-]+$")
+# 会话 id：仅字母数字/下划线/连字符（uuid4 满足），防穿越到任意 .json/.html
+_SAFE_SESSION_ID = _re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+
+
+def _require_safe_session_id(session_id: str) -> str:
+    if not session_id or not _SAFE_SESSION_ID.match(session_id):
+        raise HTTPException(status_code=400, detail="无效的 session_id")
+    return session_id
+
+
+def _resolve_asset_path(asset_type: str, filename: str) -> str:
+    """校验并解析素材真实路径，确保落在 assets 目录内（防路径穿越读取任意文件）。"""
+    if asset_type not in _ALLOWED_ASSET_TYPES or not _SAFE_FILENAME.match(filename):
+        raise HTTPException(status_code=404, detail="文件不存在")
+    base = Path(_settings.assets_dir).resolve()
+    target = (base / asset_type / filename).resolve()
+    if not target.is_relative_to(base) or not target.is_file():
+        raise HTTPException(status_code=404, detail="文件不存在")
+    return str(target)
+
+
 # ============ 请求/响应模型 ============
 
 CHAT_HISTORY_DIR = Path(__file__).resolve().parents[2] / "data" / "chat_history"
@@ -53,6 +84,7 @@ CHAT_HISTORY_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _history_path(session_id: str) -> Path:
+    _require_safe_session_id(session_id)
     return CHAT_HISTORY_DIR / f"{session_id}.json"
 
 
@@ -186,6 +218,7 @@ class ProjectResponse(BaseModel):
 async def chat(req: ChatRequest):
     """与 AI 智能体对话"""
     session_id = req.session_id or str(uuid.uuid4())
+    _require_safe_session_id(session_id)
     if not _check_chat_rate_limit(session_id):
         raise HTTPException(status_code=429, detail="请求过于频繁，请稍候再试")
     try:
@@ -218,6 +251,7 @@ async def chat(req: ChatRequest):
 async def chat_stream(req: ChatRequest):
     """流式对话 - SSE (Server-Sent Events)"""
     session_id = req.session_id or str(uuid.uuid4())
+    _require_safe_session_id(session_id)
 
     async def event_generator():
         assistant_text = ""
@@ -314,8 +348,13 @@ async def upload_asset(
     tags: str = Form(""),
 ):
     """上传游戏素材"""
-    # 保存临时文件
+    # 安全校验：限定素材类型（防 asset_type 任意建目录），拒绝可执行/标记类扩展名（防存储型 XSS）
+    if asset_type not in _ALLOWED_ASSET_TYPES:
+        raise HTTPException(status_code=400, detail=f"不支持的素材类型：{asset_type}")
     suffix = os.path.splitext(file.filename or "file")[1]
+    if suffix.lower() in _DANGEROUS_ASSET_EXTS:
+        raise HTTPException(status_code=400, detail=f"不允许上传 {suffix} 文件")
+    # 保存临时文件
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         content = await file.read()
         tmp.write(content)
@@ -358,24 +397,19 @@ async def delete_asset(asset_id: str):
     return {"ok": True}
 
 
+_ASSET_HEADERS = {"X-Content-Type-Options": "nosniff"}
+
+
 @router.get("/api/assets/file/{asset_type}/{filename}")
 async def serve_asset(asset_type: str, filename: str):
-    """提供素材文件访问（API路径）"""
-    from src.config import settings
-    file_path = os.path.join(settings.assets_dir, asset_type, filename)
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="文件不存在")
-    return FileResponse(file_path)
+    """提供素材文件访问（API路径）。路径已做白名单+穿越校验。"""
+    return FileResponse(_resolve_asset_path(asset_type, filename), headers=_ASSET_HEADERS)
 
 
 @router.get("/assets/{asset_type}/{filename}")
 async def serve_asset_short(asset_type: str, filename: str):
-    """提供素材文件访问（短路径，供游戏代码引用）"""
-    from src.config import settings
-    file_path = os.path.join(settings.assets_dir, asset_type, filename)
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="文件不存在")
-    return FileResponse(file_path)
+    """提供素材文件访问（短路径，供游戏代码引用）。路径已做白名单+穿越校验。"""
+    return FileResponse(_resolve_asset_path(asset_type, filename), headers=_ASSET_HEADERS)
 
 
 # ============ 项目 API ============
@@ -421,7 +455,7 @@ async def delete_project(project_id: str):
 def _sync_skills():
     """更新 SkillMiddleware 的 prompt 缓存 + 持久化到磁盘"""
     import src.agent.game_agent as ga
-    ga._skills_prompt = "\n".join(f"- **{s['name']}**: {s['description']}" for s in SKILLS)
+    ga._rebuild_skills_prompt()  # 只列常用技能 + 检索提示（不再注入全部上百条）
     ga._invalidate_system_overhead()  # 技能变了，固定开销需重新计算（影响上下文圆环）
     _save_custom_skills()
 

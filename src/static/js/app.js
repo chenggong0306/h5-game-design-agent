@@ -213,7 +213,8 @@ function formatBytes(bytes) {
 function addMessage(content, role = 'ai') {
     const div = document.createElement('div');
     div.className = `msg ${role}`;
-    let html = content
+    // 先转义再套 markdown，杜绝聊天内容（含历史回放）里的 HTML/脚本注入（XSS）
+    let html = escapeHtml(content || '')
         .replace(/```(\w*)\n([\s\S]*?)```/g, '<pre><code>$2</code></pre>')
         .replace(/`([^`]+)`/g, '<code>$1</code>')
         .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
@@ -313,10 +314,9 @@ function createStreamBubble() {
     return div.querySelector('.msg-content');
 }
 
-// 将原始文本渲染为 HTML（简单 markdown）
+// 将原始文本渲染为 HTML（简单 markdown）。先转义，防止 XSS。
 function renderMarkdown(text) {
-    return text
-        .trim()  // 去掉开头和结尾的空白
+    return escapeHtml(String(text ?? '').trim())
         .replace(/```(\w*)\n([\s\S]*?)```/g, '<pre><code>$2</code></pre>')
         .replace(/`([^`]+)`/g, '<code>$1</code>')
         .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
@@ -330,6 +330,11 @@ function escapeHtml(value) {
         .replace(/>/g, '&gt;')
         .replace(/"/g, '&quot;')
         .replace(/'/g, '&#039;');
+}
+
+// 在 HTML 属性内的 JS 字符串字面量中安全使用（先 JS 转义反斜杠/单引号，再 HTML 转义）
+function jsStr(value) {
+    return escapeHtml(String(value ?? '').replace(/\\/g, '\\\\').replace(/'/g, "\\'"));
 }
 
 function getToolMeta(tool) {
@@ -517,8 +522,8 @@ async function openHistoryModal() {
             <div class="history-item">
                 <div class="top">
                     <div>
-                        <div class="title">${s.title || '未命名会话'}</div>
-                        <div class="meta">${s.message_count || 0} 条消息${s.updated_at ? ' · ' + s.updated_at : ''}</div>
+                        <div class="title">${escapeHtml(s.title || '未命名会话')}</div>
+                        <div class="meta">${s.message_count || 0} 条消息${s.updated_at ? ' · ' + escapeHtml(s.updated_at) : ''}</div>
                     </div>
                     <div class="history-actions">
                         <button type="button" onclick="openChatSession('${s.session_id}')">打开</button>
@@ -946,6 +951,25 @@ function injectPreviewErrorBridge(code) {
     const bridge = `
 <script>
 (function(){
+  // 预览运行在 sandbox="allow-scripts"（null origin）下，原生访问 localStorage/sessionStorage
+  // 会抛 SecurityError 直接令游戏崩溃。这里注入内存垫片：游戏照常存取（如最高分），
+  // 数据仅在本次预览内有效、刷新即重置——既不破坏功能，又不让预览读到本站真实存储。
+  function installStorageShim(name){
+    try { var probe = window[name]; probe.getItem('__probe__'); return; } catch (_) {}
+    var mem = {};
+    var shim = {
+      getItem: function(k){ k = String(k); return Object.prototype.hasOwnProperty.call(mem, k) ? mem[k] : null; },
+      setItem: function(k, v){ mem[String(k)] = String(v); },
+      removeItem: function(k){ delete mem[String(k)]; },
+      clear: function(){ mem = {}; },
+      key: function(i){ var ks = Object.keys(mem); return (i >= 0 && i < ks.length) ? ks[i] : null; }
+    };
+    Object.defineProperty(shim, 'length', { get: function(){ return Object.keys(mem).length; } });
+    try { Object.defineProperty(window, name, { value: shim, configurable: true }); } catch (_) {}
+  }
+  installStorageShim('localStorage');
+  installStorageShim('sessionStorage');
+
   function sendRuntimeError(payload){
     try {
       parent.postMessage(Object.assign({ channel: 'h5-game-preview-runtime-error' }, payload), '*');
@@ -1080,7 +1104,7 @@ async function loadProjects() {
         }
         list.innerHTML = projects.map(p => `
             <div class="project-item">
-                <span class="name">📁 ${p.name || '未命名项目'}</span>
+                <span class="name">📁 ${escapeHtml(p.name || '未命名项目')}</span>
                 <div class="actions">
                     <button onclick="loadProject('${p.project_id}')" title="加载">📂</button>
                     <button onclick="deleteProject('${p.project_id}')" title="删除">🗑️</button>
@@ -1158,8 +1182,8 @@ async function loadAssets() {
             const url = `/assets/${a.asset_type}/${aid}${a.extension || ''}`;
             return `
             <div class="asset-item">
-                <span class="name">${getTypeIcon(a.asset_type)} ${a.file_name}</span>
-                <code style="font-size:11px;color:#888;margin:0 8px">${url}</code>
+                <span class="name">${getTypeIcon(a.asset_type)} ${escapeHtml(a.file_name || '')}</span>
+                <code style="font-size:11px;color:#888;margin:0 8px">${escapeHtml(url)}</code>
                 <div class="actions">
                     <button onclick="deleteAsset('${aid}')" title="删除">🗑️</button>
                 </div>
@@ -1225,12 +1249,12 @@ async function loadSkills() {
         list.innerHTML = skills.map(s => `
             <div class="skill-item">
                 <div class="skill-info">
-                    <strong>${s.name}</strong>
-                    <span>${s.description}</span>
+                    <strong>${escapeHtml(s.name || '')}</strong>
+                    <span>${escapeHtml(s.description || '')}</span>
                 </div>
                 <div class="skill-actions">
-                    <button onclick="viewSkill('${s.name}')" title="查看">👁</button>
-                    <button onclick="deleteSkill('${s.name}')" title="删除">🗑️</button>
+                    <button onclick="viewSkill('${jsStr(s.name)}')" title="查看">👁</button>
+                    <button onclick="deleteSkill('${jsStr(s.name)}')" title="删除">🗑️</button>
                 </div>
             </div>
         `).join('');

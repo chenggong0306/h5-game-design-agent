@@ -130,8 +130,9 @@ def _begin_code_session(session_id: str, code: str, client_dirty: bool = False):
     """
     token = _current_session_id.set(session_id)
 
-    # 每个回合开始时清空残留的分段写入暂存区（上一回合应已提交或丢弃）
-    _staging_by_session.pop(session_id, None)
+    # 注意：不在回合开始清空分段写入暂存区。长游戏的分段写入可能跨回合（模型写了第1段
+    # 就停下或分批），过早清空会让下一回合的 append_game 找不到上一段（APPEND_TO_EMPTY）。
+    # 暂存区只在：提交成功 / 新的 write_game 覆盖 / clear_session / 会话过期 时清除。
 
     server_code = _code_by_session.get(session_id)
     if server_code is None:
@@ -185,13 +186,14 @@ def _cleanup_old_sessions() -> None:
 
     for sid in expired_sessions:
         _code_by_session.pop(sid, None)
+        _staging_by_session.pop(sid, None)  # 暂存区不再每回合清空，过期时一并回收
         _code_session_last_access.pop(sid, None)
         log_session_event(sid, "session_expired")
 
 
 CONTEXT_WINDOW_TOKENS = 131_072          # 默认（openai/qwen 128K）
 CONTEXT_WINDOW_TOKENS_DEEPSEEK = 1_000_000  # deepseek 1M 上下文
-MODEL_OUTPUT_TOKEN_BUDGET = 16_000   # 与 max_tokens 保持一致
+MODEL_OUTPUT_TOKEN_BUDGET = settings.max_output_tokens   # 与各模型的 max_tokens 保持一致
 CONTEXT_SAFETY_MARGIN_TOKENS = 8_000
 # 可用输入预算 = 窗口 - 输出预留 - 安全余量。
 # 注意：system prompt / 工具 schema / 技能列表 / 注入代码 等"固定开销"不再从这里写死扣除，
@@ -257,7 +259,7 @@ def _compute_system_overhead_tokens() -> int:
     overhead = _estimate_tokens(SYSTEM_PROMPT)
     overhead += _estimate_tokens(_skills_prompt) + 60  # SkillMiddleware 每次注入技能列表
     try:
-        for t in ALL_TOOLS + [load_skill]:
+        for t in ALL_TOOLS + [load_skill, search_skills]:
             desc = getattr(t, "description", "") or ""
             overhead += int(_estimate_tokens(desc) * 1.4) + 20  # 描述 + 参数 schema 放大
     except Exception:
@@ -386,15 +388,30 @@ def _load_custom_skills() -> list[dict]:
     return []
 
 def _save_custom_skills() -> None:
-    """将自定义技能（非内置的）保存到磁盘"""
+    """将自定义技能（非内置、非品类模板的）保存到磁盘"""
     _CUSTOM_SKILLS_FILE.parent.mkdir(parents=True, exist_ok=True)
     builtin_names = {skill["category"] for skill in H5_GAME_SKILLS}
-    custom = [s for s in SKILLS if s["name"] not in builtin_names]
+    reserved = builtin_names | _GENRE_SKILL_NAMES  # 内置 + 品类模板都不算自定义
+    custom = [s for s in SKILLS if s["name"] not in reserved]
     _CUSTOM_SKILLS_FILE.write_text(
         _json.dumps(custom, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
-# 内置技能 + 磁盘上的自定义技能
+
+# 随仓库分发的品类模板技能（动作/平台/射击/消除/跑酷/塔防），由 load_skill 按需加载
+_GENRE_SKILLS_FILE = Path(__file__).resolve().parent.parent / "knowledge" / "genre_skills.json"
+
+
+def _load_genre_skills() -> list[dict]:
+    if _GENRE_SKILLS_FILE.exists():
+        try:
+            return _json.loads(_GENRE_SKILLS_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return []
+
+
+# 内置技能 + 品类模板 + 磁盘上的自定义技能
 SKILLS: list[dict] = [
     {
         "name": skill["category"],
@@ -403,6 +420,16 @@ SKILLS: list[dict] = [
     }
     for skill in H5_GAME_SKILLS
 ]
+# 品类模板（聚焦各品类承重代码，模型做对应游戏时 load_skill 加载并 lift）
+_GENRE_SKILL_NAMES: set[str] = set()
+for _gs in _load_genre_skills():
+    if _gs.get("name") and _gs.get("content") and not any(s["name"] == _gs["name"] for s in SKILLS):
+        SKILLS.append({
+            "name": _gs["name"],
+            "description": _gs.get("description", _gs["name"]),
+            "content": _gs["content"],
+        })
+        _GENRE_SKILL_NAMES.add(_gs["name"])
 # 启动时恢复自定义技能
 for _cs in _load_custom_skills():
     if not any(s["name"] == _cs["name"] for s in SKILLS):
@@ -411,22 +438,73 @@ for _cs in _load_custom_skills():
 
 @tool
 def load_skill(skill_name: str) -> str:
-    """加载指定技能的完整内容到上下文。当需要某个技能的详细指南时调用。
-    可用技能列表见 system prompt 中的「可用技能」部分。
+    """加载指定技能的完整内容到上下文。需要某个技能的详细指南/代码时调用。
+    常用技能见 system prompt 的「可用技能」；未列出的先用 search_skills 检索拿到名称。
 
     Args:
-        skill_name: 技能名称（见 system prompt 列出的可用技能）
+        skill_name: 技能名称
     """
     for skill in SKILLS:
         if skill["name"] == skill_name:
             return f"## 技能: {skill['description']}\n\n{skill['content']}"
-    available = ", ".join(s["name"] for s in SKILLS)
-    return f"技能 '{skill_name}' 不存在。可用技能: {available}"
+    # 名称不存在：给出相近建议而非全量列表（技能可能上百个）
+    return f"技能 '{skill_name}' 不存在。可能想找：\n{_search_skills_impl(skill_name, limit=8)}"
 
 
-_skills_prompt = "\n".join(
-    f"- **{s['name']}**: {s['description']}" for s in SKILLS
-)
+def _search_skills_impl(query: str, limit: int = 12) -> str:
+    q = (query or "").lower().strip()
+    if not q:
+        return f"技能库共 {len(SKILLS)} 个，名称如下：\n" + ", ".join(s["name"] for s in SKILLS)
+    terms = [t for t in q.split() if t]
+    scored = []
+    for s in SKILLS:
+        name = s["name"].lower()
+        desc = (s.get("description") or "").lower()
+        score = 0
+        if q in name: score += 4
+        if q in desc: score += 2
+        for w in terms:
+            if w in name: score += 2
+            elif w in desc: score += 1
+        if score > 0:
+            scored.append((score, s))
+    if not scored:
+        return f"未找到与 '{query}' 相关的技能。用 search_skills(\"\") 可列出全部技能名。"
+    scored.sort(key=lambda x: -x[0])
+    top = scored[:limit]
+    body = "\n".join(f"- **{s['name']}**: {s.get('description', '')}" for _, s in top)
+    return f"找到 {len(scored)} 个相关技能（显示前 {len(top)}）：\n{body}"
+
+
+@tool
+def search_skills(query: str) -> str:
+    """在技能库里按关键词检索技能（匹配名称/描述），返回最相关的若干条名称+描述。
+    找到后用 load_skill(名称) 加载完整内容。query 传空字符串可列出全部技能名。
+
+    Args:
+        query: 关键词，如 "射击" "碰撞" "粒子" "对话" "排行榜"
+    """
+    return _search_skills_impl(query)
+
+
+# 常用技能（内置 + 品类模板）始终列在 system；其余（如大量导入的自定义技能）改为按需 search_skills 检索，
+# 避免每轮把上百条技能名注入 prompt（显著降低每次调用的固定开销）。
+_CURATED_SKILL_NAMES: set[str] = {s["category"] for s in H5_GAME_SKILLS} | _GENRE_SKILL_NAMES
+
+
+def _rebuild_skills_prompt() -> str:
+    """重建注入用的技能列表（只列常用技能 + 一行检索提示）。技能增删后调用。"""
+    global _skills_prompt
+    curated = [s for s in SKILLS if s["name"] in _CURATED_SKILL_NAMES]
+    lines = "\n".join(f"- **{s['name']}**: {s['description']}" for s in curated)
+    extra = len(SKILLS) - len(curated)
+    if extra > 0:
+        lines += f"\n\n（技能库另有 {extra} 个技能未列出，用 search_skills(\"关键词\") 检索后再 load_skill 加载）"
+    _skills_prompt = lines
+    return _skills_prompt
+
+
+_skills_prompt = _rebuild_skills_prompt()
 
 
 def _inject_skills_into_request(request: ModelRequest) -> ModelRequest:
@@ -434,7 +512,8 @@ def _inject_skills_into_request(request: ModelRequest) -> ModelRequest:
     from langchain_core.messages import SystemMessage
     skills_addendum = (
         f"\n\n## 可用技能\n\n{_skills_prompt}\n\n"
-        "需要某个技能的详细指南时，调用 load_skill(skill_name) 工具加载。"
+        "需要技能的详细指南/代码时调用 load_skill(skill_name)；"
+        "未列出的技能先用 search_skills(\"关键词\") 检索。"
     )
     new_content = list(request.system_message.content_blocks) + [
         {"type": "text", "text": skills_addendum}
@@ -446,7 +525,7 @@ def _inject_skills_into_request(request: ModelRequest) -> ModelRequest:
 class SkillMiddleware(AgentMiddleware):
     """将技能列表注入到 system prompt，AI 需要时通过 load_skill 工具加载完整内容。"""
 
-    tools = [load_skill]
+    tools = [load_skill, search_skills]
 
     def wrap_model_call(self, request, handler):
         return handler(_inject_skills_into_request(request))
@@ -560,19 +639,45 @@ def _commit_staging(session_id: str) -> str:
     return f"游戏代码已写入并生效，共 {lines} 行。"
 
 
-def _autocommit_staging(session_id: str) -> None:
-    """回合结束兜底：模型写了游戏到暂存区却忘了最后一段 more=False 时，
-    文档完整则自动提交；不完整（生成被中断）则丢弃，保留原有代码不被半成品覆盖。
+def _stage_or_commit(session_id: str) -> str:
+    """内容驱动的提交：暂存区一旦出现闭合的 </html> 就提交生效；
+    否则保留在暂存区并提示继续（这是正常流程，不是错误，避免把中间段标记为失败）。
     """
-    staged = _staging_by_session.pop(session_id, None)
+    staged = _staging_by_session.get(session_id, "")
+    ok, reason = _validate_staged_html(staged)
+    if ok:
+        return _commit_staging(session_id)
+    lines = staged.count(chr(10)) + 1 if staged else 0
+    return (f"已暂存至第 {lines} 行（文档尚未闭合：{reason}）。"
+            "继续用 append_game 写后续片段即可；写到出现 </html> 会自动校验并整份生效。")
+
+
+def _autocommit_staging(session_id: str) -> None:
+    """回合结束兜底：
+    - 文档完整（有 </html>）→ 提交生效并清空暂存。
+    - 有文档头+脚本但缺 </html>（末段被截断）→ 补全闭合标签再提交，避免整局丢失。
+    - 其余残缺 → 【保留】暂存，等下个回合继续 append（不再丢弃，避免分段跨回合时丢失进度）。
+    """
+    staged = _staging_by_session.get(session_id)
     if not staged or not staged.strip():
         return
     ok, _ = _validate_staged_html(staged)
+    if not ok:
+        low = staged.lower()
+        if ("<!doctype" in low or "<html" in low) and "<script" in low and "</html>" not in low:
+            patched = staged.rstrip()
+            if "</body>" not in low:
+                patched += "\n</body>"
+            staged = patched + "\n</html>"
+            ok = True
+            logger.info("staging_autoclosed", session_id=session_id, size=len(staged))
     if ok:
         _set_current_code(staged)
+        _staging_by_session.pop(session_id, None)
         logger.info("staging_autocommitted", session_id=session_id, size=len(staged))
     else:
-        logger.warning("staging_discarded_incomplete", session_id=session_id, size=len(staged))
+        # 残缺但保留，等下个回合 append_game 续写（不丢弃）
+        logger.info("staging_kept_for_continuation", session_id=session_id, size=len(staged))
 
 
 @tool
@@ -585,44 +690,40 @@ def write_game(html: str, more: bool = False) -> str:
         write_game(html="<!DOCTYPE html>...<head>...<style>...", more=True)  ← 第1段
         append_game(html="<script>...游戏逻辑...", more=True)                 ← 续写，可多次
         append_game(html="...</script></body></html>", more=False)           ← 最后一段
-    分段期间右侧预览不会刷新、原有代码不受影响；只有最后一段（more=False）
-    通过完整性校验后，整份代码才会一次性生效——避免半成品覆盖。
+    分段期间右侧预览不会刷新、原有代码不受影响；**写到出现闭合的 `</html>` 时
+    自动校验并整份生效**（无需手动控制 more 标志）。中间段会回复"已暂存…继续"，
+    那是正常进度提示、不是失败。每段不要太长（建议 ≤ 300 行）以免被截断。
 
     Args:
         html: 这一段 HTML 文本（第1段应以 <!DOCTYPE html> 开头）
-        more: True=后面还有续写段（用 append_game 续写）；False=已写完，立即校验并生效
+        more: 可选、仅作语义提示；是否生效由内容是否包含 </html> 决定，不依赖此标志
     """
     session_id = _current_session_id.get()
     if len(html) > MAX_CODE_SIZE:
         return format_error(ErrorCode.INPUT_TOO_LARGE,
             f"html 超过 {MAX_CODE_SIZE // (1024*1024)}MB 限制")
     _staging_by_session[session_id] = html
-    if more:
-        return f"已写入第1段（暂存，尚未生效），共 {html.count(chr(10)) + 1} 行。续写请用 append_game。"
-    return _commit_staging(session_id)
+    return _stage_or_commit(session_id)
 
 
 @tool
 def append_game(html: str, more: bool = False) -> str:
-    """续写正在分段写入的游戏（接在 write_game 之后）。
+    """续写正在分段写入的游戏（接在 write_game 之后）。写到出现 </html> 自动生效。
 
     Args:
         html: 这一段 HTML 文本
-        more: True=后面还有续写段；False=已写完，立即校验并生效
+        more: 可选、仅作语义提示；是否生效由内容是否包含 </html> 决定，不依赖此标志
     """
     session_id = _current_session_id.get()
     staged = _staging_by_session.get(session_id, "")
     if not staged:
         return format_error(ErrorCode.APPEND_TO_EMPTY,
-            "当前没有正在写入的游戏。请先调用 write_game(html=第1段, more=True)。")
+            "当前没有正在写入的游戏。请先调用 write_game(html=第1段)。")
     if len(staged) + len(html) > MAX_CODE_SIZE:
         return format_error(ErrorCode.CODE_SIZE_EXCEEDED,
             f"代码总大小将超过 {MAX_CODE_SIZE // (1024*1024)}MB 限制")
     _staging_by_session[session_id] = staged + html
-    if more:
-        total = _staging_by_session[session_id]
-        return f"已续写（暂存，尚未生效），当前共 {total.count(chr(10)) + 1} 行。"
-    return _commit_staging(session_id)
+    return _stage_or_commit(session_id)
 
 
 # -------- 修改已有代码的工具（直接作用于生效代码） --------
@@ -772,14 +873,30 @@ SYSTEM_PROMPT = """你是一个专业的 H5 页面游戏设计 AI 助手，帮�
    - **有素材** → 调用 `load_skill("assets")` 获取 loadImages/loadSounds/drawSprite 用法，用图片渲染游戏对象
    - **暂无素材** → 自行用 Canvas API 绘制
 2. 明确用户需求后再写 HTML，且必须满足下方【质量底线】
-3. 需要可直接复用的**完整代码模板**时，按需调用 `load_skill("gameloop"|"polish"|"gamedesign")`（不强制；下方底线已含关键规则，简单游戏可不加载）。
+3. **强烈建议**：先判断游戏品类，加载对应**品类模板**技能（含该品类经过验证的承重代码，直接 lift 改写远胜从零写）：
+   - 横版动作/格斗 → `load_skill("genre_action")`
+   - 平台跳跃 → `load_skill("genre_platformer")`
+   - 飞行/弹幕射击 → `load_skill("genre_shooter")`
+   - 三消/消除 → `load_skill("genre_match3")`
+   - 跑酷/无限横版 → `load_skill("genre_runner")`
+   - 塔防 → `load_skill("genre_towerdefense")`
+   - 其它品类或需要通用范式 → 按需 `load_skill("gameloop"|"polish"|"gamedesign")`（下方质量底线已含关键规则，简单游戏可不加载）
 4. **写入完整 HTML**（高质量游戏代码很长，单次输出会被截断，需分段）：
    - 一次写完（短游戏）：`write_game(html="<!DOCTYPE html>...完整...</html>")`
-   - 分段写入（长游戏，推荐）：
-     - 第1段：`write_game(html="<!DOCTYPE html>...<head>...<style>...", more=True)`
-     - 续写段：`append_game(html="<script>...游戏逻辑...", more=True)`（可多次）
-     - 最后一段：`append_game(html="...</script></body></html>", more=False)` ← **最后一段必须 `more=False`**
-   - 分段期间预览不刷新、旧代码不受影响；最后一段通过完整性校验后整份才生效
+   - 能一次写完就**优先一次** `write_game` 写完整份（含 `</html>`），最省事最可靠
+   - 分段写入（确实超长时）：
+     - 第1段：`write_game(html="<!DOCTYPE html>...<head>...<style>...")`
+     - 续写段：`append_game(html="<script>...游戏逻辑...")`（可多次）
+     - 末段以 `...</script></body></html>` 结尾 → 系统检测到 `</html>` **自动整份生效**
+   - 🚫 **严禁在同一条消息里同时发出多个 write_game/append_game 调用（并行工具调用）**——
+     它们会被并发执行、乱序，导致 append 跑在 write 前面而失败（APPEND_TO_EMPTY）。
+     **必须一段一段来：发一个写入工具 → 等它的结果返回 → 再发下一段**，严格串行。
+   - ⚠️ 每段控制在 ~150 行以内：整段要连同工具调用一起塞进单次输出预算，过长会被截断，
+     导致该段工具调用报 "Error invoking tool"（参数被截坏）
+   - 若某段写入工具报错（多半是该段太长被截断）：把**这一段拆得更小、重新发一次**即可，
+     前面已暂存的段不受影响、不用重来
+   - 中间段会回复"已暂存…继续写"，那是**正常进度**不是失败；只有出现 `</html>` 才生效
+   - 是否生效只看内容里有没有闭合的 `</html>`，**不需要纠结 more 标志**；暂存会跨回合保留，可继续 append
 5. 最终回复只总结游戏玩法、操作方式和完成内容，**不要在聊天中输出完整 HTML 代码块**
 
 ## 【质量底线】（每个游戏都必须做到，否则黑屏或手感差；需要完整模板时 load_skill）
@@ -835,10 +952,17 @@ class GameDesignAgent:
         provider = settings.llm_provider.lower().strip()
         base_url_hint = (settings.openai_base_url or "").lower()
         model_hint = (settings.openai_model or "").lower()
+        # 本地 vLLM / OpenAI 兼容端点（qwen / gemma 等自托管模型）统一走 "vllm" 分支
+        _COMPATIBLE = {"qwen", "vllm", "gemma", "compatible"}
         if provider == "openai" and ("api.deepseek.com" in base_url_hint or model_hint.startswith("deepseek")):
             provider = "deepseek"
-        elif provider == "openai" and ("qwen" in model_hint or "autodl" in base_url_hint):
-            provider = "qwen"
+        elif provider == "openai" and (
+            "qwen" in model_hint or "gemma" in model_hint
+            or "autodl" in base_url_hint or ":6006" in base_url_hint
+        ):
+            provider = "vllm"
+        elif provider in _COMPATIBLE:
+            provider = "vllm"
 
         if provider == "deepseek":
             api_key = settings.deepseek_api_key or settings.openai_api_key
@@ -849,8 +973,8 @@ class GameDesignAgent:
                 model_provider="openai",
                 api_key=api_key,
                 base_url=base_url,
-                temperature=0.6,
-                max_tokens=16000,
+                temperature=settings.temperature,
+                max_tokens=settings.max_output_tokens,
                 top_p=0.95,
                 presence_penalty=0.0,
                 frequency_penalty=0.0,
@@ -858,8 +982,10 @@ class GameDesignAgent:
                 max_retries=2,
                 extra_body={"thinking": {"type": "disabled"}},
             )
-        elif provider == "qwen":
-            api_key = settings.qwen_api_key or settings.openai_api_key
+        elif provider == "vllm":
+            # 本地 vLLM / OpenAI 兼容端点（如 qwen、gemma-4）。沿用 QWEN_* 配置位，
+            # 缺省回退到 OPENAI_*。vLLM 不需要真实 key，留任意非空字符串即可。
+            api_key = settings.qwen_api_key or settings.openai_api_key or "EMPTY"
             base_url = settings.qwen_base_url or settings.openai_base_url
             model_name = settings.qwen_model or settings.openai_model
             model = init_chat_model(
@@ -867,8 +993,8 @@ class GameDesignAgent:
                 model_provider="openai",
                 api_key=api_key,
                 base_url=base_url,
-                temperature=0.6,
-                max_tokens=16000,
+                temperature=settings.temperature,
+                max_tokens=settings.max_output_tokens,
                 top_p=0.95,
                 presence_penalty=0.0,
                 frequency_penalty=0.0,
@@ -881,8 +1007,8 @@ class GameDesignAgent:
                 model_provider="openai",
                 api_key=settings.openai_api_key,
                 base_url=settings.openai_base_url,
-                temperature=0.6,
-                max_tokens=16000,
+                temperature=settings.temperature,
+                max_tokens=settings.max_output_tokens,
                 top_p=0.95,
                 presence_penalty=0.0,
                 frequency_penalty=0.0,
