@@ -732,6 +732,19 @@ async function sendMessage(messageOverride = null, options = {}) {
                     } else if (event.type === 'context_usage') {
                         updateContextMeter(event);
 
+                    } else if (event.type === 'self_check') {
+                        // 自检+自修闭环状态：在对话里展示一条系统提示（content 为原始文本，渲染时统一走 renderMarkdown 转义）
+                        let txt;
+                        if (event.status === 'repairing') {
+                            txt = '🔧 自检发现问题，正在自动修复：\n' + (event.issues || []).map(s => '· ' + s).join('\n');
+                        } else if (event.status === 'passed') {
+                            txt = '✅ 自检通过';
+                        } else {
+                            txt = '⚠️ 自检仍有问题（已尽力修复）：\n' + (event.issues || []).map(s => '· ' + s).join('\n');
+                        }
+                        activeStreamState.blocks.push({ type: 'text', content: '\n' + txt + '\n' });
+                        renderStreamMessage(activeStreamState, true);
+
                     } else if (event.type === 'code_update') {
                         if (editor && event.code) {
                             // 流式期间只更新编辑器文本，不在此刷新预览（避免多段编辑反复重载/闪屏），

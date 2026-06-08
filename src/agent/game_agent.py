@@ -622,6 +622,17 @@ def _validate_staged_html(html: str) -> tuple[bool, str]:
     return True, ""
 
 
+def _strip_trailing_close_tags(html: str) -> str:
+    """去掉文档结尾的 </html>/</body>（保留正文），以便在已闭合文档后继续 append_game。"""
+    s = html.rstrip()
+    while True:
+        m = re.search(r"</\s*(?:html|body)\s*>\s*$", s, re.IGNORECASE)
+        if not m:
+            break
+        s = s[:m.start()].rstrip()
+    return s
+
+
 def _commit_staging(session_id: str) -> str:
     """校验并提交暂存区到生效代码；失败时保留暂存区不动当前代码。"""
     staged = _staging_by_session.get(session_id, "")
@@ -680,6 +691,65 @@ def _autocommit_staging(session_id: str) -> None:
         logger.info("staging_kept_for_continuation", session_id=session_id, size=len(staged))
 
 
+# ============ gemma / harmony 控制标记清洗 ============
+# 某些本地模型（gemma4 / harmony 风格）会把"通道"控制标记泄漏进正文，例如
+#   <|channel|>  <|channel>  <channel|>  <|message|>  <|end|>  <start_of_turn> …
+# 它们不是给用户看的，需在流式与非流式回复里都剥掉，否则聊天里会出现 <|channel> 等乱码。
+_CTRL_TOKEN_RE = re.compile(
+    r"<\|[a-zA-Z_]*\|?>"                          # <|channel|> <|channel> <|message|> <|end|> <|>
+    r"|<[a-zA-Z_]+\|>"                            # <channel|>
+    r"|</?\s*(?:start_of_turn|end_of_turn)\s*>",  # gemma 轮次标记
+    re.IGNORECASE,
+)
+_CHANNEL_MARK_RE = re.compile(r"<\|?channel\|?>", re.IGNORECASE)
+_CHANNEL_NAMES = ("analysis", "thinking", "thought", "commentary", "reasoning", "final")
+_LEADING_CHANNEL_NAME_RE = re.compile(
+    r"^\s*(?:" + "|".join(_CHANNEL_NAMES) + r")\b[ \t]*", re.IGNORECASE)
+
+
+def _strip_control_tokens(text: str) -> str:
+    """一次性剥离全部控制标记（用于非流式整段文本）。"""
+    if not text or "<" not in text:
+        return text
+    # 通道头整体去掉（保留其后正文）：<|channel|>analysis<|message|> / <|channel>thought<channel|>
+    text = re.sub(
+        r"<\|?channel\|?>[ \t]*(?:" + "|".join(_CHANNEL_NAMES) + r")?[ \t]*"
+        r"(?:<\|?(?:channel|message)\|?>)?",
+        "", text, flags=re.IGNORECASE)
+    return _CTRL_TOKEN_RE.sub("", text)
+
+
+def _sanitize_stream_chunk(ss: dict, raw: str) -> str:
+    """流式清洗：累积缓冲，剥离完整控制标记；尾部可能被截断的 '<...' 暂存到下一块再处理。
+    跨块场景（如 '<|channel>'、'thought'、'<channel|>' 分三块到达）也能正确清掉通道名。
+    """
+    buf = ss.get("_san_buf", "") + raw
+    if _CHANNEL_MARK_RE.search(buf):
+        ss["_san_expect_name"] = True  # 见到通道标记 → 紧随其后的通道名也要清掉
+    buf = _CTRL_TOKEN_RE.sub("", buf)
+    if ss.get("_san_expect_name"):
+        new = _LEADING_CHANNEL_NAME_RE.sub("", buf, count=1)
+        if new != buf:
+            ss["_san_expect_name"] = False
+            buf = new
+        elif buf.strip():  # 出现了真正的正文 → 不再等待通道名
+            ss["_san_expect_name"] = False
+    idx = buf.rfind("<")
+    if idx != -1 and ">" not in buf[idx:] and (len(buf) - idx) <= 32:
+        ss["_san_buf"] = buf[idx:]   # 暂存疑似被截断的标记
+        return buf[:idx]
+    ss["_san_buf"] = ""
+    return buf
+
+
+def _sanitize_stream_flush(ss: dict) -> str:
+    """流结束时吐出暂存的尾部并清理清洗状态。"""
+    rest = ss.get("_san_buf", "")
+    ss["_san_buf"] = ""
+    ss["_san_expect_name"] = False
+    return _CTRL_TOKEN_RE.sub("", rest) if rest else ""
+
+
 @tool
 def write_game(html: str, more: bool = False) -> str:
     """写入一个全新的游戏，覆盖当前代码。新建游戏 / 整体重写时用它。
@@ -717,8 +787,21 @@ def append_game(html: str, more: bool = False) -> str:
     session_id = _current_session_id.get()
     staged = _staging_by_session.get(session_id, "")
     if not staged:
-        return format_error(ErrorCode.APPEND_TO_EMPTY,
-            "当前没有正在写入的游戏。请先调用 write_game(html=第1段)。")
+        # 容错自愈：模型常把第 1 段写成完整文档（含 </html>），它已自动提交、暂存被清空，
+        # 随后的 append 找不到暂存就会报 APPEND_TO_EMPTY、在前端弹"续写失败"。改为无缝续写：
+        low_html = html.lower().lstrip()
+        if low_html.startswith("<!doctype") or low_html.startswith("<html"):
+            # 续写内容本身就是一份完整新文档 → 按整体重写处理
+            _staging_by_session[session_id] = html
+            return _stage_or_commit(session_id)
+        existing = _get_current_code()
+        if existing and "<html" in existing.lower():
+            # 从已生效代码恢复：去掉结尾闭合标签，把这段接上去，写到 </html> 再整份生效
+            staged = _strip_trailing_close_tags(existing)
+            logger.info("append_recovered_from_committed", session_id=session_id, base_len=len(staged))
+        else:
+            return format_error(ErrorCode.APPEND_TO_EMPTY,
+                "当前没有正在写入的游戏。请先调用 write_game(html=第1段)。")
     if len(staged) + len(html) > MAX_CODE_SIZE:
         return format_error(ErrorCode.CODE_SIZE_EXCEEDED,
             f"代码总大小将超过 {MAX_CODE_SIZE // (1024*1024)}MB 限制")
@@ -900,9 +983,13 @@ SYSTEM_PROMPT = """你是一个专业的 H5 页面游戏设计 AI 助手，帮�
 5. 最终回复只总结游戏玩法、操作方式和完成内容，**不要在聊天中输出完整 HTML 代码块**
 
 ## 【质量底线】（每个游戏都必须做到，否则黑屏或手感差；需要完整模板时 load_skill）
-- **结构顺序（不可乱，否则黑屏）**：canvas/ctx → `resize()` 定义并立即调用（DPR 适配用 `ctx.setTransform(dpr,0,0,dpr,0,0)`，**禁止 `ctx.scale`**）→ 全局状态(`state`/`score`/`lastTime`) → 工具函数 → update/draw → `resetGame` → 输入事件绑定 → 主循环 `loop` → 最后一行启动（图片加载完成才进 start）
-- **正确性**：移动一律乘 dt（`x += speed*dt`，禁止 `x += 5`）；`dt` 上限 0.05；`arc/ellipse` 半径用 `Math.max(1,r)`；删数组元素用 `filter`，**禁止 for 循环里 `splice`**；触摸坐标要按 `canvas.width/rect.width` 换算，`touchstart/touchmove` 加 `preventDefault()` 且 `{passive:false}`
+- **结构顺序（不可乱，否则黑屏）**：canvas/ctx → `resize()` 定义并立即调用 → 全局状态(`state`/`score`/`lastTime`) → 工具函数 → update/draw → `resetGame` → 输入事件绑定 → 主循环 `loop` → 最后一行启动（图片加载完成才进 start）
+- **DPR 适配（漏了就"看不到人物"！）**：`resize()` 里**这 4 行缺一不可**：① `canvas.width = W*dpr` ② `canvas.height = H*dpr`（物理缓冲）③ **`canvas.style.width = W+'px'; canvas.style.height = H+'px'`（CSS 显示尺寸，漏掉会让高分屏画面放大≈2倍、地面和人物全跑到屏幕外）** ④ `ctx.setTransform(dpr,0,0,dpr,0,0)`（**禁止 `ctx.scale`**）。保险起见 CSS 里再加 `canvas{width:100vw;height:100vh;display:block}`
+- **坐标系（最易玩不了！）**：`resize()` 里存逻辑尺寸 `W=innerWidth, H=innerHeight`；之后**定位/地面/相机/UI/clearRect 一律用 `W`、`H`，绝不用 `canvas.width`/`canvas.height`**（那是物理像素=CSS×DPR，已 setTransform 后拿来定位会让角色/地面跑到屏幕外）。角色/敌人要有明确 y（统一站 `groundY = H - 地面高`），别让 y 留 0 或用 `canvas.height`
+- **正确性**：移动一律乘 dt（`x += speed*dt`，禁止 `x += 5`）；`dt` 上限 0.05；`arc/ellipse` 半径用 `Math.max(1,r)`；删数组元素用 `filter`，**禁止 for 循环里 `splice`**
+- **输入（桌面也要能玩！）**：游戏会在**桌面预览里用鼠标**测试、在手机上用触摸——**两者都必须支持**。优先用 Pointer Events（`pointerdown/pointermove/pointerup`，自动覆盖鼠标+触摸），或鼠标+触摸各绑一套。**只绑 `touchstart` 会导致桌面点击无反应、连开始都点不动**。坐标换算用 `(e.clientX - rect.left) * (W / rect.width)`（`rect=getBoundingClientRect()`，用 `rect.width` 不是 `canvas.width`）；开始/结束界面要能点击或按键进入
 - **手感**：粒子、屏幕震动、缓动、得分浮动文字、渐变/光效背景、分数平滑滚动——击中/得分/死亡都要有视觉反馈
+- **视觉（别做成方块！）**：角色/敌人**严禁用单个 `fillRect`**——至少分层（身体+头+眼睛+脚下椭圆阴影+黑色描边），配深浅渐变 + 简单程序化动画（呼吸起伏 / 走路四肢摆动 / 受击白闪）；背景用渐变 + 多层视差 + 氛围（暗角/光带），不要大片纯色；配色用同色系深浅，别直接填纯红纯绿纯蓝。**做角色、特效或场景时先 `load_skill("visual")` 取画法与配色**
 - **设计**：难度随 `gameTime` 提升；完整 start/over 界面（标题 + 操作说明 + 本局得分 + 最高分 + 重玩提示）；HUD（分数左上、最高分右上）
 
 ### 修改/修 bug 时：
@@ -921,7 +1008,8 @@ SYSTEM_PROMPT = """你是一个专业的 H5 页面游戏设计 AI 助手，帮�
 
 ## 【禁止事项】
 - ❌ 新建游戏时禁止把完整 HTML 作为聊天正文输出，必须用 `write_game`/`append_game` 写入右侧编辑器
-- ❌ 分段写入时，最后一段必须传 `more=False`，否则代码不会生效
+- ❌ 禁止在一条消息里并行发多个 `write_game`/`append_game`（会乱序失败）；一段一段、等结果再发下一段
+- ❌ 最终总结只写**你真正实现并写进代码**的功能，不要罗列计划里却没实现的系统（不要夸大完成度）
 
 ## 【行为规则】
 - ✅ 修改代码时必须一次性完成所有步骤（搜索→查看→替换），不要中途停下来回复用户等"继续"
@@ -1137,10 +1225,29 @@ class GameDesignAgent:
                     config=config,
                 )
 
-                reply = result["messages"][-1].content
+                raw_reply = result["messages"][-1].content
+                reply = _strip_control_tokens(raw_reply) if isinstance(raw_reply, str) else raw_reply
                 _autocommit_staging(session_id)  # 兜底提交忘了 more=False 的分段写入
-                code = self._resolve_final_code(base_code, reply)
 
+                # 自检 + 自修闭环（非流式）：质检→有问题就让模型修→再判
+                if settings.self_check_enabled:
+                    from src.agent.verifier import verify_game, looks_like_game
+                    for _ in range(max(0, settings.self_check_max_rounds)):
+                        cur = _get_current_code()
+                        if not cur or not looks_like_game(cur):
+                            break
+                        res = await verify_game(cur, use_headless=settings.self_check_headless)
+                        if res["ok"]:
+                            break
+                        rep = await self.agent.ainvoke(
+                            {"messages": [{"role": "user", "content": self._build_repair_message(res["blocking"])}]},
+                            config=config,
+                        )
+                        _autocommit_staging(session_id)
+                        raw_rep = rep["messages"][-1].content
+                        reply = _strip_control_tokens(raw_rep) if isinstance(raw_rep, str) else raw_rep
+
+                code = self._resolve_final_code(base_code, reply)
                 action = "generate" if code and not base_code else "edit" if code else "chat"
                 return {"reply": reply, "code": code, "action": action}
             finally:
@@ -1160,6 +1267,101 @@ class GameDesignAgent:
             return GameDesignAgent._extract_code(reply) or ""
         return ""  # 缓冲区为空但会话本有代码 → 纯聊天，不要凭空生成代码
 
+    @staticmethod
+    def _chunk_to_events(chunk, ss) -> list:
+        """把一个 astream chunk 映射成前端事件列表，并更新流状态 ss（主回合/自修回合共用）。"""
+        evs = []
+        if chunk.get("type") == "messages":
+            msg = chunk["data"][0]
+            if isinstance(msg, AIMessageChunk) and msg.content:
+                clean = _sanitize_stream_chunk(ss, msg.content)  # 剥离 gemma/harmony 控制标记
+                if clean and (ss["full_reply"] or clean.strip()):  # 跳过开头纯空白 token
+                    ss["full_reply"] += clean
+                    evs.append({"type": "token", "content": clean})
+        elif chunk.get("type") == "updates":
+            for update in chunk["data"].values():
+                if not isinstance(update, dict):
+                    continue
+                for msg in (update.get("messages") or []):
+                    tcs = getattr(msg, "tool_calls", None)
+                    if tcs:
+                        for tc in tcs:
+                            name = tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", None)
+                            args = tc.get("args") if isinstance(tc, dict) else getattr(tc, "args", {})
+                            tid = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", None)
+                            if name:
+                                a = str(args)
+                                evs.append({"type": "tool_call", "id": tid, "tool": name,
+                                            "args": a[:100] + "..." if len(a) > 100 else a})
+                    if type(msg).__name__ == "ToolMessage":
+                        name = getattr(msg, "name", "unknown")
+                        tid = getattr(msg, "tool_call_id", None)
+                        c = str(getattr(msg, "content", ""))
+                        evs.append({"type": "tool_result", "id": tid, "tool": name,
+                                    "result": c[:200] + "..." if len(c) > 200 else c})
+                        edited = _get_current_code()
+                        if edited != ss["last_code_sent"]:
+                            ss["last_code_sent"] = edited
+                            evs.append({"type": "code_update", "code": edited, "source": name})
+        return evs
+
+    async def _run_agent_stream(self, user_content, config, ss):
+        """运行一轮 agent.astream，逐块产出前端事件。主回合与自修回合共用此逻辑。"""
+        async for chunk in self.agent.astream(
+            {"messages": [{"role": "user", "content": user_content}]},
+            config=config,
+            stream_mode=["messages", "updates"],
+            version="v2",
+        ):
+            cu = _get_context_usage(ss["session_id"])
+            key = tuple(cu.items())
+            if key != ss["ctx_key"]:
+                ss["ctx_key"] = key
+                yield {"type": "context_usage", **cu}
+            for ev in self._chunk_to_events(chunk, ss):
+                yield ev
+        # 流尾：吐出清洗缓冲里暂存的残尾，避免末尾几个字符被吞
+        tail = _sanitize_stream_flush(ss)
+        if tail and (ss["full_reply"] or tail.strip()):
+            ss["full_reply"] += tail
+            yield {"type": "token", "content": tail}
+
+    @staticmethod
+    def _build_repair_message(issues) -> str:
+        lines = "\n".join(f"- {i['msg']}（建议：{i.get('fix', '')}）" for i in issues)
+        return (
+            "[自动质检] 刚生成的游戏经自动检测发现下列问题，请在**当前代码**上用 "
+            "replace_code/insert_code 等工具针对性修复（不要重写整份）：\n"
+            + lines +
+            "\n修完用一句话说明改了什么即可，不要把完整代码贴到聊天里。"
+        )
+
+    async def _self_check_and_repair(self, session_id, config, base_code, ss):
+        """质检当前代码；有 high/medium 问题就让模型自修，最多 self_check_max_rounds 轮，最后再判一次。"""
+        from src.agent.verifier import verify_game, looks_like_game
+        code = _get_current_code()
+        if not code or not looks_like_game(code):
+            return
+        for _ in range(max(0, settings.self_check_max_rounds)):
+            result = await verify_game(code, use_headless=settings.self_check_headless)
+            if result["ok"]:
+                yield {"type": "self_check", "status": "passed", "issues": []}
+                return
+            issues = result["blocking"]
+            yield {"type": "self_check", "status": "repairing", "issues": [i["msg"] for i in issues]}
+            async for ev in self._run_agent_stream(self._build_repair_message(issues), config, ss):
+                yield ev
+            _autocommit_staging(session_id)
+            new_code = _get_current_code()
+            if new_code != ss["last_code_sent"]:
+                ss["last_code_sent"] = new_code
+                yield {"type": "code_update", "code": new_code, "source": "self_repair"}
+            code = new_code
+        final = await verify_game(code, use_headless=settings.self_check_headless)
+        yield {"type": "self_check",
+               "status": "passed" if final["ok"] else "issues_remain",
+               "issues": [i["msg"] for i in final["blocking"]]}
+
     async def chat_stream(self, session_id: str, user_message, current_code: str = "", code_dirty: bool = False):
         """流式对话 - 逐 token 返回"""
         await self._ensure_agent()
@@ -1167,93 +1369,31 @@ class GameDesignAgent:
         await lock.acquire()
 
         config = {"configurable": {"thread_id": session_id}, "recursion_limit": 500}
-        full_reply = ""
         token = None
-        last_context_usage_key = None
 
         try:
             token = _begin_code_session(session_id, current_code, code_dirty)
             base_code = _get_current_code()  # 协调后的基准代码
-            last_code_sent = base_code
-            async for chunk in self.agent.astream(
-                {"messages": [{"role": "user", "content": self._build_message(user_message, base_code)}]},
-                config=config,
-                stream_mode=["messages", "updates"],
-                version="v2",
-            ):
-                context_usage = _get_context_usage(session_id)
-                context_usage_key = tuple(context_usage.items())
-                if context_usage_key != last_context_usage_key:
-                    last_context_usage_key = context_usage_key
-                    yield {"type": "context_usage", **context_usage}
+            # 流状态：full_reply 累积文本、last_code_sent 去重 code_update、ctx_key 去重 context_usage
+            ss = {"session_id": session_id, "full_reply": "", "last_code_sent": base_code, "ctx_key": None}
 
-                # 处理不同类型的 chunk
-                if chunk["type"] == "messages":
-                    # 流式 token
-                    msg = chunk["data"][0]
+            # 主回合：模型生成
+            async for ev in self._run_agent_stream(self._build_message(user_message, base_code), config, ss):
+                yield ev
 
-                    if not isinstance(msg, AIMessageChunk):
-                        continue
-
-                    # 处理文本内容
-                    if msg.content:
-                        # 跳过开头的纯空白 token（reasoning 后的换行符）
-                        if not full_reply and not msg.content.strip():
-                            continue
-
-                        full_reply += msg.content
-                        yield {"type": "token", "content": msg.content}
-
-                elif chunk["type"] == "updates":
-                    # 完整的节点更新（工具调用和工具结果）
-                    for update in chunk["data"].values():
-                        if not isinstance(update, dict):
-                            continue
-                        if "messages" in update:
-                            for msg in update["messages"]:
-                                # 工具调用（在 model 节点）
-                                if hasattr(msg, 'tool_calls') and msg.tool_calls:
-                                    for tc in msg.tool_calls:
-                                        tool_name = tc.get('name') if isinstance(tc, dict) else getattr(tc, 'name', None)
-                                        tool_args = tc.get('args') if isinstance(tc, dict) else getattr(tc, 'args', {})
-                                        tool_id = tc.get('id') if isinstance(tc, dict) else getattr(tc, 'id', None)
-                                        if tool_name:
-                                            yield {
-                                                "type": "tool_call",
-                                                "id": tool_id,
-                                                "tool": tool_name,
-                                                "args": str(tool_args)[:100] + "..." if len(str(tool_args)) > 100 else str(tool_args)
-                                            }
-
-                                # 工具结果（在 tools 节点）
-                                if type(msg).__name__ == "ToolMessage":
-                                    tool_name = getattr(msg, 'name', 'unknown')
-                                    tool_call_id = getattr(msg, 'tool_call_id', None)
-                                    tool_content = getattr(msg, 'content', '')
-                                    yield {
-                                        "type": "tool_result",
-                                        "id": tool_call_id,
-                                        "tool": tool_name,
-                                        "result": tool_content[:200] + "..." if len(str(tool_content)) > 200 else str(tool_content)
-                                    }
-
-                                    edited_code = _get_current_code()
-                                    if edited_code != last_code_sent:
-                                        last_code_sent = edited_code
-                                        yield {
-                                            "type": "code_update",
-                                            "code": edited_code,
-                                            "source": tool_name,
-                                        }
-
-            # 流结束：兜底提交忘了 more=False 的分段写入，再取最终代码
+            # 主回合结束：兜底提交分段写入，并把新代码补发给前端
             _autocommit_staging(session_id)
             edited_code = _get_current_code()
-            if edited_code != last_code_sent and edited_code != base_code:
-                # 兜底提交产生的新代码，补发一次 code_update 让前端渲染
+            if edited_code != ss["last_code_sent"] and edited_code != base_code:
+                ss["last_code_sent"] = edited_code
                 yield {"type": "code_update", "code": edited_code, "source": "write_game"}
-            code = self._resolve_final_code(base_code, full_reply)
 
+            # ★ 自检 + 自修闭环：生成游戏后自动质检，发现"看不到/玩不了/报错"类问题让模型自修后再返回
+            if settings.self_check_enabled:
+                async for ev in self._self_check_and_repair(session_id, config, base_code, ss):
+                    yield ev
+
+            code = self._resolve_final_code(base_code, ss["full_reply"])
             action = "generate" if code and not base_code else "edit" if code else "chat"
             yield {"type": "done", "code": code, "action": action}
 

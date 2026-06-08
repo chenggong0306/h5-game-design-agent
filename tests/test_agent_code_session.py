@@ -9,7 +9,7 @@ _TEST_SESSIONS = [
     "session-a", "session-b", "view-session", "write-once", "write-chunked",
     "write-incomplete", "append-empty", "replace-empty", "doctype-frag",
     "autocommit", "autocommit-bad", "reconcile", "reconcile2", "resurrect",
-    "resolve", "resolve-empty",
+    "resolve", "resolve-empty", "append-recover", "append-rewrite",
 ]
 
 
@@ -138,6 +138,36 @@ class AgentCodeSessionTests(unittest.TestCase):
             msg = game_agent.append_game.invoke({"html": "<x>", "more": False})
             self.assertIn("先调用 write_game", msg)
             self.assertEqual(game_agent._get_current_code(), "OLD GAME")
+        finally:
+            game_agent._end_code_session(token)
+
+    def test_append_recovers_from_committed_complete_doc(self):
+        # 自愈：模型把第1段写成完整文档（已提交、暂存清空），随后 append 续写不应报错，
+        # 而是从已生效代码去掉结尾闭合标签后接着写，写到 </html> 整份生效。
+        token = game_agent._begin_code_session("append-recover", "")
+        try:
+            doc = "<!DOCTYPE html>\n<html><body><canvas></canvas></body></html>"
+            game_agent.write_game.invoke({"html": doc})           # 完整文档 → 立即提交
+            self.assertEqual(game_agent._get_current_code(), doc)
+            msg = game_agent.append_game.invoke({"html": "<script>game()</script></body></html>"})
+            self.assertNotIn("[ERROR", msg)
+            self.assertIn("已写入并生效", msg)
+            code = game_agent._get_current_code()
+            self.assertIn("<script>game()</script>", code)
+            self.assertIn("<canvas></canvas>", code)              # 旧正文保留
+            self.assertEqual(code.lower().count("</html>"), 1)    # 只有一个闭合标签
+        finally:
+            game_agent._end_code_session(token)
+
+    def test_append_full_doc_after_commit_is_rewrite(self):
+        # 自愈分支2：append 的内容本身就是一份完整新文档 → 当作整体重写
+        token = game_agent._begin_code_session("append-rewrite", "")
+        try:
+            game_agent.write_game.invoke({"html": "<!DOCTYPE html><html><body>OLD</body></html>"})
+            new_doc = "<!DOCTYPE html><html><body>NEW GAME</body></html>"
+            msg = game_agent.append_game.invoke({"html": new_doc})
+            self.assertIn("已写入并生效", msg)
+            self.assertEqual(game_agent._get_current_code(), new_doc)
         finally:
             game_agent._end_code_session(token)
 

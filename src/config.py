@@ -25,6 +25,12 @@ class Settings(BaseSettings):
     # 太大可能被 provider 拒绝/截断；配合"分段写入"使用，单段建议 ≤300 行。
     max_output_tokens: int = 8192
 
+    # 生成后自检 + 自修闭环
+    self_check_enabled: bool = True      # 生成游戏后自动质检，发现问题让模型自修后再返回
+    self_check_max_rounds: int = 1       # 最多自修轮数（每轮一次模型修复 + 重新质检）
+    self_check_headless: bool = False     # 启用无头浏览器运行检查（需 playwright + chromium）：
+                                          # pip install playwright && playwright install chromium
+
     # DeepSeek 配置（启用方式：LLM_PROVIDER=deepseek）
     deepseek_api_key: str = ""
     deepseek_base_url: str = "https://api.deepseek.com"

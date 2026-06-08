@@ -105,13 +105,15 @@ function playBgm() {
 const canvas = document.getElementById('c');
 const ctx = canvas.getContext('2d');
 
-// ② resize 定义 + 立即调用（DPR 适配，防模糊）
+// ② resize：DPR 适配 + 保存【逻辑尺寸 W/H】。此后一切定位都用 W、H，不要用 canvas.width/height
+let W = 0, H = 0, groundY = 0;
 function resize() {
   const dpr = window.devicePixelRatio || 1;
-  const w = window.innerWidth, h = window.innerHeight;
-  canvas.width = w * dpr; canvas.height = h * dpr;
-  canvas.style.width = w + 'px'; canvas.style.height = h + 'px';
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0); // ✅ 禁止用 ctx.scale（会叠加）
+  W = window.innerWidth; H = window.innerHeight;     // 逻辑尺寸(CSS像素)，用于布局/坐标/相机/UI
+  canvas.width = W * dpr; canvas.height = H * dpr;   // 物理后备缓冲(=逻辑×DPR)，别拿来定位
+  canvas.style.width = W + 'px'; canvas.style.height = H + 'px'; // ⚠️ 必写！漏了高分屏画面放大≈2倍、人物/地面跑屏外看不到
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0); // 此后画布坐标==逻辑像素；禁止 ctx.scale（会叠加）
+  groundY = H - 80;                        // 依赖 H 的布局量(地面线等)必须在 resize 里重算
 }
 window.addEventListener('resize', resize);
 resize(); // 必须在全局变量声明之前调用
@@ -133,15 +135,27 @@ function resetGame() {
 }
 
 // ⑦ 输入事件绑定（在 resetGame 定义之后）
-canvas.addEventListener('click', () => {
-  if (state === 'start' || state === 'over') resetGame();
-});
+//    用 Pointer Events 一次性覆盖【鼠标(桌面)+触摸(手机)】，桌面预览才点得动
+function getPointer(e) {                 // 统一取逻辑坐标
+  const r = canvas.getBoundingClientRect();
+  return { x: (e.clientX - r.left) * (W / r.width),    // ✅ 用 r.width(CSS宽)，不是 canvas.width
+           y: (e.clientY - r.top)  * (H / r.height) };
+}
+canvas.addEventListener('pointerdown', e => {
+  e.preventDefault();
+  if (state === 'start' || state === 'over') { resetGame(); return; }
+  const p = getPointer(e);
+  // ...用 p.x / p.y 处理点击或分区操作（左半移动 / 右半攻击等）...
+}, { passive: false });
+canvas.addEventListener('pointermove', e => { e.preventDefault(); /* 按住拖动 */ }, { passive: false });
+window.addEventListener('pointerup', () => { /* 松手：清除移动/格挡状态 */ });
+// 键盘(桌面常用)：window.addEventListener('keydown'/'keyup', ...) 处理移动/攻击/切换
 
 // ⑧ 主循环
 function loop(ts) {
   const dt = Math.min((ts - lastTime) / 1000, 0.05); // 上限 0.05s 防止跳帧
   lastTime = ts;
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.clearRect(0, 0, W, H); // 用逻辑尺寸清屏（已 setTransform(dpr)，不要用 canvas.width/height）
   if      (state === 'start')   drawStart();
   else if (state === 'playing') { update(dt); draw(); }
   else if (state === 'over')    drawOver();
@@ -154,11 +168,14 @@ loadImages({ /* ... */ }, () => { state = 'start'; requestAnimationFrame(loop); 
 
 ## 关键规则
 
+- **坐标系（最易出 bug！）**：定位/地面/相机/UI 一律用逻辑尺寸 `W`、`H`（resize 里存 `W=innerWidth, H=innerHeight`）。**绝不用 `canvas.width`/`canvas.height` 做坐标**——它们是物理像素(=CSS×DPR)，已 `setTransform(dpr)` 后拿它们定位会让角色/地面/UI 跑到屏幕外、游戏没法玩。地面线、屏幕中心、相机夹紧都用 `W`/`H`/`groundY`。
+- 实体要有明确的 y：角色/敌人统一站在 `groundY`（如 `player.y = groundY`），别让 y 留在 0 或用物理高度。
 - 所有移动必须乘以 dt：`obj.x += speed * dt`，禁止 `obj.x += 5`
 - `ctx.arc` / `ctx.ellipse` 半径必须 `Math.max(1, r)`，防止负值报错
 - 数组删除用 `filter`，禁止在 `for` 循环中 `splice`
-- 触摸坐标必须转换：`(e.touches[0].clientX - rect.left) * (canvas.width / rect.width)`
-- `touchstart` / `touchmove` 必须加 `e.preventDefault()` + `{ passive: false }`"""
+- **输入必须同时支持鼠标和触摸**：游戏会在桌面预览里用**鼠标**测试、在手机上用**触摸**。优先用 **Pointer Events**（`pointerdown/pointermove/pointerup`，一次覆盖鼠标+触摸），或鼠标(`mousedown/move/up`)和触摸(`touchstart/move/end`)各绑一套。**只绑 `touchstart` 会导致桌面点击毫无反应、连开始界面都进不去**。开始/结束界面也要能用鼠标点击进入。
+- 坐标转换到**逻辑像素**：`const r = canvas.getBoundingClientRect(); x = (e.clientX - r.left) * (W / r.width)`——**用 `r.width`(CSS宽)，不是 `canvas.width`(物理宽，会多乘 DPR、坐标翻倍)**。
+- `pointer*` / `touchstart` / `touchmove` 必须加 `e.preventDefault()` + `{ passive: false }`"""
     },
     {
         "title": "游戏视觉与手感打磨（polish）",
