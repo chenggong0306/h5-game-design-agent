@@ -61,6 +61,25 @@
     --transition-fast: 150ms;
     --transition-normal: 250ms;
     --transition-slow: 350ms;
+
+    /* ============ 兼容别名（历史代码引用了这些名字，缺失会导致边框/强调色/错误卡/进度条样式失效）============ */
+    --border: var(--border-primary);
+    --accent: var(--accent-primary);
+    --glass: rgba(255, 255, 255, 0.04);
+    --radius-full: 999px;
+    --neon-cyan: #56d4dd;
+    --progress-bg: var(--border-primary);
+    --progress-text: var(--text-tertiary);
+    /* 错误气泡分级（critical/warning/info）*/
+    --error-critical: var(--error);
+    --error-warning: var(--warning);
+    --error-info: var(--info);
+    --error-bg-critical: var(--error-subtle);
+    --error-bg-warning: var(--warning-subtle);
+    --error-bg-info: var(--info-subtle);
+    --error-border-critical: var(--error);
+    --error-border-warning: var(--warning);
+    --error-border-info: var(--info);
 }
 
 
@@ -1156,4 +1175,23 @@ body {
         opacity: 0.5;
         transform: scale(0.8);
     }
+}
+
+/* ============ 移动端 / 窄屏响应式（本应用主打手机小游戏，但三栏定宽横排在手机上裂开）============ */
+@media (max-width: 860px) {
+    body { height: auto; min-height: 100vh; overflow: auto; }
+    .app-main { flex-direction: column; overflow: visible; }
+    /* 三个面板改为纵向堆叠、占满宽度，去掉定宽 */
+    .chat-panel, .editor-panel, .preview-panel {
+        width: 100%;
+        min-width: 0;
+        border-right: none;
+        border-bottom: 1px solid var(--border-primary);
+    }
+    .chat-panel { height: 55vh; }
+    .editor-panel, .preview-panel { min-height: 50vh; }
+    #editor-container, #game-preview { min-height: 45vh; }
+    /* 顶栏按钮换行，避免溢出 */
+    .app-header { flex-wrap: wrap; height: auto; padding: var(--space-sm); }
+    .header-actions { flex-wrap: wrap; }
 }

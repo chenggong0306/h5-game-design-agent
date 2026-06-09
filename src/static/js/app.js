@@ -108,6 +108,22 @@ class ErrorHandler {
 
 const errorHandler = new ErrorHandler();
 
+/**
+ * 校验 fetch 响应状态：非 2xx 时抛出带后端 detail 的错误。
+ * 修复"错误响应被当成功 JSON 解析、误报成功/列表错乱"的问题。
+ */
+async function ensureOk(res) {
+    if (!res.ok) {
+        let detail = `HTTP ${res.status}`;
+        try {
+            const d = await res.json();
+            if (d && d.detail) detail = Array.isArray(d.detail) ? JSON.stringify(d.detail) : d.detail;
+        } catch (_) { /* 非 JSON 错误体，沿用状态码 */ }
+        throw new Error(detail);
+    }
+    return res;
+}
+
 // ============ 工具调用状态跟踪 ============
 class ToolProgressTracker {
     constructor() {
@@ -777,7 +793,12 @@ async function sendMessage(messageOverride = null, options = {}) {
                         }
                     } else if (event.type === 'error') {
                         activeStreamState.done = true;
-                        ensureTextBlock(activeStreamState).content += `\n❌ ${event.content}`;
+                        // 带结构化错误码时走统一错误处理（限流/超时等有更友好的提示）
+                        if (event.error_code) {
+                            errorHandler.show({ code: event.error_code, message: event.content, isError: true });
+                        } else {
+                            ensureTextBlock(activeStreamState).content += `\n❌ ${event.content}`;
+                        }
                         renderStreamMessage(activeStreamState, false);
                     }
                 } catch (e) {
@@ -902,6 +923,9 @@ function clearPreviewRuntimeError() {
 
 function renderRuntimeErrorCard() {
     if (!lastPreviewRuntimeError) return;
+    // 自愈：清对话/切历史/新建后旧卡片已从 DOM 移除，引用变成游离节点，
+    // 否则会渲染到看不见的地方。检测断连就丢弃旧引用、重新挂载。
+    if (runtimeErrorCard && !runtimeErrorCard.isConnected) runtimeErrorCard = null;
     if (!runtimeErrorCard) {
         runtimeErrorCard = document.createElement('div');
         runtimeErrorCard.className = 'msg ai runtime-error-chat-card';
@@ -1040,6 +1064,10 @@ document.getElementById('btn-fullscreen').addEventListener('click', () => {
 });
 
 window.addEventListener('message', (event) => {
+    // 只接受来自预览 iframe 本身的消息（iframe 为 sandbox=allow-scripts，origin 为 "null"，
+    // 故用 source 身份校验而非 origin），防止其它窗口/嵌入方伪造运行错误消息。
+    const iframe = document.getElementById('game-preview');
+    if (!iframe || event.source !== iframe.contentWindow) return;
     if (!event.data || event.data.channel !== 'h5-game-preview-runtime-error') return;
     showPreviewRuntimeError(event.data);
 });
@@ -1093,6 +1121,7 @@ document.getElementById('btn-save').addEventListener('click', async () => {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ project_id: currentProjectId, name, code }),
         });
+        await ensureOk(res);
         const data = await res.json();
         currentProjectId = data.project_id;
         alert('✅ 保存成功！');
@@ -1109,6 +1138,7 @@ document.getElementById('btn-load').addEventListener('click', async () => {
 async function loadProjects() {
     try {
         const res = await fetch('/api/projects');
+        await ensureOk(res);
         const projects = await res.json();
         const list = document.getElementById('projects-list');
         if (projects.length === 0) {
@@ -1132,6 +1162,7 @@ async function loadProjects() {
 async function loadProject(id) {
     try {
         const res = await fetch(`/api/projects/${id}`);
+        await ensureOk(res);
         const data = await res.json();
         currentProjectId = id;
         applyEditorCode(data.code || '');
@@ -1145,7 +1176,7 @@ async function loadProject(id) {
 async function deleteProject(id) {
     if (!confirm('确定删除此项目？')) return;
     try {
-        await fetch(`/api/projects/${id}`, { method: 'DELETE' });
+        await ensureOk(await fetch(`/api/projects/${id}`, { method: 'DELETE' }));
         await loadProjects();
     } catch (err) {
         alert('❌ 删除失败: ' + err.message);
@@ -1162,6 +1193,7 @@ document.getElementById('btn-upload').addEventListener('click', async () => {
     const fileInput = document.getElementById('file-input');
     if (!fileInput.files.length) { alert('请选择文件'); return; }
 
+    const failed = [];
     for (const file of fileInput.files) {
         const formData = new FormData();
         formData.append('file', file);
@@ -1169,21 +1201,23 @@ document.getElementById('btn-upload').addEventListener('click', async () => {
         formData.append('description', document.getElementById('asset-desc').value);
         formData.append('tags', document.getElementById('asset-tags').value);
         try {
-            await fetch('/api/assets/upload', { method: 'POST', body: formData });
+            await ensureOk(await fetch('/api/assets/upload', { method: 'POST', body: formData }));
         } catch (err) {
-            alert('❌ 上传失败: ' + err.message);
+            failed.push(`${file.name}: ${err.message}`);
         }
     }
     fileInput.value = '';
     document.getElementById('asset-desc').value = '';
     document.getElementById('asset-tags').value = '';
     await loadAssets();
-    alert('✅ 上传成功！');
+    // 别再无条件报成功：有失败就如实告知
+    alert(failed.length ? '❌ 部分上传失败：\n' + failed.join('\n') : '✅ 上传成功！');
 });
 
 async function loadAssets() {
     try {
         const res = await fetch('/api/assets');
+        await ensureOk(res);
         const assets = await res.json();
         const list = document.getElementById('assets-list');
         if (assets.length === 0) {
@@ -1215,7 +1249,7 @@ function getTypeIcon(type) {
 async function deleteAsset(id) {
     if (!confirm('确定删除此素材？')) return;
     try {
-        await fetch(`/api/assets/${id}`, { method: 'DELETE' });
+        await ensureOk(await fetch(`/api/assets/${id}`, { method: 'DELETE' }));
         await loadAssets();
     } catch (err) {
         alert('❌ 删除失败: ' + err.message);
