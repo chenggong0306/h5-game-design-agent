@@ -122,8 +122,21 @@ async def run_headless(html: str, timeout_s: float = 6.0) -> list[dict] | None:
     issues = []
     try:
         async with async_playwright() as pw:
+            # --no-sandbox 是 autodl 等 root 容器里 Chromium 能启动的必要条件（去掉会启动失败→静默降级）；
+            # SSRF 风险改由下面的请求拦截（只放行内联资源）来兜，而非靠进程沙箱。
             browser = await pw.chromium.launch(headless=True, args=["--no-sandbox", "--disable-gpu"])
             page = await browser.new_page(viewport={"width": 390, "height": 740}, device_scale_factor=2)
+
+            # 安全：被检代码是模型生成的不可信 HTML。拦截一切外部请求，只放行内联资源
+            # （data:/about:/blob:），防止 SSRF 打云元数据(169.254.169.254)/内网服务、或读本地文件。
+            async def _block_external(route):
+                scheme = route.request.url.split(":", 1)[0].lower()
+                if scheme in ("data", "about", "blob"):
+                    await route.continue_()
+                else:
+                    await route.abort()
+            await page.route("**/*", _block_external)
+
             errors: list[str] = []
             page.on("pageerror", lambda e: errors.append(str(e)))
             page.on("console", lambda m: errors.append(m.text) if m.type == "error" else None)

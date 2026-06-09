@@ -9,7 +9,7 @@ _TEST_SESSIONS = [
     "session-a", "session-b", "view-session", "write-once", "write-chunked",
     "write-incomplete", "append-empty", "replace-empty", "doctype-frag",
     "autocommit", "autocommit-bad", "reconcile", "reconcile2", "resurrect",
-    "resolve", "resolve-empty", "append-recover", "append-rewrite",
+    "resolve", "resolve-empty", "append-recover", "append-rewrite", "autoclose-script",
 ]
 
 
@@ -138,6 +138,23 @@ class AgentCodeSessionTests(unittest.TestCase):
             msg = game_agent.append_game.invoke({"html": "<x>", "more": False})
             self.assertIn("先调用 write_game", msg)
             self.assertEqual(game_agent._get_current_code(), "OLD GAME")
+        finally:
+            game_agent._end_code_session(token)
+
+    def test_autocommit_closes_unclosed_script_before_body_html(self):
+        # 末段截断在未闭合 <script> 里 → 兜底补全必须先补 </script> 再补 </body></html>，
+        # 否则补出来的闭合标签落在 script 内被当 JS、整页解析坏掉。
+        token = game_agent._begin_code_session("autoclose-script", "OLD")
+        try:
+            game_agent.write_game.invoke({"html":
+                "<!DOCTYPE html><html><body><canvas></canvas><script>let x=1; // 被截断"})
+            self.assertEqual(game_agent._get_current_code(), "OLD")  # 未闭合，未提交
+            game_agent._autocommit_staging("autoclose-script")
+            code = game_agent._get_current_code()
+            low = code.lower()
+            self.assertEqual(low.count("<script"), low.count("</script>"))  # script 配平
+            self.assertIn("</html>", low)
+            self.assertLess(low.index("</script>"), low.index("</body>"))   # 顺序正确
         finally:
             game_agent._end_code_session(token)
 

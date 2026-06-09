@@ -262,6 +262,76 @@ def _count_message_tokens_cjk(messages) -> int:
     return total
 
 
+class CJKContextEditingMiddleware(ContextEditingMiddleware):
+    """ContextEditingMiddleware 的 CJK 计数版。
+
+    父类只有两档计数：
+    - "approximate"：英文 4 字符/token，中文欠计 3-4 倍 → 清理永不触发；
+    - "model"：对 gemma/vLLM/deepseek 这类非 OpenAI 标准模型名，
+      get_num_tokens_from_messages 直接抛 NotImplementedError → **每回合崩**。
+    两者都不可用，故改用项目自带的 CJK 感知计数器（与 SummarizationMiddleware 一致）。
+    """
+
+    def _edit(self, request):
+        # 浅拷贝即可：ClearToolUsesEdit 只替换列表元素、用 model_copy 生成新对象，
+        # 不就地修改原消息，故不会污染 checkpoint 里的历史。
+        edited = list(request.messages)
+        for edit in self.edits:
+            edit.apply(edited, count_tokens=_count_message_tokens_cjk)
+        return edited
+
+    def wrap_model_call(self, request, handler):
+        if not request.messages:
+            return handler(request)
+        return handler(request.override(messages=self._edit(request)))
+
+    async def awrap_model_call(self, request, handler):
+        if not request.messages:
+            return await handler(request)
+        return await handler(request.override(messages=self._edit(request)))
+
+
+class SafeSummarizationMiddleware(SummarizationMiddleware):
+    """总结失败时【跳过】本回合压缩，而不是把 "Error generating summary: ..." 当摘要写回、
+    清空历史（上下文最满时的灾难性丢失）。覆盖 DeepSeek 模型名写错 / 服务抖动 / 超限等情形。
+    清理层（CJKContextEditingMiddleware）仍会照常工作，作为更便宜的兜底。"""
+
+    @staticmethod
+    def _summary_failed(result) -> bool:
+        if not result:
+            return False
+        for m in (result.get("messages") or []):
+            c = getattr(m, "content", "")
+            if isinstance(c, str) and (
+                "Error generating summary" in c
+                or "too long to summarize" in c
+            ):
+                return True
+        return False
+
+    def before_model(self, state, runtime):
+        try:
+            result = super().before_model(state, runtime)
+        except Exception as e:
+            logger.warning("summarization_skipped_error", error=str(e)[:200])
+            return None
+        if self._summary_failed(result):
+            logger.warning("summarization_skipped_bad_summary")
+            return None
+        return result
+
+    async def abefore_model(self, state, runtime):
+        try:
+            result = await super().abefore_model(state, runtime)
+        except Exception as e:
+            logger.warning("summarization_skipped_error", error=str(e)[:200])
+            return None
+        if self._summary_failed(result):
+            logger.warning("summarization_skipped_bad_summary")
+            return None
+        return result
+
+
 # -------- 每次调用的固定开销（system prompt + 技能列表 + 工具 schema），实测并缓存 --------
 _system_overhead_tokens: int | None = None
 
@@ -691,7 +761,13 @@ def _autocommit_staging(session_id: str) -> None:
         low = staged.lower()
         if ("<!doctype" in low or "<html" in low) and "<script" in low and "</html>" not in low:
             patched = staged.rstrip()
-            if "</body>" not in low:
+            plow = patched.lower()
+            # 末段可能截断在未闭合的 <script> 里：先补 </script> 再补 body/html，
+            # 否则补出来的 </body></html> 会落在 script 内被当成 JS、整页解析坏掉。
+            if plow.count("<script") > plow.count("</script>"):
+                patched += "\n</script>"
+                plow = patched.lower()
+            if "</body>" not in plow:
                 patched += "\n</body>"
             staged = patched + "\n</html>"
             ok = True
@@ -1226,7 +1302,7 @@ class GameDesignAgent:
                     track_context_usage,
                     SkillMiddleware(),
                     CodeContextMiddleware(),
-                    ContextEditingMiddleware(
+                    CJKContextEditingMiddleware(
                         edits=[
                             ClearToolUsesEdit(
                                 trigger=clear_trigger,
@@ -1235,11 +1311,11 @@ class GameDesignAgent:
                                 placeholder="[已清理]",
                             ),
                         ],
-                        # ⚠️ 默认 "approximate" 用 4字符/token 计中文 → 欠计 3-4 倍、清理永不触发。
-                        # 改用模型真实分词器（tiktoken/模型自带）计数，中文计数才准。
-                        token_count_method="model",
+                        # ⚠️ 不能用 "approximate"(中文欠计3-4倍/永不触发) 或 "model"
+                        # (gemma/vLLM 非标准模型名→get_num_tokens_from_messages 抛 NotImplementedError/每回合崩)，
+                        # CJKContextEditingMiddleware 用 CJK 感知计数器，二者皆免。
                     ),
-                    SummarizationMiddleware(
+                    SafeSummarizationMiddleware(
                         model=summarization_model,
                         trigger=("tokens", summ_trigger),
                         keep=("messages", SUMMARIZATION_KEEP_MESSAGES),
@@ -1297,7 +1373,9 @@ class GameDesignAgent:
                             config=config,
                         )
                         _autocommit_staging(session_id)
-                        reply = _strip_control_tokens(rep["messages"][-1].content)  # 兼容 str / 分块 list
+                        new_reply = _strip_control_tokens(rep["messages"][-1].content)  # 兼容 str / 分块 list
+                        if new_reply.strip():  # 修复回合可能以工具调用收尾、正文为空 → 别用空串覆盖主回合总结
+                            reply = new_reply
 
                 code = self._resolve_final_code(base_code, reply)
                 action = "generate" if code and not base_code else "edit" if code else "chat"
@@ -1494,13 +1572,15 @@ class GameDesignAgent:
                 await self.checkpointer.adelete_thread(session_id)
         except Exception:
             pass
-        # 原子清理全部存储位置：上下文圆环缓存 / 内存代码 / 暂存区 / 访问时间 / 会话锁 / 磁盘 .html
-        _context_usage_by_session.pop(session_id, None)
-        _code_by_session.pop(session_id, None)
-        _staging_by_session.pop(session_id, None)
-        _code_session_last_access.pop(session_id, None)
-        self._session_locks.pop(session_id, None)
-        try:
-            delete_session_code(session_id)  # 删磁盘文件，否则清空后重开会"复活"旧代码
-        except Exception as e:
-            logger.warning("delete_session_code_failed", session_id=session_id, error=str(e))
+        # ⚠️ 必须持有会话锁再清理：否则与正在进行的 chat/chat_stream 回合（读改写生效代码）
+        # 交错执行，会丢编辑/留下不一致状态。也【不要】pop 锁对象——pop 掉会让正在等锁的
+        # 并发回合拿到一把新锁、失去串行化。
+        async with self._get_session_lock(session_id):
+            _context_usage_by_session.pop(session_id, None)
+            _code_by_session.pop(session_id, None)
+            _staging_by_session.pop(session_id, None)
+            _code_session_last_access.pop(session_id, None)
+            try:
+                delete_session_code(session_id)  # 删磁盘文件，否则清空后重开会"复活"旧代码
+            except Exception as e:
+                logger.warning("delete_session_code_failed", session_id=session_id, error=str(e))
