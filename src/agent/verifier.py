@@ -6,6 +6,7 @@
 每个 issue: {id, severity('high'|'medium'|'low'), msg, fix}
 """
 
+import asyncio
 import re
 
 from src.utils.logger import logger
@@ -114,46 +115,52 @@ def _is_blank_png(png_bytes: bytes) -> bool:
         return False
 
 
-async def run_headless(html: str, timeout_s: float = 6.0) -> list[dict] | None:
+async def run_headless(html: str, timeout_s: float = 15.0) -> list[dict] | None:
     """用 playwright chromium 跑一遍游戏，捕获运行时报错 + 空屏。
-    未安装 playwright/chromium 或出错 → 返回 None（视为不可用，降级到纯静态）。"""
+    未安装 playwright/chromium 或出错/超时 → 返回 None（视为不可用，降级到纯静态）。
+    整个过程有 timeout_s 墙钟上限，卡住的页面不会拖死自检。"""
     try:
         from playwright.async_api import async_playwright
     except Exception:
         return None
 
-    issues = []
-    try:
+    async def _run() -> tuple[list[str], bool]:
         async with async_playwright() as pw:
             # --no-sandbox 是 autodl 等 root 容器里 Chromium 能启动的必要条件（去掉会启动失败→静默降级）；
             # SSRF 风险改由下面的请求拦截（只放行内联资源）来兜，而非靠进程沙箱。
             browser = await pw.chromium.launch(headless=True, args=["--no-sandbox", "--disable-gpu"])
-            page = await browser.new_page(viewport={"width": 390, "height": 740}, device_scale_factor=2)
+            try:
+                page = await browser.new_page(viewport={"width": 390, "height": 740}, device_scale_factor=2)
 
-            # 安全：被检代码是模型生成的不可信 HTML。拦截一切外部请求，只放行内联资源
-            # （data:/about:/blob:），防止 SSRF 打云元数据(169.254.169.254)/内网服务、或读本地文件。
-            async def _block_external(route):
-                scheme = route.request.url.split(":", 1)[0].lower()
-                if scheme in ("data", "about", "blob"):
-                    await route.continue_()
-                else:
-                    await route.abort()
-            await page.route("**/*", _block_external)
+                # 安全：被检代码是模型生成的不可信 HTML。拦截一切外部请求，只放行内联资源
+                # （data:/about:/blob:），防止 SSRF 打云元数据(169.254.169.254)/内网服务、或读本地文件。
+                async def _block_external(route):
+                    scheme = route.request.url.split(":", 1)[0].lower()
+                    if scheme in ("data", "about", "blob"):
+                        await route.continue_()
+                    else:
+                        await route.abort()
+                await page.route("**/*", _block_external)
 
-            errors: list[str] = []
-            page.on("pageerror", lambda e: errors.append(str(e)))
-            page.on("console", lambda m: errors.append(m.text) if m.type == "error" else None)
-            await page.set_content(html, wait_until="load")
-            await page.wait_for_timeout(1200)            # 让 requestAnimationFrame 跑起来
-            try:                                          # 模拟"点击开始"+按键，触发进入游戏
-                await page.mouse.click(195, 370)
-                await page.keyboard.press("Space")
-            except Exception:
-                pass
-            await page.wait_for_timeout(800)
-            shot = await page.screenshot()
-            blank = _is_blank_png(shot)
-            await browser.close()
+                errs: list[str] = []
+                page.on("pageerror", lambda e: errs.append(str(e)))
+                page.on("console", lambda m: errs.append(m.text) if m.type == "error" else None)
+                await page.set_content(html, wait_until="load")
+                await page.wait_for_timeout(1200)            # 让 requestAnimationFrame 跑起来
+                try:                                          # 模拟"点击开始"+按键，触发进入游戏
+                    await page.mouse.click(195, 370)
+                    await page.keyboard.press("Space")
+                except Exception:
+                    pass
+                await page.wait_for_timeout(800)
+                shot = await page.screenshot()
+                return errs, _is_blank_png(shot)
+            finally:
+                await browser.close()  # 即便超时取消，也保证关掉浏览器进程
+
+    issues = []
+    try:
+        errors, blank = await asyncio.wait_for(_run(), timeout=timeout_s)
 
         seen = set()
         for e in errors:
