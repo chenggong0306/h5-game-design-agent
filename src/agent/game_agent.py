@@ -248,6 +248,20 @@ def _message_text_for_budget(message) -> str:
     return "\n".join(parts)
 
 
+def _count_message_tokens_cjk(messages) -> int:
+    """CJK 感知的"消息列表"token 计数，喂给 LangChain 压缩中间件。
+
+    LangChain 默认的 count_tokens_approximately 按 ~4 字符/token（英文标定）计数，
+    会把中文低估 3-4 倍，且 SummarizationMiddleware 的 usage_metadata 校正被硬上限
+    钳到 ≤1.25×，根本补不回中文的欠计 → 触发阈值在中文场景永远够不着、压缩从不触发。
+    这里改用项目自带的 CJK 感知估算（中文≈1 token/字），让阈值真正生效。
+    """
+    total = 0
+    for m in messages or []:
+        total += _estimate_tokens(_message_text_for_budget(m)) + 3  # 每条消息额外开销
+    return total
+
+
 # -------- 每次调用的固定开销（system prompt + 技能列表 + 工具 schema），实测并缓存 --------
 _system_overhead_tokens: int | None = None
 
@@ -707,8 +721,36 @@ _LEADING_CHANNEL_NAME_RE = re.compile(
     r"^\s*(?:" + "|".join(_CHANNEL_NAMES) + r")\b[ \t]*", re.IGNORECASE)
 
 
-def _strip_control_tokens(text: str) -> str:
+def _content_to_text(content) -> str:
+    """把消息 content 规整成纯文本，兼容 str 与"分块" list。
+
+    部分模型/vLLM（gemma4/harmony 通道格式、带 reasoning 时）会把 AIMessageChunk.content
+    返回成 [{'type':'text','text':...}, {'type':'reasoning',...}, ...] 这样的块列表，
+    而不是一个字符串。之前的流式清洗直接对它做 str 拼接 →
+    `can only concatenate str (not "list") to str` 崩溃。这里统一抽取文本块、
+    跳过 reasoning/thinking 等不该展示的块。
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for b in content:
+            if isinstance(b, str):
+                parts.append(b)
+            elif isinstance(b, dict):
+                btype = b.get("type")
+                if btype in (None, "text", "output_text", "input_text"):
+                    parts.append(str(b.get("text", "") or ""))
+                # reasoning / thinking / redacted 等通道块：跳过（本就不该展示给用户）
+        return "".join(parts)
+    return str(content)
+
+
+def _strip_control_tokens(text) -> str:
     """一次性剥离全部控制标记（用于非流式整段文本）。"""
+    text = _content_to_text(text)  # 容错：content 可能是分块 list
     if not text or "<" not in text:
         return text
     # 通道头整体去掉（保留其后正文）：<|channel|>analysis<|message|> / <|channel>thought<channel|>
@@ -719,10 +761,13 @@ def _strip_control_tokens(text: str) -> str:
     return _CTRL_TOKEN_RE.sub("", text)
 
 
-def _sanitize_stream_chunk(ss: dict, raw: str) -> str:
+def _sanitize_stream_chunk(ss: dict, raw) -> str:
     """流式清洗：累积缓冲，剥离完整控制标记；尾部可能被截断的 '<...' 暂存到下一块再处理。
     跨块场景（如 '<|channel>'、'thought'、'<channel|>' 分三块到达）也能正确清掉通道名。
+    raw 可能是 str 或分块 list（多模态/通道格式），先规整成纯文本再处理。
     """
+    if not isinstance(raw, str):
+        raw = _content_to_text(raw)
     buf = ss.get("_san_buf", "") + raw
     if _CHANNEL_MARK_RE.search(buf):
         ss["_san_expect_name"] = True  # 见到通道标记 → 紧随其后的通道名也要清掉
@@ -1068,6 +1113,7 @@ class GameDesignAgent:
                 frequency_penalty=0.0,
                 timeout=120,
                 max_retries=2,
+                stream_usage=True,  # 流式时也回传 usage_metadata（OpenAI 兼容端点默认会关；用于压缩计数的 ≤1.25x 校正与未来按比例触发）
                 extra_body={"thinking": {"type": "disabled"}},
             )
         elif provider == "vllm":
@@ -1088,6 +1134,7 @@ class GameDesignAgent:
                 frequency_penalty=0.0,
                 timeout=120,
                 max_retries=2,
+                stream_usage=True,  # vLLM/兼容端点流式时回传 usage_metadata（自定义 base_url 默认会关）
             )
         else:
             model = init_chat_model(
@@ -1102,6 +1149,7 @@ class GameDesignAgent:
                 frequency_penalty=0.0,
                 timeout=120,
                 max_retries=2,
+                stream_usage=True,  # 流式时回传 usage_metadata
             )
 
         checkpoint_dir = Path(settings.chroma_persist_dir).parent
@@ -1187,11 +1235,17 @@ class GameDesignAgent:
                                 placeholder="[已清理]",
                             ),
                         ],
+                        # ⚠️ 默认 "approximate" 用 4字符/token 计中文 → 欠计 3-4 倍、清理永不触发。
+                        # 改用模型真实分词器（tiktoken/模型自带）计数，中文计数才准。
+                        token_count_method="model",
                     ),
                     SummarizationMiddleware(
                         model=summarization_model,
                         trigger=("tokens", summ_trigger),
                         keep=("messages", SUMMARIZATION_KEEP_MESSAGES),
+                        # ⚠️ 必传 CJK 感知计数器，否则默认英文标定计数把中文低估 3-4 倍、
+                        # 且 usage_metadata 校正被钳到 ≤1.25×，触发阈值在中文场景永远够不着。
+                        token_counter=_count_message_tokens_cjk,
                         trim_tokens_to_summarize=32000,
                     ),
                 ],
@@ -1225,8 +1279,7 @@ class GameDesignAgent:
                     config=config,
                 )
 
-                raw_reply = result["messages"][-1].content
-                reply = _strip_control_tokens(raw_reply) if isinstance(raw_reply, str) else raw_reply
+                reply = _strip_control_tokens(result["messages"][-1].content)  # 兼容 str / 分块 list
                 _autocommit_staging(session_id)  # 兜底提交忘了 more=False 的分段写入
 
                 # 自检 + 自修闭环（非流式）：质检→有问题就让模型修→再判
@@ -1244,8 +1297,7 @@ class GameDesignAgent:
                             config=config,
                         )
                         _autocommit_staging(session_id)
-                        raw_rep = rep["messages"][-1].content
-                        reply = _strip_control_tokens(raw_rep) if isinstance(raw_rep, str) else raw_rep
+                        reply = _strip_control_tokens(rep["messages"][-1].content)  # 兼容 str / 分块 list
 
                 code = self._resolve_final_code(base_code, reply)
                 action = "generate" if code and not base_code else "edit" if code else "chat"

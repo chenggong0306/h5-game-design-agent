@@ -65,5 +65,38 @@ class SanitizeStreamChunkTests(unittest.TestCase):
         self.assertEqual(self._run(["这是", "一个", "贪吃蛇游戏"]), "这是一个贪吃蛇游戏")
 
 
+class ListBlockContentTests(unittest.TestCase):
+    """回归：AIMessageChunk.content 可能是分块 list（gemma/vLLM 通道格式），
+    之前直接 str 拼接 → 'can only concatenate str (not list) to str' 崩溃。"""
+
+    def test_content_to_text_str(self):
+        self.assertEqual(ga._content_to_text("你好"), "你好")
+
+    def test_content_to_text_none(self):
+        self.assertEqual(ga._content_to_text(None), "")
+
+    def test_content_to_text_list_text_blocks(self):
+        c = [{"type": "text", "text": "你"}, {"type": "text", "text": "好"}]
+        self.assertEqual(ga._content_to_text(c), "你好")
+
+    def test_content_to_text_skips_reasoning(self):
+        c = [{"type": "reasoning", "text": "内部思考"}, {"type": "text", "text": "正文"}]
+        self.assertEqual(ga._content_to_text(c), "正文")
+
+    def test_content_to_text_plain_str_blocks(self):
+        self.assertEqual(ga._content_to_text(["a", "b"]), "ab")
+
+    def test_sanitize_stream_chunk_accepts_list(self):
+        # 复现并验证修复：传入 list 不再抛 TypeError
+        ss = {"full_reply": ""}
+        out = ga._sanitize_stream_chunk(ss, [{"type": "text", "text": "你好<|channel>"}])
+        out += ga._sanitize_stream_flush(ss)
+        self.assertEqual(out, "你好")
+
+    def test_strip_control_tokens_accepts_list(self):
+        c = [{"type": "text", "text": "前<|channel>后"}]
+        self.assertEqual(ga._strip_control_tokens(c), "前后")
+
+
 if __name__ == "__main__":
     unittest.main()
