@@ -126,8 +126,11 @@ async def run_headless(html: str, timeout_s: float = 15.0) -> list[dict] | None:
 
     async def _run() -> tuple[list[str], bool]:
         async with async_playwright() as pw:
-            # --no-sandbox 是 autodl 等 root 容器里 Chromium 能启动的必要条件（去掉会启动失败→静默降级）；
-            # SSRF 风险改由下面的请求拦截（只放行内联资源）来兜，而非靠进程沙箱。
+            # --no-sandbox：root 容器/AutoDL 等环境下 Chromium 启动的必要条件。
+            # 去掉沙箱降低进程隔离，威胁模型里的缓解措施：
+            #   1. 仅跑不可信 HTML 且拦截外部网络请求（下面 page.route 只放行 data:/about:/blob:）
+            #   2. 整段有 wall-clock timeout（asyncio.wait_for），卡住不会拖死自检
+            #   3. 每次浏览器实例用完立即 close（finally 块保证）
             browser = await pw.chromium.launch(headless=True, args=["--no-sandbox", "--disable-gpu"])
             try:
                 page = await browser.new_page(viewport={"width": 390, "height": 740}, device_scale_factor=2)

@@ -59,8 +59,8 @@ _ALLOWED_ASSET_TYPES = {"image", "audio", "spritesheet", "tilemap", "font"}
 _DANGEROUS_ASSET_EXTS = {".html", ".htm", ".svg", ".xml", ".js", ".mjs", ".css"}
 # 文件名：无前导点、无 ".."、仅限安全字符（防穿越）
 _SAFE_FILENAME = _re.compile(r"^(?!\.)(?!.*\.\.)[A-Za-z0-9_.-]+$")
-# 会话 id：仅字母数字/下划线/连字符（uuid4 满足），防穿越到任意 .json/.html
-_SAFE_SESSION_ID = _re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+# 会话 id：来源统一在 src/config.py → settings.safe_session_id_pattern（一处修改、全局生效）
+_SAFE_SESSION_ID = _re.compile(_settings.safe_session_id_pattern)
 
 
 def _require_safe_session_id(session_id: str) -> str:
@@ -577,13 +577,29 @@ class SkillScanRequest(BaseModel):
 async def scan_skills_folder(req: SkillScanRequest):
     """扫描本地文件夹，找到所有 SKILL.md 文件并导入（本地管理操作）。
 
+    安全限制：仅允许扫描项目 skills_dir 或用户家目录下的路径；
+    拒绝系统目录（/etc, /tmp, C:\\Windows 等）以防止本地文件读取。
+
     注意：这是面向本机管理员的便捷功能（默认 HOST=127.0.0.1）。若把服务对外暴露，
     务必同时设置 API_TOKEN —— 否则任意客户端都能让服务端遍历目录、读取 SKILL.md。
     """
     import os, re as re_mod
-    folder = req.path.strip()
+    folder_raw = req.path.strip()
+    folder = os.path.realpath(folder_raw)
+
     if not os.path.isdir(folder):
         raise HTTPException(400, f"路径不存在: {folder}")
+
+    # 安全：仅允许扫描项目 skills_dir 或用户家目录；拒绝系统目录
+    allowed_roots = [
+        os.path.realpath(_settings.skills_dir),
+        os.path.realpath(os.path.expanduser("~")),
+    ]
+    if not any(os.path.commonpath([folder, root]) == root for root in allowed_roots):
+        raise HTTPException(
+            403,
+            f"出于安全考虑，仅允许扫描项目技能目录和用户家目录。提供的路径不在允许范围内。",
+        )
 
     _MAX_DIRS, _MAX_FOUND = 5000, 500  # 遍历上限：防超大目录树拖垮（DoS）
 

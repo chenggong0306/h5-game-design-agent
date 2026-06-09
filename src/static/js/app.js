@@ -1263,7 +1263,13 @@ uploadZone.addEventListener('dragleave', () => uploadZone.classList.remove('drag
 uploadZone.addEventListener('drop', (e) => {
     e.preventDefault();
     uploadZone.classList.remove('drag-over');
-    document.getElementById('file-input').files = e.dataTransfer.files;
+    const fileInput = document.getElementById('file-input');
+    const dt = new DataTransfer();
+    for (const file of e.dataTransfer.files) {
+        dt.items.add(file);
+    }
+    fileInput.files = dt.files;
+    fileInput.dispatchEvent(new Event('change'));
 });
 
 // ============ 工具函数 ============

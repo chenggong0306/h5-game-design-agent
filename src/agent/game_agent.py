@@ -87,13 +87,17 @@ def _set_current_code(code: str) -> None:
 def _enforce_cache_limits() -> None:
     """强制执行缓存限制：总大小不超过 MAX_TOTAL_CACHE_SIZE，会话数不超过 MAX_SESSIONS。
     使用 LRU 策略：优先清理最久未访问的会话。
+
+    安全：先对 dict items 做 list 快照再操作，避免"dictionary changed size during
+    iteration"——即使未来有代码在此函数内加了 await（单线程 asyncio 中同步代码是原子的，
+    但快照模式更防御性）。
     """
     # 1. 检查会话数量限制
     if len(_code_by_session) > MAX_SESSIONS:
-        # 按最后访问时间排序，删除最旧的
+        # 快照：list() 消费 items view，后续 pop 不影响已拿到的列表
         sorted_sessions = sorted(
-            _code_session_last_access.items(),
-            key=lambda x: x[1]
+            list(_code_session_last_access.items()),
+            key=lambda x: x[1],
         )
         to_remove = len(_code_by_session) - MAX_SESSIONS
         for session_id, _ in sorted_sessions[:to_remove]:
@@ -103,10 +107,9 @@ def _enforce_cache_limits() -> None:
     # 2. 检查总大小限制
     total_size = sum(len(code) for code in _code_by_session.values())
     if total_size > MAX_TOTAL_CACHE_SIZE:
-        # 按最后访问时间排序，逐个删除直到总大小低于限制
         sorted_sessions = sorted(
-            _code_session_last_access.items(),
-            key=lambda x: x[1]
+            list(_code_session_last_access.items()),
+            key=lambda x: x[1],
         )
         for session_id, _ in sorted_sessions:
             if total_size <= MAX_TOTAL_CACHE_SIZE:
@@ -1515,12 +1518,11 @@ class GameDesignAgent:
         """流式对话 - 逐 token 返回"""
         await self._ensure_agent()
         lock = self._get_session_lock(session_id)  # 串行化同一会话的并发回合
-        await lock.acquire()
-
         config = {"configurable": {"thread_id": session_id}, "recursion_limit": 500}
         token = None
 
         try:
+            await lock.acquire()
             token = _begin_code_session(session_id, current_code, code_dirty)
             base_code = _get_current_code()  # 协调后的基准代码
             # 流状态：full_reply 累积文本、last_code_sent 去重 code_update、ctx_key 去重 context_usage
@@ -1565,7 +1567,11 @@ class GameDesignAgent:
         finally:
             if token is not None:
                 _end_code_session(token)
-            lock.release()
+            # 防御性释放：若 acquire 被 CancelledError 中断，release() 会抛 RuntimeError
+            try:
+                lock.release()
+            except RuntimeError:
+                pass
 
     @staticmethod
     def _extract_code(text: str) -> str | None:

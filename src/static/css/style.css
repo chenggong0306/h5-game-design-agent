@@ -347,7 +347,6 @@ body {
 .image-attachment-card button:hover {
     background: var(--error);
     color: var(--bg-primary);
-}
     cursor: pointer;
 }
 .message-image-list {
@@ -587,11 +586,6 @@ body {
     padding: 0;
 }
 
-/* 发送按钮禁用状态 */
-#btn-send:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
-}
 
 /* ============ 弹窗 ============ */
 .modal {
@@ -753,15 +747,6 @@ body {
     font-size: 12px;
 }
 .history-actions { display: flex; gap: 8px; align-items: center; }
-.history-item button.danger {
-    border-color: rgba(239, 68, 68, 0.42);
-    color: #fecaca;
-}
-.history-item button.danger:hover {
-    border-color: rgba(248, 113, 113, 0.85);
-    background: linear-gradient(135deg, rgba(239,68,68,0.28), rgba(244,63,94,0.20));
-    box-shadow: 0 0 22px rgba(239,68,68,0.20);
-}
 
 
 /* ============ Loading ============ */

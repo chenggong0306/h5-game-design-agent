@@ -62,6 +62,11 @@ class Settings(BaseSettings):
     assets_dir: str = str(BASE_DIR / "data" / "assets")
     skills_dir: str = str(BASE_DIR / "data" / "skills")
 
+    # 安全
+    # 会话 ID 安全校验正则（字母数字/下划线/连字符 1-128 位）
+    # 供 HTTP 层和持久化层共用，防路径穿越（一处修改、全局生效）
+    safe_session_id_pattern: str = r"^[A-Za-z0-9_-]{1,128}$"
+
     # 项目
     project_name: str = "AI Game Design Agent"
     version: str = "0.1.0"

@@ -103,6 +103,9 @@ async def require_token(request: Request, x_api_token: str | None = Header(defau
     if not settings.api_token:
         return  # 未配置令牌：本机自用模式，全部放行
     path = request.url.path
+    # 只读媒体放行（已做路径穿越校验）：null-origin iframe 预览无法发送自定义头，
+    # 必须豁免才能加载素材。风险：若 asset 文件名可猜，素材可匿名直链下载。
+    # 缓解：文件名使用 UUID（不可猜）；settings.assets_dir 默认不可公开列举。
     if path.startswith("/assets/") or path.startswith("/api/assets/file/"):
         return  # 只读媒体放行（已做路径校验），供 null-origin 预览 iframe 加载
     if x_api_token != settings.api_token:

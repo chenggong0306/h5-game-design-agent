@@ -2,19 +2,22 @@
 
 import json
 import re
+import time
 from pathlib import Path
 from typing import Optional
+from src.config import BASE_DIR, settings
 from src.utils.logger import logger
 
-# 持久化目录
-SESSIONS_DIR = Path("data/sessions")
+# 持久化目录（使用项目根目录拼绝对路径，避免 CWD 依赖）
+SESSIONS_DIR = BASE_DIR / "data" / "sessions"
 SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
 
 # 会话元数据文件
 SESSIONS_META_FILE = SESSIONS_DIR / "_sessions.json"
 
-# 会话 id 安全校验（防穿越写到任意路径）；与 HTTP 层一致
-_SAFE_SESSION_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+# 会话 id 安全校验（防穿越写到任意路径）
+# 正则来源统一在 src/config.py → settings.safe_session_id_pattern（一处修改、全局生效）
+_SAFE_SESSION_ID = re.compile(settings.safe_session_id_pattern)
 
 
 def _is_safe_session_id(session_id: str) -> bool:
@@ -134,15 +137,15 @@ def _update_session_meta(session_id: str, code_size: int):
         
         meta[session_id] = {
             "size": code_size,
-            "updated_at": __import__("time").time(),
+            "updated_at": time.time(),
         }
         
         SESSIONS_META_FILE.write_text(
             json.dumps(meta, ensure_ascii=False, indent=2),
             encoding="utf-8"
         )
-    except Exception:
-        pass  # 元数据失败不影响主流程
+    except Exception as e:
+        logger.debug("update_session_meta_failed", session_id=session_id, error=str(e))  # 元数据失败不影响主流程
 
 
 def _remove_session_meta(session_id: str):
@@ -155,8 +158,8 @@ def _remove_session_meta(session_id: str):
                 json.dumps(meta, ensure_ascii=False, indent=2),
                 encoding="utf-8"
             )
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("remove_session_meta_failed", session_id=session_id, error=str(e))
 
 
 def cleanup_old_files(max_age_days: int = 7):
@@ -174,8 +177,8 @@ def cleanup_old_files(max_age_days: int = 7):
             try:
                 file.unlink()
                 cleaned += 1
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("cleanup_file_failed", file=str(file), error=str(e))
     
     if cleaned > 0:
         logger.info("cleanup_old_sessions", cleaned=cleaned, max_age_days=max_age_days)
