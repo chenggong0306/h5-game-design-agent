@@ -101,11 +101,14 @@ def _is_blank_png(png_bytes: bytes) -> bool:
         import io
         from PIL import Image
         img = Image.open(io.BytesIO(png_bytes)).convert("RGB").resize((48, 48))
-        px = list(img.getdata())
-        def var(idx):
-            a = [p[idx] for p in px]
-            m = sum(a) / len(a)
-            return sum((x - m) ** 2 for x in a) / len(a)
+        raw = img.tobytes()  # RGBRGB...（避开已弃用的 Image.getdata）
+        n = len(raw) // 3
+        if n == 0:
+            return False
+        def var(off):
+            a = raw[off::3]            # 该通道的全部字节（R=0/G=1/B=2）
+            m = sum(a) / n
+            return sum((x - m) ** 2 for x in a) / n
         return (var(0) + var(1) + var(2)) < 60
     except Exception:
         return False

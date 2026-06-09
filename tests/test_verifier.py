@@ -81,5 +81,28 @@ class StaticAnalysisTests(unittest.TestCase):
         self.assertIn("dpr_css_size", got)
 
 
+class BlankDetectionTests(unittest.TestCase):
+    """无头检查的空屏判定：纯色截图=空屏，高方差画面=非空。"""
+
+    def _png(self, painter):
+        from io import BytesIO
+        from PIL import Image
+        img = Image.new("RGB", (64, 64))
+        px = img.load()
+        for x in range(64):
+            for y in range(64):
+                px[x, y] = painter(x, y)
+        buf = BytesIO()
+        img.save(buf, "PNG")
+        return buf.getvalue()
+
+    def test_solid_color_is_blank(self):
+        self.assertTrue(verifier._is_blank_png(self._png(lambda x, y: (20, 30, 40))))
+
+    def test_high_variance_is_not_blank(self):
+        png = self._png(lambda x, y: ((x * 4) % 256, (y * 4) % 256, ((x + y) * 4) % 256))
+        self.assertFalse(verifier._is_blank_png(png))
+
+
 if __name__ == "__main__":
     unittest.main()
