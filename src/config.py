@@ -13,9 +13,9 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     openai_base_url: str = "https://api.openai.com/v1"
     openai_model: str = "gpt-4o"
-    embedding_model: str = "text-embedding-3-small"
 
-    # 多模型服务配置：LLM_PROVIDER 可选 openai / deepseek / qwen
+    # 多模型服务配置：LLM_PROVIDER 可选 openai / deepseek / vllm
+    #（qwen / gemma / compatible 为同义别名，均走本地 vLLM/OpenAI 兼容分支）
     llm_provider: str = "openai"
 
     # 生成质量调参
@@ -24,6 +24,11 @@ class Settings(BaseSettings):
     # 单次输出上限。务必 ≤ 你所用模型的真实最大输出（如 deepseek-chat≈8192、gpt-4o≈16384）。
     # 太大可能被 provider 拒绝/截断；配合"分段写入"使用，单段建议 ≤300 行。
     max_output_tokens: int = 8192
+    # 单回合墙钟上限（秒）：防止个别回合（工具循环/自修）跑太久、占资源。流式与非流式都生效。
+    turn_deadline_seconds: float = 600.0
+    # 流式时是否请求 usage_metadata（stream_options.include_usage）。默认开（供压缩计数校正）；
+    # 个别严格的 OpenAI 兼容网关不认这个字段时可设 false 关闭。
+    stream_usage: bool = True
 
     # 生成后自检 + 自修闭环
     self_check_enabled: bool = True      # 生成游戏后自动质检，发现问题让模型自修后再返回
@@ -36,7 +41,7 @@ class Settings(BaseSettings):
     deepseek_base_url: str = "https://api.deepseek.com"
     deepseek_model: str = "deepseek-v4-flash"
 
-    # Qwen/vLLM/OpenAI-compatible 配置（启用方式：LLM_PROVIDER=qwen）
+    # Qwen/vLLM/OpenAI-compatible 配置（启用方式：LLM_PROVIDER=vllm，qwen/gemma 同义）
     qwen_api_key: str = ""
     qwen_base_url: str = ""
     qwen_model: str = ""
@@ -56,7 +61,6 @@ class Settings(BaseSettings):
     chroma_persist_dir: str = str(BASE_DIR / "data" / "chroma_db")
     assets_dir: str = str(BASE_DIR / "data" / "assets")
     skills_dir: str = str(BASE_DIR / "data" / "skills")
-    templates_dir: str = str(BASE_DIR / "data" / "templates")
 
     # 项目
     project_name: str = "AI Game Design Agent"

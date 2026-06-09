@@ -188,6 +188,7 @@ def _cleanup_old_sessions() -> None:
         _code_by_session.pop(sid, None)
         _staging_by_session.pop(sid, None)  # 暂存区不再每回合清空，过期时一并回收
         _code_session_last_access.pop(sid, None)
+        _context_usage_by_session.pop(sid, None)  # 上下文圆环缓存同周期回收，防无限增长
         log_session_event(sid, "session_expired")
 
 
@@ -811,6 +812,7 @@ def _content_to_text(content) -> str:
     if isinstance(content, str):
         return content
     if isinstance(content, list):
+        _SKIP = {"reasoning", "thinking", "thought", "redacted_thinking", "image", "image_url"}
         parts: list[str] = []
         for b in content:
             if isinstance(b, str):
@@ -820,6 +822,12 @@ def _content_to_text(content) -> str:
                 if btype in (None, "text", "output_text", "input_text"):
                     parts.append(str(b.get("text", "") or ""))
                 # reasoning / thinking / redacted 等通道块：跳过（本就不该展示给用户）
+        # 兜底：若已知类型一个都没匹配上、但块里确实带 text（某些模型用了别的 type 名），
+        # 再扫一遍把非 reasoning 块的 text 收进来，避免静默丢掉真正的回答正文。
+        if not "".join(parts).strip():
+            for b in content:
+                if isinstance(b, dict) and b.get("type") not in _SKIP and b.get("text"):
+                    parts.append(str(b.get("text") or ""))
         return "".join(parts)
     return str(content)
 
@@ -890,6 +898,8 @@ def write_game(html: str, more: bool = False) -> str:
         more: 可选、仅作语义提示；是否生效由内容是否包含 </html> 决定，不依赖此标志
     """
     session_id = _current_session_id.get()
+    if not session_id:  # ContextVar 未设 → 会写到空键、与真实会话串味，直接拒绝
+        return format_error(ErrorCode.SYSTEM_ERROR, "无活动会话，无法写入游戏")
     if len(html) > MAX_CODE_SIZE:
         return format_error(ErrorCode.INPUT_TOO_LARGE,
             f"html 超过 {MAX_CODE_SIZE // (1024*1024)}MB 限制")
@@ -906,6 +916,8 @@ def append_game(html: str, more: bool = False) -> str:
         more: 可选、仅作语义提示；是否生效由内容是否包含 </html> 决定，不依赖此标志
     """
     session_id = _current_session_id.get()
+    if not session_id:  # ContextVar 未设 → 拒绝，避免写到空键
+        return format_error(ErrorCode.SYSTEM_ERROR, "无活动会话，无法写入游戏")
     staged = _staging_by_session.get(session_id, "")
     if not staged:
         # 容错自愈：模型常把第 1 段写成完整文档（含 </html>），它已自动提交、暂存被清空，
@@ -1189,7 +1201,7 @@ class GameDesignAgent:
                 frequency_penalty=0.0,
                 timeout=120,
                 max_retries=2,
-                stream_usage=True,  # 流式时也回传 usage_metadata（OpenAI 兼容端点默认会关；用于压缩计数的 ≤1.25x 校正与未来按比例触发）
+                stream_usage=settings.stream_usage,  # 流式时也回传 usage_metadata（OpenAI 兼容端点默认会关；用于压缩计数的 ≤1.25x 校正与未来按比例触发）
                 extra_body={"thinking": {"type": "disabled"}},
             )
         elif provider == "vllm":
@@ -1210,7 +1222,7 @@ class GameDesignAgent:
                 frequency_penalty=0.0,
                 timeout=120,
                 max_retries=2,
-                stream_usage=True,  # vLLM/兼容端点流式时回传 usage_metadata（自定义 base_url 默认会关）
+                stream_usage=settings.stream_usage,  # vLLM/兼容端点流式时回传 usage_metadata（自定义 base_url 默认会关）
             )
         else:
             model = init_chat_model(
@@ -1225,7 +1237,7 @@ class GameDesignAgent:
                 frequency_penalty=0.0,
                 timeout=120,
                 max_retries=2,
-                stream_usage=True,  # 流式时回传 usage_metadata
+                stream_usage=settings.stream_usage,  # 流式时回传 usage_metadata
             )
 
         checkpoint_dir = Path(settings.chroma_persist_dir).parent
@@ -1350,9 +1362,12 @@ class GameDesignAgent:
             base_code = _get_current_code()  # 协调后的基准代码
             try:
                 config = {"configurable": {"thread_id": session_id}, "recursion_limit": 500}
-                result = await self.agent.ainvoke(
-                    {"messages": [{"role": "user", "content": self._build_message(user_message, base_code)}]},
-                    config=config,
+                result = await asyncio.wait_for(  # 单回合墙钟上限
+                    self.agent.ainvoke(
+                        {"messages": [{"role": "user", "content": self._build_message(user_message, base_code)}]},
+                        config=config,
+                    ),
+                    settings.turn_deadline_seconds,
                 )
 
                 reply = _strip_control_tokens(result["messages"][-1].content)  # 兼容 str / 分块 list
@@ -1368,9 +1383,12 @@ class GameDesignAgent:
                         res = await verify_game(cur, use_headless=settings.self_check_headless)
                         if res["ok"]:
                             break
-                        rep = await self.agent.ainvoke(
-                            {"messages": [{"role": "user", "content": self._build_repair_message(res["blocking"])}]},
-                            config=config,
+                        rep = await asyncio.wait_for(
+                            self.agent.ainvoke(
+                                {"messages": [{"role": "user", "content": self._build_repair_message(res["blocking"])}]},
+                                config=config,
+                            ),
+                            settings.turn_deadline_seconds,
                         )
                         _autocommit_staging(session_id)
                         new_reply = _strip_control_tokens(rep["messages"][-1].content)  # 兼容 str / 分块 list
@@ -1479,6 +1497,7 @@ class GameDesignAgent:
                 return
             issues = result["blocking"]
             yield {"type": "self_check", "status": "repairing", "issues": [i["msg"] for i in issues]}
+            ss["full_reply"] = ""  # 自修回合的正文不要拼接到主回合总结后面（与非流式 chat 的"替换"语义一致）
             async for ev in self._run_agent_stream(self._build_repair_message(issues), config, ss):
                 yield ev
             _autocommit_staging(session_id)
@@ -1507,21 +1526,22 @@ class GameDesignAgent:
             # 流状态：full_reply 累积文本、last_code_sent 去重 code_update、ctx_key 去重 context_usage
             ss = {"session_id": session_id, "full_reply": "", "last_code_sent": base_code, "ctx_key": None}
 
-            # 主回合：模型生成
-            async for ev in self._run_agent_stream(self._build_message(user_message, base_code), config, ss):
-                yield ev
-
-            # 主回合结束：兜底提交分段写入，并把新代码补发给前端
-            _autocommit_staging(session_id)
-            edited_code = _get_current_code()
-            if edited_code != ss["last_code_sent"] and edited_code != base_code:
-                ss["last_code_sent"] = edited_code
-                yield {"type": "code_update", "code": edited_code, "source": "write_game"}
-
-            # ★ 自检 + 自修闭环：生成游戏后自动质检，发现"看不到/玩不了/报错"类问题让模型自修后再返回
-            if settings.self_check_enabled:
-                async for ev in self._self_check_and_repair(session_id, config, base_code, ss):
+            async with asyncio.timeout(settings.turn_deadline_seconds):  # 单回合墙钟上限（含自修），防失控长跑
+                # 主回合：模型生成
+                async for ev in self._run_agent_stream(self._build_message(user_message, base_code), config, ss):
                     yield ev
+
+                # 主回合结束：兜底提交分段写入，并把新代码补发给前端
+                _autocommit_staging(session_id)
+                edited_code = _get_current_code()
+                if edited_code != ss["last_code_sent"] and edited_code != base_code:
+                    ss["last_code_sent"] = edited_code
+                    yield {"type": "code_update", "code": edited_code, "source": "write_game"}
+
+                # ★ 自检 + 自修闭环：生成游戏后自动质检，发现"看不到/玩不了/报错"类问题让模型自修后再返回
+                if settings.self_check_enabled:
+                    async for ev in self._self_check_and_repair(session_id, config, base_code, ss):
+                        yield ev
 
             code = self._resolve_final_code(base_code, ss["full_reply"])
             action = "generate" if code and not base_code else "edit" if code else "chat"

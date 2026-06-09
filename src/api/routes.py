@@ -1,7 +1,9 @@
 """FastAPI 后端路由 - 游戏设计 API"""
 
+import asyncio
 import base64
 import json
+import logging
 import os
 import tempfile
 import uuid
@@ -18,6 +20,7 @@ from src.knowledge.knowledge_base import KnowledgeBase
 from src.agent.game_agent import GameDesignAgent, SKILLS, _save_custom_skills
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 # 全局实例
 kb = KnowledgeBase()
@@ -230,12 +233,16 @@ async def chat(req: ChatRequest):
             current_code=req.current_code,
             code_dirty=req.code_dirty,
         )
-        _append_chat_history(session_id, "user", req.message, {"images": _image_history_meta(images)} if images else None)
-        _append_chat_history(session_id, "ai", result.get("reply", ""), {"code": result.get("code") or ""})
+        # 历史 I/O 放到线程，别阻塞事件循环；不再把整份 HTML 塞进历史（磁盘 .html 才是权威，避免 O(N^2) 膨胀）
+        await asyncio.to_thread(_append_chat_history, session_id, "user", req.message,
+                                {"images": _image_history_meta(images)} if images else None)
+        await asyncio.to_thread(_append_chat_history, session_id, "ai", result.get("reply", ""))
         return ChatResponse(session_id=session_id, **result)
+    except HTTPException:
+        raise  # 图片校验等 4xx 原样抛出，别被吞成 500
     except Exception as e:
         err_str = str(e)
-        # 友好的错误提示
+        # 友好的错误提示（其余一律走通用文案 + 服务端日志，避免把原始异常/路径/配置泄露给前端）
         if "401" in err_str or "api_key" in err_str.lower() or "auth" in err_str.lower():
             detail = "API Key 无效或已过期，请在 .env 文件中检查 OPENAI_API_KEY 配置"
         elif "timeout" in err_str.lower() or "timed out" in err_str.lower():
@@ -243,7 +250,8 @@ async def chat(req: ChatRequest):
         elif "connect" in err_str.lower():
             detail = "无法连接到 AI 服务，请检查网络和 OPENAI_BASE_URL 配置"
         else:
-            detail = f"AI 对话失败: {err_str}"
+            logger.exception("chat failed (session=%s)", session_id)
+            detail = "AI 对话失败，请稍后重试（详情见服务端日志）"
         raise HTTPException(status_code=500, detail=detail)
 
 
@@ -252,6 +260,11 @@ async def chat_stream(req: ChatRequest):
     """流式对话 - SSE (Server-Sent Events)"""
     session_id = req.session_id or str(uuid.uuid4())
     _require_safe_session_id(session_id)
+    # ⚠️ 图片校验必须在创建 StreamingResponse 之前做：否则校验失败时 HTTPException 抛在
+    # SSE 生成器里（已经 200 OK），前端拿不到 4xx、流被无声截断。
+    images = _validate_chat_images(req.images)
+    user_content = _build_user_message_content(req.message, images)
+    image_meta = _image_history_meta(images) if images else None
 
     async def event_generator():
         assistant_text = ""
@@ -262,9 +275,8 @@ async def chat_stream(req: ChatRequest):
             yield f"data: {json.dumps({'type': 'error', 'content': '请求过于频繁，请稍候再试', 'error_code': 'RATE_LIMIT_EXCEEDED'}, ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
             return
-        images = _validate_chat_images(req.images)
-        user_content = _build_user_message_content(req.message, images)
-        _append_chat_history(session_id, "user", req.message, {"images": _image_history_meta(images)} if images else None)
+        await asyncio.to_thread(_append_chat_history, session_id, "user", req.message,
+                                {"images": image_meta} if image_meta else None)
         try:
             async for chunk in agent.chat_stream(
                 session_id=session_id,
@@ -272,14 +284,19 @@ async def chat_stream(req: ChatRequest):
                 current_code=req.current_code,
                 code_dirty=req.code_dirty,
             ):
-                if chunk.get("type") == "token":
+                ctype = chunk.get("type")
+                if ctype == "token":
                     assistant_text += chunk.get("content", "")
-                elif chunk.get("type") == "code_update":
+                elif ctype == "code_update":
                     latest_code = chunk.get("code") or latest_code
-                elif chunk.get("type") == "done":
+                elif ctype == "done":
                     latest_code = chunk.get("code") or latest_code
+                    # 不再把整份 HTML 写进历史（磁盘权威，避免 O(N^2) 膨胀）。
+                    # 即便正文为空但确实改了代码，也落一条占位，回放时才有助手条目。
                     if assistant_text.strip():
-                        _append_chat_history(session_id, "ai", assistant_text, {"code": latest_code})
+                        await asyncio.to_thread(_append_chat_history, session_id, "ai", assistant_text)
+                    elif chunk.get("action") in ("generate", "edit"):
+                        await asyncio.to_thread(_append_chat_history, session_id, "ai", "（已更新右侧代码）")
                 yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
         except Exception as e:
             err_msg = str(e)
@@ -304,11 +321,13 @@ async def chat_stream(req: ChatRequest):
 @router.get("/api/chat/history")
 async def list_chat_history():
     """列出所有对话历史会话"""
-    sessions = []
-    for path in sorted(CHAT_HISTORY_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
-        session_id = path.stem
-        sessions.append(_build_session_summary(session_id))
-    return sessions
+    def _list():
+        return [
+            _build_session_summary(path.stem)
+            for path in sorted(CHAT_HISTORY_DIR.glob("*.json"),
+                               key=lambda p: p.stat().st_mtime, reverse=True)
+        ]
+    return await asyncio.to_thread(_list)  # glob+stat+逐文件读放线程，别阻塞事件循环
 
 
 @router.get("/api/chat/{session_id}/history")
@@ -319,8 +338,8 @@ async def get_chat_history(session_id: str):
     仅当磁盘没有时才回退到聊天历史里的快照（兼容旧会话）。
     """
     from src.utils.persistence import load_session_code
-    history = _load_chat_history(session_id)
-    latest_code = load_session_code(session_id) or _get_latest_code_from_history(history)
+    history = await asyncio.to_thread(_load_chat_history, session_id)
+    latest_code = (await asyncio.to_thread(load_session_code, session_id)) or _get_latest_code_from_history(history)
     return {
         "session_id": session_id,
         "messages": history,
@@ -362,7 +381,8 @@ async def upload_asset(
 
     try:
         tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
-        result = kb.upload_asset(
+        result = await asyncio.to_thread(  # 嵌入推理 + 文件拷贝是阻塞操作，放线程
+            kb.upload_asset,
             file_path=tmp_path,
             file_name=file.filename or "unknown",
             asset_type=asset_type,
@@ -379,19 +399,19 @@ async def upload_asset(
 @router.get("/api/assets")
 async def list_assets(asset_type: str | None = None):
     """列出素材"""
-    return kb.list_assets(asset_type)
+    return await asyncio.to_thread(kb.list_assets, asset_type)
 
 
 @router.get("/api/assets/search")
 async def search_assets(q: str, asset_type: str | None = None, top_k: int = 5):
     """搜索素材"""
-    return kb.search_assets(q, asset_type, top_k)
+    return await asyncio.to_thread(kb.search_assets, q, asset_type, top_k)  # 含嵌入推理，放线程
 
 
 @router.delete("/api/assets/{asset_id}")
 async def delete_asset(asset_id: str):
     """删除素材"""
-    ok = kb.delete_asset(asset_id)
+    ok = await asyncio.to_thread(kb.delete_asset, asset_id)
     if not ok:
         raise HTTPException(status_code=404, detail="素材不存在")
     return {"ok": True}
@@ -417,7 +437,8 @@ async def serve_asset_short(asset_type: str, filename: str):
 @router.post("/api/projects", response_model=ProjectResponse)
 async def save_project(req: ProjectSaveRequest):
     """保存项目"""
-    project_id = kb.save_project(
+    project_id = await asyncio.to_thread(
+        kb.save_project,
         project_id=req.project_id,
         name=req.name,
         code=req.code,
@@ -429,13 +450,13 @@ async def save_project(req: ProjectSaveRequest):
 @router.get("/api/projects")
 async def list_projects():
     """列出项目"""
-    return kb.list_projects()
+    return await asyncio.to_thread(kb.list_projects)
 
 
 @router.get("/api/projects/{project_id}", response_model=ProjectResponse)
 async def get_project(project_id: str):
     """获取项目"""
-    project = kb.get_project(project_id)
+    project = await asyncio.to_thread(kb.get_project, project_id)
     if not project:
         raise HTTPException(status_code=404, detail="项目不存在")
     return ProjectResponse(**project)
@@ -444,7 +465,7 @@ async def get_project(project_id: str):
 @router.delete("/api/projects/{project_id}")
 async def delete_project(project_id: str):
     """删除项目"""
-    ok = kb.delete_project(project_id)
+    ok = await asyncio.to_thread(kb.delete_project, project_id)
     if not ok:
         raise HTTPException(status_code=404, detail="项目不存在")
     return {"ok": True}
@@ -554,21 +575,31 @@ class SkillScanRequest(BaseModel):
 
 @router.post("/api/skills/scan")
 async def scan_skills_folder(req: SkillScanRequest):
-    """扫描本地文件夹，找到所有 SKILL.md 文件并导入"""
+    """扫描本地文件夹，找到所有 SKILL.md 文件并导入（本地管理操作）。
+
+    注意：这是面向本机管理员的便捷功能（默认 HOST=127.0.0.1）。若把服务对外暴露，
+    务必同时设置 API_TOKEN —— 否则任意客户端都能让服务端遍历目录、读取 SKILL.md。
+    """
     import os, re as re_mod
     folder = req.path.strip()
     if not os.path.isdir(folder):
         raise HTTPException(400, f"路径不存在: {folder}")
 
-    found = []
-    for root, dirs, files in os.walk(folder):
-        for fname in files:
-            if fname.upper() == 'SKILL.MD':
+    _MAX_DIRS, _MAX_FOUND = 5000, 500  # 遍历上限：防超大目录树拖垮（DoS）
+
+    def _scan():
+        found, dirs_seen = [], 0
+        for root, _dirs, files in os.walk(folder):
+            dirs_seen += 1
+            if dirs_seen > _MAX_DIRS or len(found) >= _MAX_FOUND:
+                break
+            for fname in files:
+                if fname.upper() != 'SKILL.MD':
+                    continue
                 filepath = os.path.join(root, fname)
                 try:
                     with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
                         raw = f.read()
-                    # 解析 YAML frontmatter
                     skill_name = os.path.basename(root).replace(' ', '_')
                     description = skill_name
                     content = raw
@@ -581,14 +612,15 @@ async def scan_skills_folder(req: SkillScanRequest):
                                 skill_name = line.split(':', 1)[1].strip().strip('"').strip("'")
                             elif line.startswith('description:'):
                                 description = line.split(':', 1)[1].strip().strip('"').strip("'")
-                    found.append({
-                        "name": skill_name,
-                        "description": description,
-                        "content": content,
-                        "source": filepath,
-                    })
+                    found.append({"name": skill_name, "description": description,
+                                  "content": content, "source": filepath})
+                    if len(found) >= _MAX_FOUND:
+                        break
                 except Exception:
                     continue
+        return found
+
+    found = await asyncio.to_thread(_scan)  # 遍历/读盘放线程，别阻塞事件循环
 
     if not found:
         raise HTTPException(404, f"在 {folder} 中未找到 SKILL.md 文件")

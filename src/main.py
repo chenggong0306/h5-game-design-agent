@@ -37,7 +37,7 @@ from fastapi.requests import Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from src.config import settings
-from src.api.routes import router, kb
+from src.api.routes import router, kb, agent
 from src.agent.game_agent import SKILLS
 
 
@@ -58,6 +58,14 @@ async def lifespan(app: FastAPI):
     print(f"[Startup] KB stats: {kb.get_stats()}")
 
     yield
+
+    # 关停：显式关闭 checkpointer 的 aiosqlite 连接，避免 "Event loop is closed" 噪音 / 句柄泄漏
+    conn = getattr(agent, "checkpoint_conn", None)
+    if conn is not None:
+        try:
+            await conn.close()
+        except Exception:
+            pass
 
 
 # 创建 FastAPI 应用
