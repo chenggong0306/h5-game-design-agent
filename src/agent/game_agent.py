@@ -802,11 +802,10 @@ _LEADING_CHANNEL_NAME_RE = re.compile(
 
 
 def _content_to_text(content) -> str:
-    """把消息 content 规整成纯文本，兼容 str 与"分块" list。
+    """把消息 content 规整成纯文本，兼容 str / dict / list / 嵌套 list。
 
-    部分模型/vLLM（gemma4/harmony 通道格式、带 reasoning 时）会把 AIMessageChunk.content
-    返回成 [{'type':'text','text':...}, {'type':'reasoning',...}, ...] 这样的块列表，
-    而不是一个字符串。之前的流式清洗直接对它做 str 拼接 →
+    部分模型（gemma4/harmony 通道、带 reasoning、多模态）会把 content 返回成
+    dict/嵌套 list 而非纯字符串，之前的流式清洗直接对它做 str 拼接 →
     `can only concatenate str (not "list") to str` 崩溃。这里统一抽取文本块、
     跳过 reasoning/thinking 等不该展示的块。
     """
@@ -814,6 +813,17 @@ def _content_to_text(content) -> str:
         return ""
     if isinstance(content, str):
         return content
+    # 裸 dict：{"type":"text","text":"hello"} 或 {"text":"..."}
+    if isinstance(content, dict):
+        text = content.get("text", "") or content.get("content", "") or ""
+        if text:
+            return str(text)
+        # 递归处理 dict 内可能藏着的 content 列表
+        inner = content.get("content")
+        if inner is not None:
+            return _content_to_text(inner)
+        return str(content)
+    # 列表（可能嵌套）：统一扫描抽取所有 text 块
     if isinstance(content, list):
         _SKIP = {"reasoning", "thinking", "thought", "redacted_thinking", "image", "image_url"}
         parts: list[str] = []
@@ -824,15 +834,27 @@ def _content_to_text(content) -> str:
                 btype = b.get("type")
                 if btype in (None, "text", "output_text", "input_text"):
                     parts.append(str(b.get("text", "") or ""))
-                # reasoning / thinking / redacted 等通道块：跳过（本就不该展示给用户）
-        # 兜底：若已知类型一个都没匹配上、但块里确实带 text（某些模型用了别的 type 名），
-        # 再扫一遍把非 reasoning 块的 text 收进来，避免静默丢掉真正的回答正文。
+                elif btype in _SKIP:
+                    pass  # reasoning / thinking 块：本就不该展示给用户
+                else:
+                    # 未知 type，但有 text / content 字段就收进来（避免静默丢数据）
+                    t = b.get("text") or b.get("content") or ""
+                    if t:
+                        parts.append(str(t))
+            elif isinstance(b, list):
+                # 嵌套 list：递归处理
+                parts.append(_content_to_text(b))
+        # 兜底：若已知类型一个都没提取到，再扫一遍把非 skip 块的 text 收进来
         if not "".join(parts).strip():
             for b in content:
-                if isinstance(b, dict) and b.get("type") not in _SKIP and b.get("text"):
-                    parts.append(str(b.get("text") or ""))
+                if isinstance(b, dict) and b.get("type") not in _SKIP:
+                    t = b.get("text") or b.get("content") or ""
+                    if t:
+                        parts.append(str(t))
         return "".join(parts)
-    return str(content)
+    # 其他未知类型：兜底 str() + 防御（如果 str() 返回了类名的 dump 就丢弃）
+    s = str(content)
+    return "" if s.startswith("<") and s.endswith(">") else s
 
 
 def _strip_control_tokens(text) -> str:
@@ -851,10 +873,13 @@ def _strip_control_tokens(text) -> str:
 def _sanitize_stream_chunk(ss: dict, raw) -> str:
     """流式清洗：累积缓冲，剥离完整控制标记；尾部可能被截断的 '<...' 暂存到下一块再处理。
     跨块场景（如 '<|channel>'、'thought'、'<channel|>' 分三块到达）也能正确清掉通道名。
-    raw 可能是 str 或分块 list（多模态/通道格式），先规整成纯文本再处理。
+    raw 可能是 str / dict / list / 嵌套 list（多模态/通道格式），先规整成纯文本再处理。
     """
-    if not isinstance(raw, str):
-        raw = _content_to_text(raw)
+    try:
+        if not isinstance(raw, str):
+            raw = _content_to_text(raw)
+    except Exception:
+        raw = str(raw or "")
     buf = ss.get("_san_buf", "") + raw
     if _CHANNEL_MARK_RE.search(buf):
         ss["_san_expect_name"] = True  # 见到通道标记 → 紧随其后的通道名也要清掉
@@ -1427,7 +1452,7 @@ class GameDesignAgent:
             if isinstance(msg, AIMessageChunk) and msg.content:
                 clean = _sanitize_stream_chunk(ss, msg.content)  # 剥离 gemma/harmony 控制标记
                 if clean and (ss["full_reply"] or clean.strip()):  # 跳过开头纯空白 token
-                    ss["full_reply"] += clean
+                    ss["full_reply"] += str(clean)
                     evs.append({"type": "token", "content": clean})
         elif chunk.get("type") == "updates":
             for update in chunk["data"].values():
