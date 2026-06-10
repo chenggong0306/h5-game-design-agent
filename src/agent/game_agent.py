@@ -3,6 +3,7 @@
 import asyncio
 import re
 import time
+from collections import OrderedDict
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
@@ -49,6 +50,9 @@ _code_by_session: dict[str, str] = {}
 _staging_by_session: dict[str, str] = {}  # 分段写入新游戏的暂存区，校验通过后才提交到 _code_by_session
 _code_session_last_access: dict[str, float] = {}  # 记录最后访问时间，用于清理
 CODE_SESSION_TIMEOUT = 3600  # 1小时未访问的会话代码将被清理
+# code_update 全量推送的最小间隔（秒）：一回合几十次编辑时去抖中间版本，
+# 避免 O(编辑次数×代码体积) 的冗余 SSE 流量与前端 Monaco 反复全量重载
+CODE_UPDATE_DEBOUNCE_SECONDS = 1.0
 
 # -------- 企业级配置：资源限制 --------
 MAX_CODE_SIZE = 5 * 1024 * 1024  # 单个代码文件最大 5MB
@@ -120,8 +124,8 @@ def _enforce_cache_limits() -> None:
             total_size -= code_size
 
 
-def _begin_code_session(session_id: str, code: str, client_dirty: bool = False):
-    """绑定当前 async 上下文的会话 ID，并协调出本回合的基准代码。
+def _reconcile_code_sync(session_id: str, code: str, client_dirty: bool = False) -> str:
+    """协调出本回合的基准代码（纯同步，含磁盘读写，协程内请经 asyncio.to_thread 调用）。
 
     数据源唯一化：服务端权威代码 = 内存缓冲优先、其次磁盘 .html。前端传入的
     current_code 不再无脑覆盖服务端，而是按下列规则协调，避免 stale 标签页 / 渲染
@@ -130,9 +134,10 @@ def _begin_code_session(session_id: str, code: str, client_dirty: bool = False):
     - client_dirty=True（用户确实在编辑器里手改过）→ 以前端为准
     - 前端没声明手改、但内容与服务端不一致 → 判为 stale，保留服务端权威代码并告警
     - 其余情况 → 两者一致或前端为空，取非空的一方
-    """
-    token = _current_session_id.set(session_id)
 
+    注意：本函数不绑定 contextvar（to_thread 里 set 不会传播回协程），调用方负责
+    先在协程内执行 `_current_session_id.set(session_id)`。
+    """
     # 注意：不在回合开始清空分段写入暂存区。长游戏的分段写入可能跨回合（模型写了第1段
     # 就停下或分批），过早清空会让下一回合的 append_game 找不到上一段（APPEND_TO_EMPTY）。
     # 暂存区只在：提交成功 / 新的 write_game 覆盖 / clear_session / 会话过期 时清除。
@@ -166,6 +171,19 @@ def _begin_code_session(session_id: str, code: str, client_dirty: bool = False):
 
     log_session_event(session_id, "session_started", code_size=len(chosen))
 
+    return chosen
+
+
+def _begin_code_session(session_id: str, code: str, client_dirty: bool = False):
+    """绑定当前 async 上下文的会话 ID，并协调出本回合的基准代码（同步便捷入口）。
+
+    ⚠️ 含同步磁盘 I/O（load/save_session_code），协程内不要直接调用——应改为：
+    `token = _current_session_id.set(session_id)`（contextvar 必须留在协程内）
+    + `await asyncio.to_thread(_reconcile_code_sync, session_id, code, client_dirty)`。
+    本入口保留给同步调用方（测试 / 线程内工具路径）。
+    """
+    token = _current_session_id.set(session_id)
+    _reconcile_code_sync(session_id, code, client_dirty)
     return token
 
 
@@ -227,6 +245,13 @@ _context_usage_by_session: dict[str, dict[str, int | bool]] = {}
 # 每张图片的 token 估算（OpenAI vision: low-res≈85, high-res≈170-1105；保守取 300）
 _IMAGE_TOKEN_ESTIMATE = 300
 
+# CJK 字符段匹配（范围与旧的逐字符 ord() 判断完全一致）：
+# 假名 3040-30FF / 扩展A 3400-4DBF / 统一表意 4E00-9FFF / 韩文音节 AC00-D7A3 / 全角 FF00-FFEF
+_CJK_RE = re.compile(
+    "[぀-ヿ㐀-䶿一-鿿가-힣＀-￯]+"
+)
+
+
 def _estimate_tokens(text: str) -> int:
     """CJK 感知的近似 token 估算。
 
@@ -243,14 +268,9 @@ def _estimate_tokens(text: str) -> int:
     if "[IMAGE]" in text:
         image_count = text.count("[IMAGE]")
         text = text.replace("[IMAGE]", "")
-    cjk = 0
-    for ch in text:
-        o = ord(ch)
-        if (0x4E00 <= o <= 0x9FFF or 0x3400 <= o <= 0x4DBF   # 中日韩统一表意
-                or 0x3040 <= o <= 0x30FF                       # 日文假名
-                or 0xAC00 <= o <= 0xD7A3                       # 韩文音节
-                or 0xFF00 <= o <= 0xFFEF):                     # 全角符号
-            cjk += 1
+    # 预编译正则按"CJK 连续段"匹配求和（C 速度）。⚠️ 不要改成单字符 findall：
+    # 物化逐字符匹配列表后实测仅 ~2x 提速，连续段匹配 240KB 文本约 2-3ms（旧循环 ~30ms）。
+    cjk = sum(len(m) for m in _CJK_RE.findall(text))
     other = len(text) - cjk
     text_tokens = max(1, int(cjk + other / 3.5))
     return text_tokens + image_count * _IMAGE_TOKEN_ESTIMATE
@@ -285,6 +305,32 @@ def _message_text_for_budget(message) -> str:
     return "\n".join(parts)
 
 
+# 按消息的 token 计数 LRU 缓存：历史消息不可变（ClearToolUsesEdit 用 model_copy 生成
+# 新对象），同一条消息每次模型调用都会被 track_context_usage / 清理 / 总结三个钩子
+# 重复计数。key 取 (消息 id, 文本长度)：内容被清成占位符时（id 不变）长度必变、键自然
+# 失效，避免脏缓存；消息无 id 时直接计算不缓存。
+_msg_token_cache: OrderedDict[tuple[str, int], int] = OrderedDict()
+_MSG_TOKEN_CACHE_MAX = 4096
+
+
+def _estimate_message_tokens(message) -> int:
+    """单条消息的 CJK 感知 token 估算（带按消息 id 的 LRU 缓存）。"""
+    text = _message_text_for_budget(message)
+    mid = getattr(message, "id", None)
+    if not mid:
+        return _estimate_tokens(text)
+    key = (mid, len(text))
+    cached = _msg_token_cache.get(key)
+    if cached is not None:
+        _msg_token_cache.move_to_end(key)
+        return cached
+    count = _estimate_tokens(text)
+    _msg_token_cache[key] = count
+    while len(_msg_token_cache) > _MSG_TOKEN_CACHE_MAX:
+        _msg_token_cache.popitem(last=False)
+    return count
+
+
 def _count_message_tokens_cjk(messages) -> int:
     """CJK 感知的"消息列表"token 计数，喂给 LangChain 压缩中间件。
 
@@ -295,7 +341,7 @@ def _count_message_tokens_cjk(messages) -> int:
     """
     total = 0
     for m in messages or []:
-        total += _estimate_tokens(_message_text_for_budget(m)) + 3  # 每条消息额外开销
+        total += _estimate_message_tokens(m) + 3  # 每条消息额外开销
     return total
 
 
@@ -410,8 +456,8 @@ def track_context_usage(state: AgentState, runtime: Runtime) -> dict[str, Any] |
     messages = state["messages"]
 
     # CJK 感知地统计消息 token（count_tokens_approximately 会把中文低估 2-3 倍）。
-    # 每条消息再加 ~4 token 估算 role/结构开销。
-    used_tokens = sum(_estimate_tokens(_message_text_for_budget(m)) + 4 for m in messages)
+    # 每条消息再加 ~4 token 估算 role/结构开销。走按消息 id 的计数缓存，历史只算一次。
+    used_tokens = sum(_estimate_message_tokens(m) + 4 for m in messages)
 
     # 真实占用 = 消息 + 注入代码（CodeContextMiddleware 放在 system，不在 messages 里）
     #          + 固定开销（system prompt / 技能列表 / 工具 schema）。
@@ -504,8 +550,18 @@ def _load_custom_skills() -> list[dict]:
     if _CUSTOM_SKILLS_FILE.exists():
         try:
             return _json.loads(_CUSTOM_SKILLS_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            pass
+        except Exception as e:
+            # 不能静默吞错：损坏时所有自定义技能凭空消失，且下次 _save_custom_skills
+            # 会用"不含丢失技能"的列表直接覆盖坏文件、原始数据二次销毁。
+            logger.error("custom_skills_corrupt", file=str(_CUSTOM_SKILLS_FILE), error=str(e))
+            try:
+                # 改名保留原始数据供手工恢复；带时间戳避免 Windows 上目标已存在 rename 失败
+                backup = _CUSTOM_SKILLS_FILE.with_name(
+                    f"{_CUSTOM_SKILLS_FILE.name}.corrupt.{int(time.time())}.bak")
+                _CUSTOM_SKILLS_FILE.rename(backup)
+                logger.error("custom_skills_backed_up", backup=str(backup))
+            except Exception as be:
+                logger.error("custom_skills_backup_failed", error=str(be))
     return []
 
 def _save_custom_skills() -> None:
@@ -1246,60 +1302,43 @@ class GameDesignAgent:
         elif provider in _COMPATIBLE:
             provider = "vllm"
 
+        # 三个 provider 仅差 api_key/base_url/model 取值来源（deepseek 额外关 thinking），
+        # 其余 9 个公共参数收敛为一份，避免改 timeout/max_retries 等漏改某分支造成
+        # provider 间静默行为分叉。⚠️ 不要提成模块级常量：会在 import 时固化 settings。
+        common_kwargs: dict[str, Any] = dict(
+            model_provider="openai",
+            temperature=settings.temperature,
+            max_tokens=settings.max_output_tokens,
+            top_p=0.95,
+            presence_penalty=0.0,
+            frequency_penalty=0.0,
+            timeout=120,
+            max_retries=2,
+            stream_usage=settings.stream_usage,  # 流式时也回传 usage_metadata（OpenAI 兼容/自定义 base_url 端点默认会关；用于压缩计数的 ≤1.25x 校正与未来按比例触发）
+        )
+        extra_kwargs: dict[str, Any] = {}
         if provider == "deepseek":
             api_key = settings.deepseek_api_key or settings.openai_api_key
             base_url = settings.deepseek_base_url or settings.openai_base_url
             model_name = settings.deepseek_model or settings.openai_model
-            model = init_chat_model(
-                model=model_name,
-                model_provider="openai",
-                api_key=api_key,
-                base_url=base_url,
-                temperature=settings.temperature,
-                max_tokens=settings.max_output_tokens,
-                top_p=0.95,
-                presence_penalty=0.0,
-                frequency_penalty=0.0,
-                timeout=120,
-                max_retries=2,
-                stream_usage=settings.stream_usage,  # 流式时也回传 usage_metadata（OpenAI 兼容端点默认会关；用于压缩计数的 ≤1.25x 校正与未来按比例触发）
-                extra_body={"thinking": {"type": "disabled"}},
-            )
+            extra_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
         elif provider == "vllm":
             # 本地 vLLM / OpenAI 兼容端点（如 qwen、gemma-4）。沿用 QWEN_* 配置位，
             # 缺省回退到 OPENAI_*。vLLM 不需要真实 key，留任意非空字符串即可。
             api_key = settings.qwen_api_key or settings.openai_api_key or "EMPTY"
             base_url = settings.qwen_base_url or settings.openai_base_url
             model_name = settings.qwen_model or settings.openai_model
-            model = init_chat_model(
-                model=model_name,
-                model_provider="openai",
-                api_key=api_key,
-                base_url=base_url,
-                temperature=settings.temperature,
-                max_tokens=settings.max_output_tokens,
-                top_p=0.95,
-                presence_penalty=0.0,
-                frequency_penalty=0.0,
-                timeout=120,
-                max_retries=2,
-                stream_usage=settings.stream_usage,  # vLLM/兼容端点流式时回传 usage_metadata（自定义 base_url 默认会关）
-            )
         else:
-            model = init_chat_model(
-                model=settings.openai_model,
-                model_provider="openai",
-                api_key=settings.openai_api_key,
-                base_url=settings.openai_base_url,
-                temperature=settings.temperature,
-                max_tokens=settings.max_output_tokens,
-                top_p=0.95,
-                presence_penalty=0.0,
-                frequency_penalty=0.0,
-                timeout=120,
-                max_retries=2,
-                stream_usage=settings.stream_usage,  # 流式时回传 usage_metadata
-            )
+            api_key = settings.openai_api_key
+            base_url = settings.openai_base_url
+            model_name = settings.openai_model
+        model = init_chat_model(
+            model=model_name,
+            api_key=api_key,
+            base_url=base_url,
+            **common_kwargs,
+            **extra_kwargs,
+        )
 
         checkpoint_dir = Path(settings.chroma_persist_dir).parent
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -1419,7 +1458,10 @@ class GameDesignAgent:
         """非流式对话"""
         await self._ensure_agent()
         async with self._get_session_lock(session_id):  # 串行化同一会话的并发回合
-            token = _begin_code_session(session_id, current_code, code_dirty)
+            # contextvar 绑定必须留在协程内（to_thread 里 set 不会传播回来）；
+            # 磁盘读写（load/save_session_code）下沉线程，不卡事件循环上的并发 SSE 流
+            token = _current_session_id.set(session_id)
+            await asyncio.to_thread(_reconcile_code_sync, session_id, current_code, code_dirty)
             base_code = _get_current_code()  # 协调后的基准代码
             try:
                 config = {"configurable": {"thread_id": session_id}, "recursion_limit": 500}
@@ -1432,7 +1474,8 @@ class GameDesignAgent:
                 )
 
                 reply = _strip_control_tokens(result["messages"][-1].content)  # 兼容 str / 分块 list
-                _autocommit_staging(session_id)  # 兜底提交忘了 more=False 的分段写入
+                # 兜底提交忘了 more=False 的分段写入；命中提交分支会整份落盘，下沉线程
+                await asyncio.to_thread(_autocommit_staging, session_id)
 
                 # 自检 + 自修闭环（非流式）：质检→有问题就让模型修→再判
                 if settings.self_check_enabled:
@@ -1451,7 +1494,7 @@ class GameDesignAgent:
                             ),
                             settings.turn_deadline_seconds,
                         )
-                        _autocommit_staging(session_id)
+                        await asyncio.to_thread(_autocommit_staging, session_id)
                         new_reply = _strip_control_tokens(rep["messages"][-1].content)  # 兼容 str / 分块 list
                         if new_reply.strip():  # 修复回合可能以工具调用收尾、正文为空 → 别用空串覆盖主回合总结
                             reply = new_reply
@@ -1510,8 +1553,14 @@ class GameDesignAgent:
                                     "result": c[:200] + "..." if len(c) > 200 else c})
                         edited = _get_current_code()
                         if edited != ss["last_code_sent"]:
-                            ss["last_code_sent"] = edited
-                            evs.append({"type": "code_update", "code": edited, "source": name})
+                            now = time.time()
+                            if now - ss.get("last_code_emit_ts", 0.0) >= CODE_UPDATE_DEBOUNCE_SECONDS:
+                                ss["last_code_sent"] = edited
+                                ss["last_code_emit_ts"] = now
+                                ss["code_pushed"] = True
+                                evs.append({"type": "code_update", "code": edited, "source": name})
+                            # else: 距上次推送太近，跳过中间版本（不更新 last_code_sent，
+                            # 回合结束/自修后的兜底推送会补发最终代码，正确性不受影响）
         return evs
 
     async def _run_agent_stream(self, user_content, config, ss):
@@ -1561,10 +1610,11 @@ class GameDesignAgent:
             ss["full_reply"] = ""  # 自修回合的正文不要拼接到主回合总结后面（与非流式 chat 的"替换"语义一致）
             async for ev in self._run_agent_stream(self._build_repair_message(issues), config, ss):
                 yield ev
-            _autocommit_staging(session_id)
+            await asyncio.to_thread(_autocommit_staging, session_id)
             new_code = _get_current_code()
             if new_code != ss["last_code_sent"]:
                 ss["last_code_sent"] = new_code
+                ss["code_pushed"] = True
                 yield {"type": "code_update", "code": new_code, "source": "self_repair"}
             code = new_code
         final = await verify_game(code, use_headless=settings.self_check_headless)
@@ -1583,21 +1633,28 @@ class GameDesignAgent:
         try:
             await lock.acquire()
             acquired = True
-            token = _begin_code_session(session_id, current_code, code_dirty)
+            # contextvar 绑定必须留在协程内（to_thread 里 set 不会传播回来）；
+            # 磁盘读写（load/save_session_code）下沉线程，不卡事件循环上的并发 SSE 流
+            token = _current_session_id.set(session_id)
+            await asyncio.to_thread(_reconcile_code_sync, session_id, current_code, code_dirty)
             base_code = _get_current_code()  # 协调后的基准代码
-            # 流状态：full_reply 累积文本、last_code_sent 去重 code_update、ctx_key 去重 context_usage
-            ss = {"session_id": session_id, "full_reply": "", "last_code_sent": base_code, "ctx_key": None}
+            # 流状态：full_reply 累积文本、last_code_sent/last_code_emit_ts 去重+去抖 code_update、
+            # code_pushed 标记本回合是否真的推送过 code_update（done 事件据此省掉重复全量代码）、
+            # ctx_key 去重 context_usage
+            ss = {"session_id": session_id, "full_reply": "", "last_code_sent": base_code,
+                  "last_code_emit_ts": 0.0, "code_pushed": False, "ctx_key": None}
 
             async with asyncio.timeout(settings.turn_deadline_seconds):  # 单回合墙钟上限（含自修），防失控长跑
                 # 主回合：模型生成
                 async for ev in self._run_agent_stream(self._build_message(user_message, base_code), config, ss):
                     yield ev
 
-                # 主回合结束：兜底提交分段写入，并把新代码补发给前端
-                _autocommit_staging(session_id)
+                # 主回合结束：兜底提交分段写入（命中提交分支会整份落盘，下沉线程），并把新代码补发给前端
+                await asyncio.to_thread(_autocommit_staging, session_id)
                 edited_code = _get_current_code()
                 if edited_code != ss["last_code_sent"] and edited_code != base_code:
                     ss["last_code_sent"] = edited_code
+                    ss["code_pushed"] = True
                     yield {"type": "code_update", "code": edited_code, "source": "write_game"}
 
                 # ★ 自检 + 自修闭环：生成游戏后自动质检，发现"看不到/玩不了/报错"类问题让模型自修后再返回
@@ -1607,7 +1664,10 @@ class GameDesignAgent:
 
             code = self._resolve_final_code(base_code, ss["full_reply"])
             action = "generate" if code and not base_code else "edit" if code else "chat"
-            yield {"type": "done", "code": code, "action": action}
+            # 本回合已通过 code_update 推过同样内容时，done 不再重复携带整份代码
+            # （app.js 仅在未收到过 code_update 时才用 done.code 兜底；routes.py 对空值有 or 兜底）
+            done_code = None if (code and ss["code_pushed"] and code == ss["last_code_sent"]) else code
+            yield {"type": "done", "code": done_code, "action": action}
 
         except asyncio.CancelledError:
             # 用户取消/断开：客户端已收不到任何事件，且取消必须向上传播
@@ -1656,8 +1716,10 @@ class GameDesignAgent:
             await self._ensure_agent()
             if self.checkpointer:
                 await self.checkpointer.adelete_thread(session_id)
-        except Exception:
-            pass
+        except Exception as e:
+            # 不能静默吞：删除失败时完整对话历史仍残留在 checkpoint sqlite 里
+            # （内存清理不碰 checkpoint DB），必须在日志里可排查
+            logger.warning("checkpoint_delete_failed", session_id=session_id, error=str(e))
         # ⚠️ 必须持有会话锁再清理：否则与正在进行的 chat/chat_stream 回合（读改写生效代码）
         # 交错执行，会丢编辑/留下不一致状态。也【不要】pop 锁对象——pop 掉会让正在等锁的
         # 并发回合拿到一把新锁、失去串行化。
