@@ -396,5 +396,209 @@ function drawHUD() {
 }
 ```"""
     },
+    {
+        "title": "Canvas 2D 模拟 3D 渲染 — 魔方/立方体等旋转物体",
+        "category": "3d-rendering",
+        "tags": ["3d", "cube", "rubik", "透视投影", "深度排序", "背面剔除", "向量"],
+        "content": """# Canvas 2D 模拟 3D 渲染的正确姿势
+
+## ⚠️ 最容易出错的点（反复踩坑总结）
+
+| 陷阱 | 错误做法 | 正确做法 |
+|------|---------|---------|
+| 投影返回值类型 | 返回普通 `{x,y,z}` 对象 | 返回普通对象即可，**不要**在后续对投影结果调用 V3 方法 |
+| 背面剔除 | 在世界空间判 `z>0` | 法线变换到**视角空间**后判 `vn.z <= 0` 跳过（背向相机） |
+| 深度排序 | 按投影后 `z` 排序 | 先 project 拿 z，排序后再 drawFace（远→近） |
+| 面色判定 | 复杂条件 `x===0||z===0` | 用 `orig`（初始局部坐标）判断该面是否在魔方外层 |
+| 旋转后量化 | 不量化，浮点累积 | `Math.round(orig)` 到 -1/0/1（防止漂移） |
+| DPR 适配 | `ctx.scale(dpr)` | `ctx.setTransform(dpr,0,0,dpr,0,0)`（一劳永逸，不叠加） |
+| 顶点生成 | 手动加减坐标 | 用法线 `n` 动态计算切线 `u = n×temp`，再 `center + u*h + v*h` |
+
+## 完整可运行的 3D 魔方参考代码
+
+```html
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>3D 魔方</title>
+<style>
+    body { margin:0; overflow:hidden; background:#1a1a2e; font-family:'Segoe UI',sans-serif; user-select:none; touch-action:none; }
+    canvas { display:block; width:100vw; height:100vh; }
+    #ui { position:absolute; top:20px; left:20px; color:#fff; pointer-events:none; text-shadow:0 2px 4px rgba(0,0,0,.5); }
+    #ui h1 { font-size:24px; margin:0 0 8px; letter-spacing:2px; }
+    .hint { position:absolute; bottom:24px; width:100%; text-align:center; color:#888; font-size:13px; pointer-events:none; }
+</style>
+</head>
+<body>
+<div id="ui"><h1>3D 魔方</h1><div id="mc" style="font-size:16px;opacity:.85;">步数: 0</div></div>
+<div class="hint">拖拽旋转视角 | 键盘 U D L R F B 旋转层 | 空格 重置</div>
+<canvas id="c"></canvas>
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const $mc = document.getElementById('mc');
+let W, H, dpr;
+function resize() {
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    W = window.innerWidth; H = window.innerHeight;
+    canvas.width = W * dpr; canvas.height = H * dpr;
+    canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+window.addEventListener('resize', resize); resize();
+
+const C = { U:'#FFF', D:'#FF0', L:'#F80', R:'#F00', F:'#0A0', B:'#00F', INNER:'#1a1a1a' };
+
+// ---- V3: 不可变向量（所有操作返回新实例）----
+class V3 {
+    constructor(x=0,y=0,z=0) { this.x=x;this.y=y;this.z=z; }
+    add(b) { return new V3(this.x+b.x, this.y+b.y, this.z+b.z); }
+    sub(b) { return new V3(this.x-b.x, this.y-b.y, this.z-b.z); }
+    mul(s) { return new V3(this.x*s, this.y*s, this.z*s); }
+    dot(b) { return this.x*b.x + this.y*b.y + this.z*b.z; }
+    cross(b) { return new V3(this.y*b.z-this.z*b.y, this.z*b.x-this.x*b.z, this.x*b.y-this.y*b.x); }
+    len() { return Math.sqrt(this.x*this.x+this.y*this.y+this.z*this.z); }
+    norm() { const l=this.len(); return l<1e-9?new V3():new V3(this.x/l,this.y/l,this.z/l); }
+}
+function rotX(v,a) { const c=Math.cos(a),s=Math.sin(a); return new V3(v.x, v.y*c-v.z*s, v.y*s+v.z*c); }
+function rotY(v,a) { const c=Math.cos(a),s=Math.sin(a); return new V3(v.x*c+v.z*s, v.y, -v.x*s+v.z*c); }
+function rotZ(v,a) { const c=Math.cos(a),s=Math.sin(a); return new V3(v.x*c-v.y*s, v.x*s+v.y*c, v.z); }
+
+// ---- Cubelet ----
+class Cubelet {
+    constructor(x, y, z) {
+        this.p = new V3(x, y, z);       // 当前位置
+        this.orig = new V3(x, y, z);    // 初始位置（判断面色归属）
+    }
+    getFaces() {
+        const faces = [];
+        const h = 0.46;
+        const dirs = [
+            { n: new V3(0,-1,0), k:'U' }, { n: new V3(0,1,0), k:'D' },
+            { n: new V3(-1,0,0), k:'L' }, { n: new V3(1,0,0), k:'R' },
+            { n: new V3(0,0,1), k:'F' },  { n: new V3(0,0,-1), k:'B' },
+        ];
+        for (const d of dirs) {
+            const o = this.orig, n = d.n;
+            const outer =
+                (n.x===-1&&o.x===-1)||(n.x===1&&o.x===1)||
+                (n.y===-1&&o.y===-1)||(n.y===1&&o.y===1)||
+                (n.z===1&&o.z===1)||(n.z===-1&&o.z===-1);
+            faces.push({ n:d.n, c:outer?C[d.k]:C.INNER });
+        }
+        return faces;
+    }
+    rotate(axis, angle) {
+        const fn = axis==='x'?rotX:axis==='y'?rotY:rotZ;
+        this.p = fn(this.p, angle);
+        this.orig = fn(this.orig, angle);
+        this.orig.x = Math.round(this.orig.x);
+        this.orig.y = Math.round(this.orig.y);
+        this.orig.z = Math.round(this.orig.z);
+    }
+}
+
+// ---- 全局 ----
+let cubes = [], moves = 0;
+let vRY = 0.7, vRX = -0.5;
+function init() {
+    cubes = [];
+    for (let x=-1; x<=1; x++) for (let y=-1; y<=1; y++) for (let z=-1; z<=1; z++)
+        cubes.push(new Cubelet(x, y, z));
+    moves = 0; $mc.textContent = '步数: 0';
+}
+
+function rotLayer(axis, layer, angle) {
+    for (const c of cubes) {
+        const v = axis==='x'?c.orig.x:axis==='y'?c.orig.y:c.orig.z;
+        if (Math.abs(v - layer) < 0.1) c.rotate(axis, angle);
+    }
+    moves++; $mc.textContent = '步数: ' + moves;
+}
+
+// ---- 渲染 ----
+function proj(w) {
+    let v = rotX(w, vRX);
+    v = rotY(v, vRY);
+    const f = 400 / (6 + v.z);
+    return { x: W/2 + v.x*100*f, y: H/2 - v.y*100*f, z: v.z };
+}
+
+function faceVerts(c, n) {
+    const h = 0.45;
+    const t = Math.abs(n.x)<0.9 ? new V3(1,0,0) : new V3(0,1,0);
+    const u = n.cross(t).norm();
+    const v = n.cross(u).norm();
+    const cen = c.p.add(n.mul(h));
+    return [cen.add(u.mul(h)).add(v.mul(h)), cen.add(u.mul(-h)).add(v.mul(h)),
+            cen.add(u.mul(-h)).add(v.mul(-h)), cen.add(u.mul(h)).add(v.mul(-h))];
+}
+
+function drawFace(pts3, color) {
+    const pts = pts3.map(proj);
+    const cross = (pts[1].x-pts[0].x)*(pts[2].y-pts[0].y) - (pts[1].y-pts[0].y)*(pts[2].x-pts[0].x);
+    if (cross <= 0) return;
+    ctx.fillStyle = color; ctx.strokeStyle = 'rgba(0,0,0,.5)'; ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(pts[0].x,pts[0].y); ctx.lineTo(pts[1].x,pts[1].y);
+    ctx.lineTo(pts[2].x,pts[2].y); ctx.lineTo(pts[3].x,pts[3].y);
+    ctx.closePath(); ctx.fill(); ctx.stroke();
+}
+
+function drawC(c) {
+    for (const f of c.getFaces()) {
+        let vn = rotX(f.n, vRX); vn = rotY(vn, vRY);
+        if (vn.z <= 0) continue; // 视角空间背面剔除
+        drawFace(faceVerts(c, f.n), f.c);
+    }
+}
+
+function loop() {
+    ctx.clearRect(0, 0, W, H);
+    const projCubes = cubes.map(c => ({ c, z: proj(c.p).z }));
+    projCubes.sort((a, b) => a.z - b.z);
+    for (const { c } of projCubes) drawC(c);
+    requestAnimationFrame(loop);
+}
+
+// ---- 交互 ----
+let dragging = false, lx = 0, ly = 0;
+canvas.addEventListener('pointerdown', e => { dragging=true; lx=e.clientX; ly=e.clientY; });
+window.addEventListener('pointermove', e => {
+    if (!dragging) return;
+    vRY += (e.clientX-lx)*0.008; vRX += (e.clientY-ly)*0.008;
+    lx=e.clientX; ly=e.clientY;
+});
+window.addEventListener('pointerup', () => dragging=false);
+window.addEventListener('keydown', e => {
+    const k = e.key.toUpperCase(), T = Math.PI/2;
+    if (k==='U') rotLayer('y',-1,-T); if (k==='D') rotLayer('y',1,T);
+    if (k==='L') rotLayer('x',-1,-T); if (k==='R') rotLayer('x',1,T);
+    if (k==='F') rotLayer('z',1,T);  if (k==='B') rotLayer('z',-1,-T);
+    if (k===' ') init();
+});
+init(); loop();
+</script>
+</body>
+</html>
+```
+
+## 关键渲染流程（严格照此顺序）
+
+1. **resize**: `setTransform(dpr,0,0,dpr,0,0)` + `canvas.style.width/height`
+2. **每帧**: `clearRect` → 所有 cubelet 投影拿 z → **按 z 排序（远→近）** → 逐个 drawC
+3. **drawC**: 6 个面 → 法线变到视角空间 → `vn.z <= 0` 跳过 → `faceVerts` 算顶点 → `drawFace`
+4. **drawFace**: 投影 4 个顶点 → 2D 叉积背面剔除 → fill + stroke
+5. **旋转层**: 改 cubelet 的 `p` 和 `orig` → `Math.round(orig)` 量化防止漂移
+
+## 如果生成 3D 游戏，请严格参考上述代码的结构和数学逻辑，避免：
+- ❌ 在世界空间判背面（方向随视角变化会反）
+- ❌ 对 project() 返回的普通对象调 V3 方法
+- ❌ 旋转后不量化 orig（浮点累积漂移）
+- ❌ 忘记 canvas.style.width/height（高分屏放大）
+- ❌ 使用 ctx.scale(dpr)（叠加缩放）"""
+    },
 ]
 

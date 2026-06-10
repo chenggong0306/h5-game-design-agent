@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>3D 魔方</title>
+<style>
+    body { margin:0; overflow:hidden; background:#1a1a2e; font-family:'Segoe UI',sans-serif; user-select:none; touch-action:none; }
+    canvas { display:block; width:100vw; height:100vh; }
+    #ui { position:absolute; top:20px; left:20px; color:#fff; pointer-events:none; text-shadow:0 2px 4px rgba(0,0,0,.5); }
+    #ui h1 { font-size:24px; margin:0 0 8px; letter-spacing:2px; }
+    #ui .stat { font-size:16px; opacity:.85; }
+    .hint { position:absolute; bottom:24px; width:100%; text-align:center; color:#888; font-size:13px; pointer-events:none; line-height:1.7; }
+</style>
+</head>
+<body>
+<div id="ui"><h1>3D 魔方</h1><div id="moveCount" class="stat">步数: 0</div></div>
+<div class="hint">拖拽背景旋转视角 &nbsp;|&nbsp; 键盘 U D L R F B 旋转层 &nbsp;|&nbsp; 空格 重置</div>
+<canvas id="c"></canvas>
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const $mc = document.getElementById('moveCount');
+
+let W, H, dpr;
+function resize() {
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    W = window.innerWidth; H = window.innerHeight;
+    canvas.width = W * dpr; canvas.height = H * dpr;
+    canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+window.addEventListener('resize', resize); resize();
+
+// ---- 6 面颜色 ----
+const C = {
+    U: '#FFFFFF', // 上 白
+    D: '#FFFF00', // 下 黄
+    L: '#FF8C00', // 左 橙
+    R: '#FF0000', // 右 红
+    F: '#00AA00', // 前 绿
+    B: '#0000FF', // 后 蓝
+    INNER: '#1a1a1a',
+};
+
+// ---- Vec3 ----
+class V3 {
+    constructor(x=0,y=0,z=0) { this.x=x;this.y=y;this.z=z; }
+    add(b) { return new V3(this.x+b.x, this.y+b.y, this.z+b.z); }
+    sub(b) { return new V3(this.x-b.x, this.y-b.y, this.z-b.z); }
+    mul(s) { return new V3(this.x*s, this.y*s, this.z*s); }
+    dot(b) { return this.x*b.x + this.y*b.y + this.z*b.z; }
+    cross(b) { return new V3(this.y*b.z-this.z*b.y, this.z*b.x-this.x*b.z, this.x*b.y-this.y*b.x); }
+    len() { return Math.sqrt(this.x*this.x+this.y*this.y+this.z*this.z); }
+    norm() { const l=this.len(); return l<1e-9?new V3():new V3(this.x/l,this.y/l,this.z/l); }
+}
+
+function rotX(v, a) { const c=Math.cos(a),s=Math.sin(a); return new V3(v.x, v.y*c-v.z*s, v.y*s+v.z*c); }
+function rotY(v, a) { const c=Math.cos(a),s=Math.sin(a); return new V3(v.x*c+v.z*s, v.y, -v.x*s+v.z*c); }
+function rotZ(v, a) { const c=Math.cos(a),s=Math.sin(a); return new V3(v.x*c-v.y*s, v.x*s+v.y*c, v.z); }
+function rotate(v, axis, a) { return axis==='x'?rotX(v,a):axis==='y'?rotY(v,a):rotZ(v,a); }
+
+// ---- 小方块 ----
+class Cubelet {
+    constructor(x, y, z) {
+        this.p = new V3(x, y, z);        // 位置 (局部坐标 -1/0/1)
+        this.orig = new V3(x, y, z);     // 原始位置（用于判断面归属）
+    }
+    // 返回该小方块的所有可见面
+    getFaces() {
+        const faces = [];
+        const h = 0.46; // 半边长（留缝）
+        const dirs = [
+            { n: new V3(0,-1,0), axis:'U' }, // 上
+            { n: new V3(0, 1,0), axis:'D' }, // 下
+            { n: new V3(-1,0,0), axis:'L' }, // 左
+            { n: new V3( 1,0,0), axis:'R' }, // 右
+            { n: new V3(0,0, 1), axis:'F' }, // 前 (z+)
+            { n: new V3(0,0,-1), axis:'B' }, // 后 (z-)
+        ];
+        for (const d of dirs) {
+            // 判断该面是否为外露面：法线方向上该位置处于魔方边界
+            const o = this.orig;
+            const n = d.n;
+            const isOuter =
+                (n.y === -1 && o.y === -1) ||  // 上表面 → y=-1 的小方块的上表面
+                (n.y ===  1 && o.y ===  1) ||  // 下表面
+                (n.x === -1 && o.x === -1) ||  // 左表面
+                (n.x ===  1 && o.x ===  1) ||  // 右表面
+                (n.z ===  1 && o.z ===  1) ||  // 前表面
+                (n.z === -1 && o.z === -1);     // 后表面
+            faces.push({
+                n: d.n,                  // 局部法线
+                c: isOuter ? C[d.axis] : C.INNER,
+            });
+        }
+        return faces;
+    }
+    // 旋转小方块位置
+    rotate(axis, angle) {
+        this.p = rotate(this.p, axis, angle);
+    }
+}
+
+// ---- 全局状态 ----
+let cubelets = [];
+let moves = 0;
+let viewRY = 0.7, viewRX = -0.5;
+
+function initCube() {
+    cubelets = [];
+    for (let x = -1; x <= 1; x++)
+    for (let y = -1; y <= 1; y++)
+    for (let z = -1; z <= 1; z++)
+        cubelets.push(new Cubelet(x, y, z));
+    moves = 0;
+    $mc.textContent = `步数: ${moves}`;
+}
+
+function rotateLayer(axis, layer, angle) {
+    const next = [];
+    for (const c of cubelets) {
+        const val = axis === 'x' ? c.orig.x : axis === 'y' ? c.orig.y : c.orig.z;
+        if (Math.abs(val - layer) < 0.1) {
+            c.rotate(axis, angle);
+            c.orig = rotate(c.orig, axis, angle);
+            // 量化到最近整数 → -1/0/1
+            c.orig.x = Math.round(c.orig.x);
+            c.orig.y = Math.round(c.orig.y);
+            c.orig.z = Math.round(c.orig.z);
+        }
+        next.push(c);
+    }
+    cubelets = next;
+    moves++;
+    $mc.textContent = `步数: ${moves}`;
+}
+
+// ---- 渲染 ----
+function project(worldV) {
+    let v = rotX(worldV, viewRX);
+    v = rotY(v, viewRY);
+    const dist = 6;
+    const f = 400 / (dist + v.z);  // 透视系数
+    return { x: W/2 + v.x * 100 * f, y: H/2 - v.y * 100 * f, z: v.z };
+}
+
+function drawFace(pts3d, color) {
+    const pts = pts3d.map(project);
+    // 2D 叉积判断正反面: 逆时针=正面, 顺时针=背面
+    const cross2d = (pts[1].x-pts[0].x)*(pts[2].y-pts[0].y) - (pts[1].y-pts[0].y)*(pts[2].x-pts[0].x);
+    if (cross2d <= 0) return; // 背面剔除
+
+    ctx.fillStyle = color;
+    ctx.strokeStyle = 'rgba(0,0,0,0.5)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(pts[0].x, pts[0].y);
+    ctx.lineTo(pts[1].x, pts[1].y);
+    ctx.lineTo(pts[2].x, pts[2].y);
+    ctx.lineTo(pts[3].x, pts[3].y);
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+}
+
+function getFaceVertices(c, n) {
+    // 给定小方块位置 p 和面法线 n，计算该面的 4 个顶点
+    const h = 0.45;
+    // 找两个与法线正交的切线向量
+    const t1 = Math.abs(n.x) < 0.9 ? new V3(1,0,0) : new V3(0,1,0);
+    const u = n.cross(t1).norm();
+    const v = n.cross(u).norm();
+    const pos = c.p;
+    // 面心 = pos + n * h
+    const center = pos.add(n.mul(h));
+    // 四个角
+    return [
+        center.add(u.mul(h)).add(v.mul(h)),
+        center.add(u.mul(-h)).add(v.mul(h)),
+        center.add(u.mul(-h)).add(v.mul(-h)),
+        center.add(u.mul(h)).add(v.mul(-h)),
+    ];
+}
+
+function drawCubelet(c) {
+    const faces = c.getFaces();
+    for (const f of faces) {
+        const pts3d = getFaceVertices(c, f.n);
+        // 视图空间法线（用于剔除）
+        let vn = rotX(f.n, viewRX);
+        vn = rotY(vn, viewRY);
+        if (vn.z <= 0) continue; // 法线朝向相机才可见
+        drawFace(pts3d, f.c);
+    }
+}
+
+function loop() {
+    ctx.clearRect(0, 0, W, H);
+
+    // 透视投影 → 按 z 排序（远的先画）
+    const projected = cubelets.map(c => ({ c, z: project(c.p).z }));
+    projected.sort((a, b) => a.z - b.z);
+
+    for (const { c } of projected) drawCubelet(c);
+
+    requestAnimationFrame(loop);
+}
+
+// ---- 交互 ----
+let dragging = false, lastX = 0, lastY = 0;
+canvas.addEventListener('pointerdown', e => { dragging = true; lastX = e.clientX; lastY = e.clientY; });
+window.addEventListener('pointermove', e => {
+    if (!dragging) return;
+    viewRY += (e.clientX - lastX) * 0.008;
+    viewRX += (e.clientY - lastY) * 0.008;
+    lastX = e.clientX; lastY = e.clientY;
+});
+window.addEventListener('pointerup', () => dragging = false);
+window.addEventListener('pointerleave', () => dragging = false);
+
+// 触摸：单手拖视角，双手 pinch 缩放（可选忽略）
+canvas.addEventListener('touchstart', e => {
+    if (e.touches.length === 1) {
+        dragging = true;
+        lastX = e.touches[0].clientX;
+        lastY = e.touches[0].clientY;
+    }
+}, { passive: true });
+canvas.addEventListener('touchmove', e => {
+    if (!dragging || e.touches.length !== 1) return;
+    viewRY += (e.touches[0].clientX - lastX) * 0.008;
+    viewRX += (e.touches[0].clientY - lastY) * 0.008;
+    lastX = e.touches[0].clientX; lastY = e.touches[0].clientY;
+}, { passive: true });
+
+window.addEventListener('keydown', e => {
+    const k = e.key.toUpperCase();
+    const T = Math.PI / 2;
+    if (k === 'U') rotateLayer('y', -1, -T);
+    if (k === 'D') rotateLayer('y',  1,  T);
+    if (k === 'L') rotateLayer('x', -1, -T);
+    if (k === 'R') rotateLayer('x',  1,  T);
+    if (k === 'F') rotateLayer('z',  1,  T);
+    if (k === 'B') rotateLayer('z', -1, -T);
+    if (k === ' ') initCube();
+});
+
+initCube();
+loop();
+</script>
+</body>
+</html>

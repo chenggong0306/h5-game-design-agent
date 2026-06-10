@@ -115,6 +115,41 @@ def _is_blank_png(png_bytes: bytes) -> bool:
         return False
 
 
+def _is_visually_torn(png_bytes: bytes) -> bool:
+    """检测 3D 渲染画面是否出现严重的面片撕裂/碎片化。
+
+    将截图缩到 40×30，计算相邻像素颜色差：正常 3D 场景有少数清晰边缘（低噪声），
+    撕裂画面有大量混乱颜色跳跃（高噪声）。返回 True 表示高度疑似画面破碎。
+    """
+    try:
+        import io
+        from PIL import Image
+        img = Image.open(io.BytesIO(png_bytes)).convert("RGB").resize((40, 30))
+        pixels = list(img.getdata())
+        if not pixels:
+            return False
+        w, h = 40, 30
+        diffs = []
+        for y in range(h):
+            for x in range(w):
+                idx = y * w + x
+                r, g, b = pixels[idx]
+                if x < w - 1:
+                    r2, g2, b2 = pixels[idx + 1]
+                    diffs.append(abs(r - r2) + abs(g - g2) + abs(b - b2))
+                if y < h - 1:
+                    r2, g2, b2 = pixels[idx + w]
+                    diffs.append(abs(r - r2) + abs(g - g2) + abs(b - b2))
+        if not diffs:
+            return False
+        avg = sum(diffs) / len(diffs)
+        # 正常 3D 场景 avg ≈ 20-50，撕裂场景 avg ≈ 80+
+        high = sum(1 for d in diffs if d > 40) / len(diffs)
+        return avg > 70 and high > 0.35
+    except Exception:
+        return False
+
+
 async def run_headless(html: str, timeout_s: float = 15.0) -> list[dict] | None:
     """用 playwright chromium 跑一遍游戏，捕获运行时报错 + 空屏。
     未安装 playwright/chromium 或出错/超时 → 返回 None（视为不可用，降级到纯静态）。
@@ -180,6 +215,10 @@ async def run_headless(html: str, timeout_s: float = 15.0) -> list[dict] | None:
             issues.append({"id": "blank_screen", "severity": "high",
                            "msg": "运行后画面几乎空白（元素可能在屏幕外/未绘制/初始化失败）",
                            "fix": "检查 DPR 与坐标：canvas.style 尺寸、用逻辑 W/H 定位、实体 y 在可视区内"})
+        elif not blank and _is_visually_torn(shot):
+            issues.append({"id": "visual_tearing", "severity": "high",
+                           "msg": "画面出现严重的面片撕裂/碎片化（3D 渲染的顶点计算或投影/背面剔除逻辑有误）",
+                           "fix": "检查 V3 类方法（sub/mul/cross/norm）是否返回正确类型、project() 返回值是否被当成 V3 调用方法、背面剔除是否在视角空间判 vn.z、旋转后 orig 是否 Math.round 量化"})
     except Exception as e:
         logger.warning("headless_verify_failed", error=str(e))
         return None
