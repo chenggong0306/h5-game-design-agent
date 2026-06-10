@@ -224,15 +224,25 @@ CLEAR_TOOL_KEEP = 20
 _context_usage_by_session: dict[str, dict[str, int | bool]] = {}
 
 
+# 每张图片的 token 估算（OpenAI vision: low-res≈85, high-res≈170-1105；保守取 300）
+_IMAGE_TOKEN_ESTIMATE = 300
+
 def _estimate_tokens(text: str) -> int:
     """CJK 感知的近似 token 估算。
 
     count_tokens_approximately 默认 ~4 字符/token（按英文调），会把中文低估 2-3 倍
     （中文约 1 字 ≈ 1 token）。本项目大量中文（system prompt / 技能 / 代码注释），
     故按字符类别分别估算：CJK 约 1 token/字，其余约 3.5 字符/token。
+
+    此外处理 _message_text_for_budget 插入的 [IMAGE] 占位符：每张图按固定值估算，
+    避免 base64 data URL 被逐字符计数（几百 KB → 虚假 70k+ token）。
     """
     if not text:
         return 0
+    image_count = 0
+    if "[IMAGE]" in text:
+        image_count = text.count("[IMAGE]")
+        text = text.replace("[IMAGE]", "")
     cjk = 0
     for ch in text:
         o = ord(ch)
@@ -242,11 +252,34 @@ def _estimate_tokens(text: str) -> int:
                 or 0xFF00 <= o <= 0xFFEF):                     # 全角符号
             cjk += 1
     other = len(text) - cjk
-    return max(1, int(cjk + other / 3.5))
+    text_tokens = max(1, int(cjk + other / 3.5))
+    return text_tokens + image_count * _IMAGE_TOKEN_ESTIMATE
 
 
 def _message_text_for_budget(message) -> str:
-    parts = [str(getattr(message, "content", "") or "")]
+    """提取消息中「对上下文预算有贡献」的文本部分。
+
+    关键：当 content 是多模态列表（文本 + 图片块）时，跳过 base64 image_url，
+    用固定估算替代 —— 否则几百 KB 的 base64 被逐字符计数会虚假拉高 70k+ token。
+    """
+    content = getattr(message, "content", None) or ""
+    if isinstance(content, list):
+        # 多模态消息：只收文本块，图片用标记占位（后续 token 计数加固定开销）
+        parts = []
+        for block in content:
+            if isinstance(block, dict):
+                t = block.get("type", "")
+                if t in ("text", "input_text", "output_text"):
+                    parts.append(str(block.get("text", "") or ""))
+                elif t == "image_url":
+                    parts.append("[IMAGE]")  # 用 ~300 token 固定成本，不计 base64
+                elif isinstance(block, str):
+                    parts.append(block)
+            elif isinstance(block, str):
+                parts.append(block)
+        content = "\n".join(parts)
+    content = str(content or "")
+    parts = [content]
     for tc in getattr(message, "tool_calls", []) or []:
         parts.append(str(tc))
     return "\n".join(parts)
