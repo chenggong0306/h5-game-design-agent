@@ -10,6 +10,7 @@ import tempfile
 import threading
 import uuid
 import zipfile
+import zlib
 
 from datetime import datetime, timezone
 from pathlib import Path
@@ -73,11 +74,14 @@ _ALLOWED_ASSET_TYPES = {"image", "audio", "spritesheet", "tilemap", "font"}
 # 扩展名按素材类型白名单（取代旧黑名单）：黑名单挡不住 .xhtml/.xht/.svgz 这类
 # mimetypes 会推断成可渲染类型的漏网项——浏览器同源内联渲染并执行其中脚本即存储型 XSS。
 # 不在白名单一律拒绝；上传入口与 serve 出口都按此校验（磁盘历史遗留文件也不回源）。
+# 白名单覆盖所有无浏览器脚本执行风险的常见格式（位图/无损音频/Tiled 地图等都安全；
+# 危险的是 .svg/.svgz/.html/.xhtml 这类可同源渲染并执行脚本的——保持拒绝）。
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico", ".avif", ".tif", ".tiff"}
 _ALLOWED_ASSET_EXTS: dict[str, set[str]] = {
-    "image": {".png", ".jpg", ".jpeg", ".gif", ".webp"},
-    "audio": {".mp3", ".wav", ".ogg", ".m4a"},
-    "spritesheet": {".png", ".jpg", ".jpeg", ".gif", ".webp"},
-    "tilemap": {".json"},
+    "image": _IMAGE_EXTS,
+    "audio": {".mp3", ".wav", ".ogg", ".m4a", ".flac", ".aac", ".opus"},
+    "spritesheet": _IMAGE_EXTS,
+    "tilemap": {".json", ".tmx"},  # .tmx 是 Tiled 的 XML 地图：回源带 nosniff，不会被当文档渲染
     "font": {".ttf", ".otf", ".woff", ".woff2"},
 }
 # 文件名：无前导点、无 ".."、仅限安全字符（防穿越）
@@ -119,21 +123,32 @@ def _history_path(session_id: str) -> Path:
     return CHAT_HISTORY_DIR / f"{session_id}.json"
 
 
-# 聊天历史的 per-session 线程锁：_append_chat_history 经 asyncio.to_thread 在线程池里跑，
-# 同会话并发请求（多标签页共享 localStorage 里的 session_id / 重复点击）的
-# load→append→save 读改写会互相覆盖丢消息，必须互斥。用线程锁而非 asyncio.Lock，
-# 因为竞争发生在工作线程之间。锁的创建本身用全局守卫锁防两个线程各建一把。
-_history_locks: dict[str, threading.Lock] = {}
-_history_locks_guard = threading.Lock()
+# 聊天历史的线程锁：读写都经 asyncio.to_thread 在线程池里跑，同会话并发请求
+# （多标签页共享 localStorage 里的 session_id / 重复点击）的 load→append→save
+# 读改写会互相覆盖丢消息；Windows 上 os.replace 还会与并发裸读互斥失败（共享冲突）。
+# 用固定数量的哈希分桶锁而非 per-session 字典：海量唯一 session_id 不会让锁表
+# 无限增长（与上面限流表同型的内存 DoS），碰撞只造成无害的跨会话串行化。
+_HISTORY_LOCKS = [threading.Lock() for _ in range(64)]
 
 
 def _history_lock(session_id: str) -> threading.Lock:
-    with _history_locks_guard:
-        lock = _history_locks.get(session_id)
-        if lock is None:
-            lock = threading.Lock()
-            _history_locks[session_id] = lock
-        return lock
+    digest = zlib.crc32(session_id.encode("utf-8", "surrogatepass"))
+    return _HISTORY_LOCKS[digest & 63]
+
+
+def _read_text_retry(path: Path, attempts: int = 4, delay: float = 0.015) -> str:
+    """读文件，对 Windows 共享冲突（os.replace 进行中 / 杀软短暂独占）做有界重试。
+
+    进程内的读写已由 _history_lock 互斥，这里只兜外部进程（Defender、编辑器）的短暂占用。
+    """
+    while True:
+        try:
+            return path.read_text(encoding="utf-8")
+        except PermissionError:
+            attempts -= 1
+            if attempts <= 0:
+                raise
+            _time.sleep(delay)
 
 
 def _load_chat_history(session_id: str) -> list[dict]:
@@ -141,16 +156,32 @@ def _load_chat_history(session_id: str) -> list[dict]:
     if not path.exists():
         return []
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception as e:
-        # 不能静默清零：下一次 append 会用空列表整体覆盖、全部历史无声丢失。
-        # 把坏文件改名备份留痕（.corrupt.bak 不再匹配 *.json glob），再从空开始。
+        raw = _read_text_retry(path)
+    except OSError as e:
+        # 瞬态读失败（共享冲突/磁盘问题）≠ 文件损坏：不能走改名分支把健康历史
+        # 错当损坏备份掉。向上抛出，让 append 路径跳过本条、读取路径返回空。
+        logger.error("聊天历史读取失败 (session=%s): %s", session_id, e)
+        raise
+    try:
+        return json.loads(raw)
+    except ValueError as e:
+        # 真正的内容损坏才走这里。不能静默清零：下一次 append 会用空列表整体覆盖、
+        # 全部历史无声丢失。把坏文件改名备份留痕（.corrupt.bak 不再匹配 *.json glob）。
         logger.error("聊天历史损坏，已备份为 .corrupt.bak 后从空开始 (session=%s): %s", session_id, e)
         try:
             os.replace(path, path.with_name(path.name + ".corrupt.bak"))
         except OSError as be:
             logger.error("聊天历史损坏文件备份失败 (session=%s): %s", session_id, be)
         return []
+
+
+def _load_chat_history_or_empty(session_id: str) -> list[dict]:
+    """只读场景（历史接口/列表）：持锁读，瞬态失败降级为空列表而非 500。"""
+    with _history_lock(session_id):
+        try:
+            return _load_chat_history(session_id)
+        except OSError:
+            return []
 
 
 def _save_chat_history(session_id: str, history: list[dict]) -> None:
@@ -161,7 +192,17 @@ def _save_chat_history(session_id: str, history: list[dict]) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(json.dumps(history, ensure_ascii=False, indent=2))
-        os.replace(tmp_path, path)
+        replace_attempts = 4
+        while True:
+            try:
+                os.replace(tmp_path, path)
+                break
+            except PermissionError:
+                # Windows：目标文件被外部进程短暂打开时 MoveFileEx 报共享冲突，重试几次
+                replace_attempts -= 1
+                if replace_attempts <= 0:
+                    raise
+                _time.sleep(0.015)
     except BaseException:
         try:
             os.unlink(tmp_path)
@@ -172,7 +213,12 @@ def _save_chat_history(session_id: str, history: list[dict]) -> None:
 
 def _append_chat_history(session_id: str, role: str, content: str, extra: dict | None = None) -> None:
     with _history_lock(session_id):  # 读改写全程持锁，防同会话并发 append 互相覆盖
-        history = _load_chat_history(session_id)
+        try:
+            history = _load_chat_history(session_id)
+        except OSError:
+            # 读不出来时宁可丢这一条消息也不能用空列表覆盖整个历史文件
+            logger.error("聊天历史暂不可读，跳过本条消息持久化 (session=%s, role=%s)", session_id, role)
+            return
         item = {
             "role": role,
             "content": content,
@@ -193,7 +239,7 @@ def _get_latest_code_from_history(history: list[dict]) -> str:
 
 
 def _build_session_summary(session_id: str) -> dict:
-    history = _load_chat_history(session_id)
+    history = _load_chat_history_or_empty(session_id)
     title = "新对话"
     for item in history:
         if item.get("role") == "user" and item.get("content"):
@@ -343,9 +389,11 @@ async def chat_stream(req: ChatRequest):
             yield f"data: {json.dumps({'type': 'error', 'content': '请求过于频繁，请稍候再试', 'error_code': 'RATE_LIMIT_EXCEEDED'}, ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
             return
-        await asyncio.to_thread(_append_chat_history, session_id, "user", req.message,
-                                {"images": image_meta} if image_meta else None)
         try:
+            # user 落历史必须在 try 内：append 异常（磁盘满/共享冲突重试耗尽）若逃出
+            # event_generator，SSE 既无 error 事件也无 [DONE]，前端流无声中断
+            await asyncio.to_thread(_append_chat_history, session_id, "user", req.message,
+                                    {"images": image_meta} if image_meta else None)
             async for chunk in agent.chat_stream(
                 session_id=session_id,
                 user_message=user_content,
@@ -406,7 +454,7 @@ async def get_chat_history(session_id: str):
     仅当磁盘没有时才回退到聊天历史里的快照（兼容旧会话）。
     """
     from src.utils.persistence import load_session_code
-    history = await asyncio.to_thread(_load_chat_history, session_id)
+    history = await asyncio.to_thread(_load_chat_history_or_empty, session_id)
     latest_code = (await asyncio.to_thread(load_session_code, session_id)) or _get_latest_code_from_history(history)
     return {
         "session_id": session_id,
@@ -420,8 +468,14 @@ async def clear_chat(session_id: str):
     """清除对话历史"""
     await agent.clear_session(session_id)
     path = _history_path(session_id)
-    # unlink 放线程（磁盘慢/杀软扫描时别卡事件循环）；missing_ok 顺带消除 exists/unlink 的 TOCTOU
-    await asyncio.to_thread(lambda: path.unlink(missing_ok=True))
+
+    # unlink 放线程（磁盘慢/杀软扫描时别卡事件循环）；missing_ok 顺带消除 exists/unlink 的
+    # TOCTOU；持历史锁防与进行中的 append 交错（清除后又被旧回合写回半截历史）
+    def _unlink_history():
+        with _history_lock(session_id):
+            path.unlink(missing_ok=True)
+
+    await asyncio.to_thread(_unlink_history)
     return {"ok": True}
 
 

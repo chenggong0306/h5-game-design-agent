@@ -742,9 +742,11 @@ async function sendMessage(messageOverride = null, options = {}) {
                         scheduleStreamRender(activeStreamState);
 
                     } else if (event.type === 'code_update') {
-                        if (editor && event.code) {
+                        if (event.code) {
                             // 流式期间只更新编辑器文本，不在此刷新预览（避免多段编辑反复重载/闪屏），
-                            // 统一在 done 时跑一次
+                            // 统一在 done 时跑一次。Monaco 未就绪时 applyEditorCode 会缓存到
+                            // pendingLatestCode，初始化回调里恢复并 runGame——这里不能因 editor
+                            // 为 null 丢弃事件：done.code 在后端已推送过时为 null，丢了就两头皆空
                             applyEditorCode(event.code);
                             activeStreamState.codeUpdated = true;
                         }
@@ -1384,10 +1386,15 @@ document.getElementById('btn-add-skill').addEventListener('click', async () => {
     try {
         if (btn.dataset.mode === 'edit') {
             const oldRes = await fetch(`/api/skills/${encodeURIComponent(name)}`);
-            await ensureOk(oldRes);
-            const backup = await oldRes.json();
-            await ensureOk(await fetch(`/api/skills/${encodeURIComponent(name)}`, { method: 'DELETE' }));
-            oldSkill = backup; // 删除确实成功后才需要回滚
+            if (oldRes.status === 404) {
+                // 旧技能已不存在（弹窗里被删 / 另一标签页删除）：跳过删除直接新建，
+                // 否则保存被永久阻断且表单卡死在编辑模式
+            } else {
+                await ensureOk(oldRes);
+                const backup = await oldRes.json();
+                await ensureOk(await fetch(`/api/skills/${encodeURIComponent(name)}`, { method: 'DELETE' }));
+                oldSkill = backup; // 删除确实成功后才需要回滚
+            }
         }
         const res = await fetch('/api/skills', {
             method: 'POST',
@@ -1476,6 +1483,12 @@ document.getElementById('skill-import-file').addEventListener('change', async (e
             if (!res.ok) { const d = await res.json(); throw new Error(d.detail); }
             const result = await res.json();
             added = result.added || 0;
+            if (result.errors && result.errors.length) {
+                alert(`✅ 导入 ${added} 个技能，${result.errors.length} 个文件失败：\n` + result.errors.join('\n'));
+                await loadSkills();
+                e.target.value = '';
+                return;
+            }
         } else {
             alert('不支持的文件格式，请使用 .json / .md / .zip');
             e.target.value = '';

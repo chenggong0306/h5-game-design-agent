@@ -1506,6 +1506,24 @@ class GameDesignAgent:
                 _end_code_session(token)
 
     @staticmethod
+    def _pending_code_events(ss: dict | None) -> list[dict]:
+        """回合异常中止（超时/系统错误）时，补发已落盘但被去抖跳过的最终代码。
+
+        ss 为 None 表示异常发生在流状态建立之前（无代码可补）。contextvar 此刻
+        仍然绑定（finally 还没跑），_get_current_code 读的就是本会话。"""
+        if not ss:
+            return []
+        try:
+            code = _get_current_code()
+        except Exception:
+            return []
+        if not code or code == ss["last_code_sent"]:
+            return []
+        ss["last_code_sent"] = code
+        ss["code_pushed"] = True
+        return [{"type": "code_update", "code": code, "source": "write_game"}]
+
+    @staticmethod
     def _resolve_final_code(base_code: str, reply: str) -> str:
         """回合结束后确定要返回/落库的代码，工具写好的缓冲区为唯一真相源。
 
@@ -1629,6 +1647,7 @@ class GameDesignAgent:
         config = {"configurable": {"thread_id": session_id}, "recursion_limit": 500}
         token = None
         acquired = False
+        ss = None  # 提前声明：超时/异常分支要靠它补发被去抖跳过的最终代码
 
         try:
             await lock.acquire()
@@ -1649,10 +1668,13 @@ class GameDesignAgent:
                 async for ev in self._run_agent_stream(self._build_message(user_message, base_code), config, ss):
                     yield ev
 
-                # 主回合结束：兜底提交分段写入（命中提交分支会整份落盘，下沉线程），并把新代码补发给前端
+                # 主回合结束：兜底提交分段写入（命中提交分支会整份落盘，下沉线程），并把新代码补发给前端。
+                # 条件只看 != last_code_sent：去抖可能跳过"把代码改回 base"的回退式编辑
+                # （此时 last_code_sent 还停在中间版本），若再加 != base_code 会拦住这次补发，
+                # 前端就停留在中间版本、与服务端权威代码分叉
                 await asyncio.to_thread(_autocommit_staging, session_id)
                 edited_code = _get_current_code()
-                if edited_code != ss["last_code_sent"] and edited_code != base_code:
+                if edited_code != ss["last_code_sent"]:
                     ss["last_code_sent"] = edited_code
                     ss["code_pushed"] = True
                     yield {"type": "code_update", "code": edited_code, "source": "write_game"}
@@ -1678,20 +1700,30 @@ class GameDesignAgent:
             log_error(session_id, ErrorCode.SYSTEM_ERROR, "内存不足", e)
             yield {"type": "error", "content": "内存不足，请减少代码长度或重启服务", "error_code": ErrorCode.SYSTEM_ERROR}
         except TimeoutError as e:
-            # 超时
+            # 超时：先把已落盘但被去抖跳过的最终代码补发出去，再报错——
+            # 否则最后一次编辑只存在于服务端，前端停留在中间版本直到下一回合
             log_error(session_id, "TIMEOUT", "请求超时", e)
+            for ev in self._pending_code_events(ss):
+                yield ev
             yield {"type": "error", "content": "请求超时，请稍后重试", "error_code": "TIMEOUT"}
         except Exception as e:
             # 其他未知错误，记录详细信息
             log_error(session_id, ErrorCode.SYSTEM_ERROR, f"chat_stream 异常: {str(e)}", e)
+            for ev in self._pending_code_events(ss):
+                yield ev
             yield {"type": "error", "content": f"系统错误: {str(e)}", "error_code": ErrorCode.SYSTEM_ERROR}
         finally:
-            if token is not None:
-                _end_code_session(token)
-            # 只释放自己真正持有的锁：asyncio.Lock 不跟踪持有者，等锁中被取消时
-            # 无条件 release() 会把"别的请求正持有的锁"放掉，串行化随之失效
-            if acquired:
-                lock.release()
+            # 嵌套 finally：_end_code_session 万一抛错（如异步生成器被 GC 在别的
+            # Context 终结时 contextvar.reset 抛 ValueError），锁也必须释放，
+            # 否则该会话永久卡死
+            try:
+                if token is not None:
+                    _end_code_session(token)
+            finally:
+                # 只释放自己真正持有的锁：asyncio.Lock 不跟踪持有者，等锁中被取消时
+                # 无条件 release() 会把"别的请求正持有的锁"放掉，串行化随之失效
+                if acquired:
+                    lock.release()
 
     @staticmethod
     def _extract_code(text: str) -> str | None:

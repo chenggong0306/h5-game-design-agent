@@ -152,12 +152,20 @@ def _is_visually_torn(png_bytes: bytes) -> bool:
 
 
 # ---- 浏览器实例复用：self_check 默认开启时每回合最多 2-3 次检查，逐次冷启动 Chromium
-# 各付 0.5-1.5 秒；改为懒启动 + 常驻复用（每次检查仍开独立 page），异常即整体丢弃、
-# 空闲 _BROWSER_IDLE_CLOSE_S 秒后自动关停，应用 shutdown 时由 aclose_browser() 兜底。
+# 各付 0.5-1.5 秒；改为懒启动 + 常驻复用（每次检查仍开独立 page）。
+# 生命周期规则（并发安全的关键，全部在事件循环线程内、持 _browser_lock 时变更）：
+#   · 检查开始：登记使用计数 + 取消空闲关停定时器（防定时器到点关掉正在用的实例）
+#   · 异常/超时报废：换代——把全局引用清掉让下次冷启动；若还有并发检查在用旧实例，
+#     只标记 doomed，由最后一个使用者真正 close（不能从别人脚下关浏览器）
+#   · 检查结束：注销计数；自己是 doomed 实例的最后使用者就顺手关掉它；
+#     全局实例空闲（无任何使用者）时才排空闲关停定时器
+# 应用 shutdown 时由 aclose_browser() 兜底。
 _pw = None
 _browser = None
 _browser_lock: asyncio.Lock | None = None
 _idle_close_task: asyncio.Task | None = None
+_browser_users: dict[int, int] = {}   # id(browser) -> 进行中的检查数
+_doomed_browsers: dict[int, object] = {}  # 已报废但仍有人在用的实例，最后使用者负责 close
 _BROWSER_IDLE_CLOSE_S = 300.0
 
 
@@ -180,31 +188,85 @@ async def _get_browser():
     return _browser
 
 
-async def _discard_browser():
-    """整体丢弃浏览器实例（下次冷启动）。异常/超时后调用，不复用状态不明的进程。"""
-    global _pw, _browser
-    b, _browser = _browser, None
-    pw, _pw = _pw, None
-    if b is not None:
-        try:
-            await b.close()
-        except Exception:
-            pass
-    if pw is not None:
-        try:
-            await pw.stop()
-        except Exception:
-            pass
+async def _close_quiet(b) -> None:
+    try:
+        await b.close()
+    except Exception:
+        pass
 
 
-async def aclose_browser():
-    """关停常驻浏览器（应用 shutdown / 空闲超时调用）。未启动过则为空操作。"""
+def _cancel_idle_close() -> None:
     global _idle_close_task
     task, _idle_close_task = _idle_close_task, None
     if task is not None and task is not asyncio.current_task() and not task.done():
         task.cancel()
+
+
+async def _acquire_browser():
+    """取常驻实例并登记使用。返回 browser；启动失败返回 None（调用方降级）。"""
     async with _get_browser_lock():
-        await _discard_browser()
+        try:
+            browser = await _get_browser()
+        except Exception as e:
+            logger.warning("headless_browser_launch_failed", error=str(e))
+            return None
+        _browser_users[id(browser)] = _browser_users.get(id(browser), 0) + 1
+        _cancel_idle_close()  # 使用中不许空闲关停
+        return browser
+
+
+async def _release_browser(browser) -> None:
+    """注销使用计数；关掉自己是最后使用者的报废实例；空闲时排关停定时器。"""
+    async with _get_browser_lock():
+        key = id(browser)
+        n = _browser_users.get(key, 1) - 1
+        if n > 0:
+            _browser_users[key] = n
+        else:
+            _browser_users.pop(key, None)
+            doomed = _doomed_browsers.pop(key, None)
+            if doomed is not None:
+                await _close_quiet(doomed)
+        # 只有在【完全】无人使用时才排空闲关停：aclose_browser 会连 playwright driver
+        # 一起停掉，报废实例上若还有进行中的检查，停 driver 会从它们脚下断连
+        if not _browser_users and (_browser is not None or _pw is not None):
+            _schedule_idle_close()
+
+
+async def _retire_browser(browser) -> None:
+    """异常/超时后报废实例：不复用状态不明的进程，但也不从并发检查脚下关掉它。
+
+    调用方自己仍在使用计数里（_release_browser 还没跑），所以这里只做标记与换代，
+    真正的 close 在最后一个使用者 _release_browser 时发生。"""
+    global _browser
+    async with _get_browser_lock():
+        if _browser is browser:
+            _browser = None  # 换代：下次检查冷启动新实例
+        _doomed_browsers[id(browser)] = browser
+
+
+async def aclose_browser():
+    """关停常驻浏览器与 playwright driver（应用 shutdown / 空闲超时调用）。
+
+    连同报废待关的实例与使用计数一起清掉：shutdown 时进行中的检查随事件循环
+    一起终止，不会再来 _release_browser。"""
+    global _pw, _browser
+    _cancel_idle_close()
+    async with _get_browser_lock():
+        doomed = list(_doomed_browsers.values())
+        _doomed_browsers.clear()
+        _browser_users.clear()
+        b, _browser = _browser, None
+        pw, _pw = _pw, None
+        for d in doomed:
+            await _close_quiet(d)
+        if b is not None:
+            await _close_quiet(b)
+        if pw is not None:
+            try:
+                await pw.stop()
+            except Exception:
+                pass
 
 
 def _schedule_idle_close():
@@ -232,19 +294,16 @@ async def run_headless(html: str, timeout_s: float = 15.0) -> list[dict] | None:
     except Exception:
         return None
 
-    async with _get_browser_lock():
-        try:
-            browser = await _get_browser()
-        except Exception as e:
-            logger.warning("headless_browser_launch_failed", error=str(e))
-            return None
+    browser = await _acquire_browser()
+    if browser is None:
+        return None
 
     async def _run() -> tuple[list[str], bool, bytes]:
         # --no-sandbox：root 容器/AutoDL 等环境下 Chromium 启动的必要条件。
         # 去掉沙箱降低进程隔离，威胁模型里的缓解措施：
         #   1. 仅跑不可信 HTML 且拦截外部网络请求（下面 page.route 只放行 data:/about:/blob:）
         #   2. 整段有 wall-clock timeout（asyncio.wait_for），卡住不会拖死自检
-        #   3. 每次检查用独立 page、用完即关（finally 保证）；浏览器实例复用但异常即弃、空闲超时自动关停
+        #   3. 每次检查用独立 page、用完即关（finally 保证）；浏览器实例复用但异常即报废换代、空闲超时自动关停
         page = await browser.new_page(viewport={"width": 390, "height": 740}, device_scale_factor=2)
         try:
             # 安全：被检代码是模型生成的不可信 HTML。拦截一切外部请求，只放行内联资源
@@ -275,39 +334,39 @@ async def run_headless(html: str, timeout_s: float = 15.0) -> list[dict] | None:
 
     issues = []
     try:
-        errors, blank, shot = await asyncio.wait_for(_run(), timeout=timeout_s)
+        try:
+            errors, blank, shot = await asyncio.wait_for(_run(), timeout=timeout_s)
 
-        seen = set()
-        for e in errors:
-            key = e[:80]
-            if key in seen:
-                continue
-            seen.add(key)
-            issues.append({"id": "runtime_error", "severity": "high",
-                           "msg": f"运行时报错：{e[:180]}",
-                           "fix": "修复该 JS 运行时错误（如未定义变量、空引用）"})
-            if len(seen) >= 5:
-                break
-        if blank:
-            issues.append({"id": "blank_screen", "severity": "high",
-                           "msg": "运行后画面几乎空白（元素可能在屏幕外/未绘制/初始化失败）",
-                           "fix": "检查 DPR 与坐标：canvas.style 尺寸、用逻辑 W/H 定位、实体 y 在可视区内"})
-        elif _is_visually_torn(shot):
-            issues.append({"id": "visual_tearing", "severity": "high",
-                           "msg": "画面出现严重的面片撕裂/碎片化（3D 渲染的顶点计算或投影/背面剔除逻辑有误）",
-                           "fix": "检查 V3 类方法（sub/mul/cross/norm）是否返回正确类型、project() 返回值是否被当成 V3 调用方法、背面剔除是否在视角空间判 vn.z、旋转后 orig 是否 Math.round 量化"})
-    except (NameError, AttributeError, TypeError, UnboundLocalError) as e:
-        # 自身编程错误（而非环境性失败）：必须高调记录，否则无头检测会静默退化成"从不报告问题"
-        logger.error("headless_verify_bug", error=repr(e))
-        async with _get_browser_lock():
-            await _discard_browser()  # 状态不明的实例不复用，下次冷启动
-        return None
-    except Exception as e:
-        logger.warning("headless_verify_failed", error=str(e))
-        async with _get_browser_lock():
-            await _discard_browser()
-        return None
-    _schedule_idle_close()
+            seen = set()
+            for e in errors:
+                key = e[:80]
+                if key in seen:
+                    continue
+                seen.add(key)
+                issues.append({"id": "runtime_error", "severity": "high",
+                               "msg": f"运行时报错：{e[:180]}",
+                               "fix": "修复该 JS 运行时错误（如未定义变量、空引用）"})
+                if len(seen) >= 5:
+                    break
+            if blank:
+                issues.append({"id": "blank_screen", "severity": "high",
+                               "msg": "运行后画面几乎空白（元素可能在屏幕外/未绘制/初始化失败）",
+                               "fix": "检查 DPR 与坐标：canvas.style 尺寸、用逻辑 W/H 定位、实体 y 在可视区内"})
+            elif _is_visually_torn(shot):
+                issues.append({"id": "visual_tearing", "severity": "high",
+                               "msg": "画面出现严重的面片撕裂/碎片化（3D 渲染的顶点计算或投影/背面剔除逻辑有误）",
+                               "fix": "检查 V3 类方法（sub/mul/cross/norm）是否返回正确类型、project() 返回值是否被当成 V3 调用方法、背面剔除是否在视角空间判 vn.z、旋转后 orig 是否 Math.round 量化"})
+        except (NameError, AttributeError, TypeError, UnboundLocalError) as e:
+            # 自身编程错误（而非环境性失败）：必须高调记录，否则无头检测会静默退化成"从不报告问题"
+            logger.error("headless_verify_bug", error=repr(e))
+            await _retire_browser(browser)  # 状态不明的实例不复用，报废换代
+            return None
+        except Exception as e:
+            logger.warning("headless_verify_failed", error=str(e))
+            await _retire_browser(browser)
+            return None
+    finally:
+        await _release_browser(browser)
     return issues
 
 

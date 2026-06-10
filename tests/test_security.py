@@ -81,6 +81,14 @@ class UploadAllowlistTests(unittest.TestCase):
             )
             self.assertEqual(r.status_code, 400, f"{fname} 应被拒绝: {r.text}")
 
+    def test_legacy_safe_extensions_allowed(self):
+        """白名单放宽回归：无浏览器脚本执行风险的常见格式不该被误杀
+        （否则升级前已上传的存量素材列表可见、访问却 404，旧游戏断资源）。"""
+        for atype, ext in [("image", ".bmp"), ("image", ".ico"), ("image", ".avif"),
+                           ("spritesheet", ".bmp"), ("audio", ".flac"), ("audio", ".opus"),
+                           ("tilemap", ".tmx")]:
+            self.assertIn(ext, routes._ALLOWED_ASSET_EXTS[atype], f"{atype} 应允许 {ext}")
+
     def test_serve_rejects_non_whitelisted_extension(self):
         """出口兜底：磁盘上历史遗留的危险类型文件也不回源。"""
         base = Path(routes._settings.assets_dir).resolve() / "image"

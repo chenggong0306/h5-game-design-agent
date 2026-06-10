@@ -255,6 +255,61 @@ class RunHeadlessTests(unittest.TestCase):
         finally:
             self._restore_modules(saved)
 
+    def test_idle_close_timer_paused_while_check_active(self):
+        """空闲关停定时器在检查进行中必须取消：否则上一轮排的定时器到点，
+        会从正在进行的检查脚下把浏览器关掉（检查失败、自检静默退化）。"""
+        fake = _FakePlaywright(_FakePage(self._gradient_png(), []))
+        saved = self._install_fakes(fake)
+
+        async def _go():
+            try:
+                b = await verifier._acquire_browser()
+                during = verifier._idle_close_task
+                await verifier._release_browser(b)
+                after = verifier._idle_close_task
+                return during, after
+            finally:
+                await verifier.aclose_browser()
+
+        try:
+            during, after = asyncio.run(_go())
+        finally:
+            self._restore_modules(saved)
+        self.assertIsNone(during, "检查进行中不应存在空闲关停定时器")
+        self.assertIsNotNone(after, "全部检查结束后应重新排定空闲关停")
+
+    def test_retire_does_not_close_browser_under_concurrent_check(self):
+        """异常报废 = 换代语义：并发检查还在用旧实例时不得 close（否则一个会话的
+        超时会把另一个会话的自检一起打挂），由最后一个使用者真正关闭。"""
+        fake = _FakePlaywright(_FakePage(self._gradient_png(), []))
+        saved = self._install_fakes(fake)
+
+        async def _go():
+            try:
+                a = await verifier._acquire_browser()
+                b = await verifier._acquire_browser()
+                assert a is b, "并发检查应共享同一常驻实例"
+                await verifier._retire_browser(a)    # A 的检查异常/超时 → 报废
+                await verifier._release_browser(a)   # A 结束：B 还在用，不能关
+                still_open = a.is_connected()
+                c = await verifier._acquire_browser()  # 换代：新检查拿到新实例
+                fresh = c is not a
+                await verifier._release_browser(b)   # 旧实例最后一个使用者退出 → 真正 close
+                closed = not a.is_connected()
+                await verifier._release_browser(c)
+                return still_open, fresh, closed
+            finally:
+                await verifier.aclose_browser()
+
+        try:
+            still_open, fresh, closed = asyncio.run(_go())
+        finally:
+            self._restore_modules(saved)
+        self.assertTrue(still_open, "报废时并发检查仍在用，不能立即 close")
+        self.assertTrue(fresh, "报废后新检查应拿到换代的新实例")
+        self.assertTrue(closed, "最后一个使用者退出后报废实例才被关闭")
+        self.assertEqual(fake.launch_count, 2)
+
     def test_browser_instance_reused_across_checks(self):
         # 同一常驻实例下，连续两次检查只 launch 一次 Chromium
         fake = _FakePlaywright(_FakePage(self._gradient_png(), []))

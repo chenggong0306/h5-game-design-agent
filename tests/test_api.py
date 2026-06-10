@@ -75,6 +75,41 @@ class ApiRouteTests(unittest.TestCase):
         history = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual([m["content"] for m in history], ["新消息"])
 
+    def test_transient_read_failure_does_not_overwrite_history(self):
+        """瞬态读失败（Windows 共享冲突/杀软占用）：跳过本条持久化，
+        绝不能把读失败当损坏改名备份、更不能用空列表覆盖整个历史。"""
+        sid = "transient-1"
+        routes._append_chat_history(sid, "user", "旧消息")
+        orig = routes._read_text_retry
+
+        def _boom(path, attempts=4, delay=0.0):
+            raise PermissionError("sharing violation")
+
+        routes._read_text_retry = _boom
+        try:
+            routes._append_chat_history(sid, "user", "新消息")  # 不应抛出
+        finally:
+            routes._read_text_retry = orig
+        history = routes._load_chat_history(sid)
+        self.assertEqual([m["content"] for m in history], ["旧消息"], "历史不能被覆盖或清零")
+        backup = Path(self.tmp) / f"{sid}.json.corrupt.bak"
+        self.assertFalse(backup.exists(), "瞬态读失败不应触发损坏改名分支")
+
+    def test_readonly_load_degrades_to_empty_on_transient_failure(self):
+        """只读路径（历史接口/列表）：瞬态读失败降级为空列表而不是 500。"""
+        sid = "transient-2"
+        routes._append_chat_history(sid, "user", "x")
+        orig = routes._read_text_retry
+
+        def _boom(path, attempts=4, delay=0.0):
+            raise PermissionError("busy")
+
+        routes._read_text_retry = _boom
+        try:
+            self.assertEqual(routes._load_chat_history_or_empty(sid), [])
+        finally:
+            routes._read_text_retry = orig
+
     def test_concurrent_appends_do_not_lose_messages(self):
         """同会话并发 append（多标签页/重复点击）：per-session 锁保证不丢消息。"""
         sid = "concurrent-1"
