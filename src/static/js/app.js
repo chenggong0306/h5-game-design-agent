@@ -262,12 +262,12 @@ function readImageFile(file) {
     return new Promise((resolve, reject) => {
         const reader = new FileReader();
         reader.onload = () => resolve({
-            name: file.name,
+            name: file.name || '粘贴图片.png',
             type: file.type || 'image/png',
             size: file.size,
             data_url: reader.result,
         });
-        reader.onerror = () => reject(new Error(`读取图片失败: ${file.name}`));
+        reader.onerror = () => reject(new Error(`读取图片失败: ${file.name || '未知'}`));
         reader.readAsDataURL(file);
     });
 }
@@ -832,19 +832,37 @@ chatInput.addEventListener('keydown', (e) => {
 });
 
 // ---------- 粘贴图片上传 ----------
-chatInput.addEventListener('paste', (e) => {
+// 通用粘贴提取：从 clipboardData 中揪出所有图片 File
+function _extractImageFilesFromClipboard(e) {
     const items = e.clipboardData?.items;
-    if (!items) return;
+    if (!items || !items.length) return [];
     const imageFiles = [];
-    for (const item of items) {
-        if (item.type.startsWith('image/')) {
+    for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        if (item.kind === 'file' && item.type.startsWith('image/')) {
             const file = item.getAsFile();
             if (file) imageFiles.push(file);
         }
     }
+    return imageFiles;
+}
+
+// ① 正文输入框粘贴（聚焦在此）
+chatInput.addEventListener('paste', (e) => {
+    const imageFiles = _extractImageFilesFromClipboard(e);
     if (imageFiles.length) {
-        e.preventDefault(); // 不把图片二进制贴进文本框
-        addSelectedImageFiles(imageFiles);
+        e.preventDefault();
+        addSelectedImageFiles(imageFiles).catch(err => console.warn('粘贴图片失败:', err));
+    }
+});
+
+// ② 兜底：焦点不在 textarea 时（如点击了聊天历史）也能接收 Ctrl+V
+document.addEventListener('paste', (e) => {
+    if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return; // ① 已处理
+    if (e.target.closest('#modal-assets') || e.target.closest('#modal-skills') || e.target.closest('#modal-projects')) return;
+    const imageFiles = _extractImageFilesFromClipboard(e);
+    if (imageFiles.length) {
+        addSelectedImageFiles(imageFiles).catch(err => console.warn('粘贴图片失败:', err));
     }
 });
 
