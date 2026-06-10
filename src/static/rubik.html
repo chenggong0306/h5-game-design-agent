@@ -104,8 +104,10 @@ function rotLayer(axis, layer, angle) {
 function proj(w) {
     let v = rotX(w, vRX);
     v = rotY(v, vRY);
-    const scale = Math.min(W, H) * 0.35;  // 魔方占屏幕 35%
-    const f = scale / (6 + v.z);
+    // 弱透视：深度对缩放的影响控制在小范围，远近面尺寸一致、看起来像正方体
+    const unit = Math.min(W, H) * 0.18;       // 1 个 cubelet ≈ 屏幕的 18%
+    const perspective = 1 - v.z * 0.04;        // ±2→1.08~0.92，仅 ~15% 差异
+    const f = unit * perspective;
     return { x: W/2 + v.x*f, y: H/2 - v.y*f, z: v.z };
 }
 
