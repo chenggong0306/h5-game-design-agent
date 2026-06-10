@@ -554,7 +554,7 @@ function drawFace(pts3, color) {
 function drawC(c) {
     for (const f of c.getFaces()) {
         let vn = rotX(f.n, vRX); vn = rotY(vn, vRY);
-        if (vn.z <= 0) continue; // 视角空间背面剔除
+        if (vn.z >= 0) continue; // 相机看 +z 方向，法线 z≥0 → 背向相机 → 剔除
         drawFace(faceVerts(c, f.n), f.c);
     }
 }
@@ -593,7 +593,7 @@ init(); loop();
 
 1. **resize**: `setTransform(dpr,0,0,dpr,0,0)` + `canvas.style.width = W + 'px'`（禁止 ctx.scale）
 2. **每帧**: `clearRect` → 所有 cubelet 投影拿 z → **按 z 排序（远→近）** → 逐个 drawC
-3. **drawC**: 6 个面 → 法线变到视角空间 → `vn.z <= 0` 跳过（视角空间背面剔除，不要在 drawFace 里再加 2D 叉积）
+3. **drawC**: 6 个面 → 法线变到视角空间 → `vn.z >= 0` 跳过（从视角空间看，z 正半轴指向屏幕深处，法线 z≥0 = 背向相机 = 剔除）
 4. **drawFace**: 投影 4 个顶点 → fill + stroke（背面剔除已在 drawC 完成）
 5. **旋转层**: 改 cubelet 的 `p` 和 `orig` → `Math.round(orig)` 量化到 -1/0/1 防止浮点漂移
 
@@ -614,6 +614,7 @@ factor 在 0.9~1.1 之间波动 → 有 3D 立体感但不变形。
 ## 如果生成 3D 游戏，请严格参考上述代码的结构和数学逻辑，避免：
 - ❌ `v.x * 数值 * f` 叠加两个缩放因子（投影到屏幕外）
 - ❌ 在世界空间判背面（方向随视角变化会反）
+- ❌ 背面剔除用 `vn.z <= 0` 而不用 `vn.z >= 0`（符号方向反了，导致所有面被裁掉）
 - ❌ 对 project() 返回的普通对象调 V3 方法
 - ❌ 旋转后不量化 orig（浮点累积漂移）
 - ❌ 忘记 canvas.style.width/height（高分屏放大）

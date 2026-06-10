@@ -130,7 +130,7 @@ function drawFace(pts3, color) {
 function drawC(c) {
     for (const f of c.getFaces()) {
         let vn=rotX(f.n,vRX); vn=rotY(vn,vRY);
-        if (vn.z<=0) continue;
+        if (vn.z >= 0) continue;  // 背面剔除：法线指向 +z（相机看 +z 方向）= 背向
         drawFace(faceVerts(c, f.n), f.c);
     }
 }
