@@ -2,11 +2,14 @@
 
 import asyncio
 import base64
+import io
 import json
 import logging
 import os
 import tempfile
+import threading
 import uuid
+import zipfile
 
 from datetime import datetime, timezone
 from pathlib import Path
@@ -29,23 +32,35 @@ agent = GameDesignAgent(kb)
 
 # ============ HTTP 层限流（取代旧的按工具调用限流，避免卡断分段写入） ============
 import time as _time
-from collections import defaultdict as _defaultdict
 
 _CHAT_RATE_WINDOW = 60   # 秒
 _CHAT_RATE_MAX = 30      # 每会话每窗口最多对话请求数
-_chat_request_times: dict[str, list[float]] = _defaultdict(list)
+_chat_request_times: dict[str, list[float]] = {}
+_rate_table_last_sweep = 0.0
 
 
 def _check_chat_rate_limit(session_id: str) -> bool:
-    """按会话滑动窗口限流。未超限返回 True。"""
+    """按会话滑动窗口限流。未超限返回 True。
+
+    只在事件循环线程调用（两个聊天端点），无需加锁。每个窗口期顺带做一次全表清扫，
+    删掉时间戳全部过期的会话条目——否则海量唯一 session_id 会让该表无限增长（内存 DoS）。
+    """
+    global _rate_table_last_sweep
     if not session_id:
         return True
     now = _time.time()
-    calls = _chat_request_times[session_id]
-    calls[:] = [t for t in calls if now - t < _CHAT_RATE_WINDOW]
+    if now - _rate_table_last_sweep >= _CHAT_RATE_WINDOW:
+        _rate_table_last_sweep = now
+        stale = [sid for sid, ts in _chat_request_times.items()
+                 if not ts or now - ts[-1] >= _CHAT_RATE_WINDOW]
+        for sid in stale:
+            _chat_request_times.pop(sid, None)
+    calls = [t for t in _chat_request_times.get(session_id, []) if now - t < _CHAT_RATE_WINDOW]
     if len(calls) >= _CHAT_RATE_MAX:
+        _chat_request_times[session_id] = calls
         return False
     calls.append(now)
+    _chat_request_times[session_id] = calls
     return True
 
 
@@ -55,8 +70,16 @@ from src.config import settings as _settings
 
 # 素材类型白名单（防止 asset_type 任意建目录/写文件）
 _ALLOWED_ASSET_TYPES = {"image", "audio", "spritesheet", "tilemap", "font"}
-# 危险扩展名：浏览器可能当脚本/标记执行，同源内联返回会造成存储型 XSS，禁止上传
-_DANGEROUS_ASSET_EXTS = {".html", ".htm", ".svg", ".xml", ".js", ".mjs", ".css"}
+# 扩展名按素材类型白名单（取代旧黑名单）：黑名单挡不住 .xhtml/.xht/.svgz 这类
+# mimetypes 会推断成可渲染类型的漏网项——浏览器同源内联渲染并执行其中脚本即存储型 XSS。
+# 不在白名单一律拒绝；上传入口与 serve 出口都按此校验（磁盘历史遗留文件也不回源）。
+_ALLOWED_ASSET_EXTS: dict[str, set[str]] = {
+    "image": {".png", ".jpg", ".jpeg", ".gif", ".webp"},
+    "audio": {".mp3", ".wav", ".ogg", ".m4a"},
+    "spritesheet": {".png", ".jpg", ".jpeg", ".gif", ".webp"},
+    "tilemap": {".json"},
+    "font": {".ttf", ".otf", ".woff", ".woff2"},
+}
 # 文件名：无前导点、无 ".."、仅限安全字符（防穿越）
 _SAFE_FILENAME = _re.compile(r"^(?!\.)(?!.*\.\.)[A-Za-z0-9_.-]+$")
 # 会话 id：来源统一在 src/config.py → settings.safe_session_id_pattern（一处修改、全局生效）
@@ -70,8 +93,13 @@ def _require_safe_session_id(session_id: str) -> str:
 
 
 def _resolve_asset_path(asset_type: str, filename: str) -> str:
-    """校验并解析素材真实路径，确保落在 assets 目录内（防路径穿越读取任意文件）。"""
+    """校验并解析素材真实路径，确保落在 assets 目录内（防路径穿越读取任意文件）。
+
+    扩展名同样按白名单校验：即便磁盘上有历史遗留的危险类型文件也拒绝回源（防存储型 XSS）。
+    """
     if asset_type not in _ALLOWED_ASSET_TYPES or not _SAFE_FILENAME.match(filename):
+        raise HTTPException(status_code=404, detail="文件不存在")
+    if os.path.splitext(filename)[1].lower() not in _ALLOWED_ASSET_EXTS.get(asset_type, set()):
         raise HTTPException(status_code=404, detail="文件不存在")
     base = Path(_settings.assets_dir).resolve()
     target = (base / asset_type / filename).resolve()
@@ -91,32 +119,69 @@ def _history_path(session_id: str) -> Path:
     return CHAT_HISTORY_DIR / f"{session_id}.json"
 
 
+# 聊天历史的 per-session 线程锁：_append_chat_history 经 asyncio.to_thread 在线程池里跑，
+# 同会话并发请求（多标签页共享 localStorage 里的 session_id / 重复点击）的
+# load→append→save 读改写会互相覆盖丢消息，必须互斥。用线程锁而非 asyncio.Lock，
+# 因为竞争发生在工作线程之间。锁的创建本身用全局守卫锁防两个线程各建一把。
+_history_locks: dict[str, threading.Lock] = {}
+_history_locks_guard = threading.Lock()
+
+
+def _history_lock(session_id: str) -> threading.Lock:
+    with _history_locks_guard:
+        lock = _history_locks.get(session_id)
+        if lock is None:
+            lock = threading.Lock()
+            _history_locks[session_id] = lock
+        return lock
+
+
 def _load_chat_history(session_id: str) -> list[dict]:
     path = _history_path(session_id)
     if not path.exists():
         return []
     try:
         return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
+    except Exception as e:
+        # 不能静默清零：下一次 append 会用空列表整体覆盖、全部历史无声丢失。
+        # 把坏文件改名备份留痕（.corrupt.bak 不再匹配 *.json glob），再从空开始。
+        logger.error("聊天历史损坏，已备份为 .corrupt.bak 后从空开始 (session=%s): %s", session_id, e)
+        try:
+            os.replace(path, path.with_name(path.name + ".corrupt.bak"))
+        except OSError as be:
+            logger.error("聊天历史损坏文件备份失败 (session=%s): %s", session_id, be)
         return []
 
 
 def _save_chat_history(session_id: str, history: list[dict]) -> None:
     path = _history_path(session_id)
-    path.write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
+    # 临时文件 + os.replace 原子写（同 persistence.py 模式）：进程崩溃/磁盘满不会留下
+    # 半截 JSON——半截文件下次加载会触发上面的损坏分支。.tmp 后缀不会被 *.json glob 误匹配。
+    fd, tmp_path = tempfile.mkstemp(dir=path.parent, prefix=f"{session_id}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps(history, ensure_ascii=False, indent=2))
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def _append_chat_history(session_id: str, role: str, content: str, extra: dict | None = None) -> None:
-    history = _load_chat_history(session_id)
-    item = {
-        "role": role,
-        "content": content,
-        "ts": datetime.now(timezone.utc).isoformat(),
-    }
-    if extra:
-        item.update(extra)
-    history.append(item)
-    _save_chat_history(session_id, history)
+    with _history_lock(session_id):  # 读改写全程持锁，防同会话并发 append 互相覆盖
+        history = _load_chat_history(session_id)
+        item = {
+            "role": role,
+            "content": content,
+            "ts": datetime.now(timezone.utc).isoformat(),
+        }
+        if extra:
+            item.update(extra)
+        history.append(item)
+        _save_chat_history(session_id, history)
 
 
 def _get_latest_code_from_history(history: list[dict]) -> str:
@@ -225,7 +290,9 @@ async def chat(req: ChatRequest):
     if not _check_chat_rate_limit(session_id):
         raise HTTPException(status_code=429, detail="请求过于频繁，请稍候再试")
     try:
-        images = _validate_chat_images(req.images)
+        # base64 解码（最多 4×10MB）是 CPU 密集操作，放线程别卡事件循环；
+        # 纯函数无共享状态，线程里抛的 HTTPException 原样传播到这里
+        images = await asyncio.to_thread(_validate_chat_images, req.images)
         user_content = _build_user_message_content(req.message, images)
         result = await agent.chat(
             session_id=session_id,
@@ -262,7 +329,8 @@ async def chat_stream(req: ChatRequest):
     _require_safe_session_id(session_id)
     # ⚠️ 图片校验必须在创建 StreamingResponse 之前做：否则校验失败时 HTTPException 抛在
     # SSE 生成器里（已经 200 OK），前端拿不到 4xx、流被无声截断。
-    images = _validate_chat_images(req.images)
+    # base64 解码是 CPU 密集操作，放线程别卡事件循环（不改变上述时序）。
+    images = await asyncio.to_thread(_validate_chat_images, req.images)
     user_content = _build_user_message_content(req.message, images)
     image_meta = _image_history_meta(images) if images else None
 
@@ -352,11 +420,36 @@ async def clear_chat(session_id: str):
     """清除对话历史"""
     await agent.clear_session(session_id)
     path = _history_path(session_id)
-    if path.exists():
-        path.unlink()
+    # unlink 放线程（磁盘慢/杀软扫描时别卡事件循环）；missing_ok 顺带消除 exists/unlink 的 TOCTOU
+    await asyncio.to_thread(lambda: path.unlink(missing_ok=True))
     return {"ok": True}
 
 
+
+
+def _write_upload_tmp(content: bytes, suffix: str) -> str:
+    """同步写上传内容到临时文件（在线程池里调用），返回路径。
+
+    写失败（磁盘满等）时自行删除半截文件再抛出，不在系统临时目录积累孤儿文件。
+    """
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    try:
+        with tmp:
+            tmp.write(content)
+    except BaseException:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+        raise
+    return tmp.name
+
+
+def _unlink_missing_ok(path: str) -> None:
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
 
 
 @router.post("/api/assets/upload")
@@ -367,18 +460,25 @@ async def upload_asset(
     tags: str = Form(""),
 ):
     """上传游戏素材"""
-    # 安全校验：限定素材类型（防 asset_type 任意建目录），拒绝可执行/标记类扩展名（防存储型 XSS）
+    # 安全校验：限定素材类型（防 asset_type 任意建目录），扩展名按类型白名单（防存储型 XSS）
     if asset_type not in _ALLOWED_ASSET_TYPES:
         raise HTTPException(status_code=400, detail=f"不支持的素材类型：{asset_type}")
-    suffix = os.path.splitext(file.filename or "file")[1]
-    if suffix.lower() in _DANGEROUS_ASSET_EXTS:
-        raise HTTPException(status_code=400, detail=f"不允许上传 {suffix} 文件")
-    # 保存临时文件
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        content = await file.read()
-        tmp.write(content)
-        tmp_path = tmp.name
-
+    suffix = os.path.splitext(file.filename or "file")[1].lower()
+    allowed_exts = _ALLOWED_ASSET_EXTS[asset_type]
+    if suffix not in allowed_exts:
+        raise HTTPException(
+            status_code=400,
+            detail=f"素材类型 {asset_type} 仅支持 {'/'.join(sorted(allowed_exts))} 文件",
+        )
+    content = await file.read()
+    if len(content) > _settings.max_upload_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail=f"文件超过 {_settings.max_upload_bytes // (1024 * 1024)}MB 上限",
+        )
+    # 临时文件写入放线程（数十 MB 同步写盘会卡事件循环）；_write_upload_tmp 写失败时
+    # 自行清理，不泄漏孤儿文件
+    tmp_path = await asyncio.to_thread(_write_upload_tmp, content, suffix)
     try:
         tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
         result = await asyncio.to_thread(  # 嵌入推理 + 文件拷贝是阻塞操作，放线程
@@ -393,7 +493,7 @@ async def upload_asset(
         result["url"] = f"/assets/{asset_type}/{result['asset_id']}{result.get('extension', '')}"
         return result
     finally:
-        os.unlink(tmp_path)
+        await asyncio.to_thread(_unlink_missing_ok, tmp_path)  # 删除也是磁盘 I/O，放线程
 
 
 @router.get("/api/assets")
@@ -473,12 +573,18 @@ async def delete_project(project_id: str):
 
 # ============ Skills API ============
 
+# _sync_skills 的磁盘全量重写会卡事件循环，调用方一律 `await asyncio.to_thread(_sync_skills)`；
+# 进线程后失去事件循环的天然串行化，用线程锁防止并发技能变更交错重写同一文件
+_skills_sync_guard = threading.Lock()
+
+
 def _sync_skills():
-    """更新 SkillMiddleware 的 prompt 缓存 + 持久化到磁盘"""
-    import src.agent.game_agent as ga
-    ga._rebuild_skills_prompt()  # 只列常用技能 + 检索提示（不再注入全部上百条）
-    ga._invalidate_system_overhead()  # 技能变了，固定开销需重新计算（影响上下文圆环）
-    _save_custom_skills()
+    """更新 SkillMiddleware 的 prompt 缓存 + 持久化到磁盘（同步函数，放线程调用）"""
+    with _skills_sync_guard:
+        import src.agent.game_agent as ga
+        ga._rebuild_skills_prompt()  # 只列常用技能 + 检索提示（不再注入全部上百条）
+        ga._invalidate_system_overhead()  # 技能变了，固定开销需重新计算（影响上下文圆环）
+        _save_custom_skills()
 
 class SkillCreateRequest(BaseModel):
     name: str
@@ -497,7 +603,7 @@ async def add_skill(req: SkillCreateRequest):
         if s["name"] == req.name:
             raise HTTPException(400, f"技能 '{req.name}' 已存在")
     SKILLS.append({"name": req.name, "description": req.description, "content": req.content})
-    _sync_skills()
+    await asyncio.to_thread(_sync_skills)  # 磁盘写入放线程
     return {"ok": True, "name": req.name}
 
 @router.delete("/api/skills/{skill_name}")
@@ -506,7 +612,7 @@ async def delete_skill(skill_name: str):
     for i, s in enumerate(SKILLS):
         if s["name"] == skill_name:
             SKILLS.pop(i)
-            _sync_skills()
+            await asyncio.to_thread(_sync_skills)  # 磁盘写入放线程
             return {"ok": True}
     raise HTTPException(404, f"技能 '{skill_name}' 不存在")
 
@@ -519,55 +625,83 @@ async def get_skill(skill_name: str):
     raise HTTPException(404, f"技能 '{skill_name}' 不存在")
 
 
+def _parse_skills_zip(content: bytes) -> tuple[list[dict], list[str]]:
+    """解压 + 解码 + 解析 ZIP 里的技能（CPU/内存密集，在线程池里调用）。
+
+    返回 (parsed, errors)：单个坏 JSON 不让整个导入失败——逐文件捕获、收集错误信息。
+    整体损坏时抛 zipfile.BadZipFile，由调用方转成 400。
+    """
+    parsed: list[dict] = []
+    errors: list[str] = []
+    with zipfile.ZipFile(io.BytesIO(content)) as zf:
+        for name in zf.namelist():
+            # 跳过目录和隐藏文件
+            if name.endswith('/') or '/__MACOSX' in name or name.startswith('.'):
+                continue
+            ext = name.rsplit('.', 1)[-1].lower()
+            raw = zf.read(name).decode('utf-8', errors='ignore')
+
+            if ext == 'md':
+                skill_name = name.rsplit('/', 1)[-1].replace('.md', '').replace(' ', '_')
+                lines = raw.split('\n')
+                description = skill_name
+                skill_content = raw
+                if lines[0].startswith('#'):
+                    description = lines[0].lstrip('#').strip()
+                    skill_content = '\n'.join(lines[1:]).strip()
+                parsed.append({"name": skill_name, "description": description, "content": skill_content})
+
+            elif ext == 'json':
+                try:
+                    data = json.loads(raw)
+                except ValueError as e:
+                    errors.append(f"{name}: JSON 解析失败（{e}）")
+                    continue
+                items = data if isinstance(data, list) else [data]
+                for s in items:
+                    if not isinstance(s, dict):
+                        errors.append(f"{name}: 跳过非对象条目")
+                        continue
+                    if not s.get("name") or not s.get("content"):
+                        continue
+                    parsed.append({
+                        "name": s["name"],
+                        "description": s.get("description", s["name"]),
+                        "content": s["content"],
+                    })
+    return parsed, errors
+
+
 @router.post("/api/skills/import")
 async def import_skills_zip(file: UploadFile = File(...)):
-    """从 ZIP 文件批量导入技能（每个 .md 文件 = 一个技能，每个 .json 文件 = 一个或多个技能）"""
-    import zipfile, io, json as json_mod
+    """从 ZIP 文件批量导入技能（每个 .md 文件 = 一个技能，每个 .json 文件 = 一个或多个技能）。
+
+    单个损坏的 JSON 只跳过该文件并记入 errors，不影响其余导入；
+    只要请求走到导入阶段就调用 _sync_skills 持久化，避免内存/磁盘/prompt 三态不一致。
+    """
     if not file.filename or not file.filename.endswith('.zip'):
         raise HTTPException(400, "请上传 .zip 文件")
     content = await file.read()
-    added = 0
+    if len(content) > _settings.max_upload_bytes:
+        raise HTTPException(413, f"文件超过 {_settings.max_upload_bytes // (1024 * 1024)}MB 上限")
     try:
-        with zipfile.ZipFile(io.BytesIO(content)) as zf:
-            for name in zf.namelist():
-                # 跳过目录和隐藏文件
-                if name.endswith('/') or '/__MACOSX' in name or name.startswith('.'):
-                    continue
-                ext = name.rsplit('.', 1)[-1].lower()
-                raw = zf.read(name).decode('utf-8', errors='ignore')
-
-                if ext == 'md':
-                    skill_name = name.rsplit('/', 1)[-1].replace('.md', '').replace(' ', '_')
-                    lines = raw.split('\n')
-                    description = skill_name
-                    skill_content = raw
-                    if lines[0].startswith('#'):
-                        description = lines[0].lstrip('#').strip()
-                        skill_content = '\n'.join(lines[1:]).strip()
-                    if any(s["name"] == skill_name for s in SKILLS):
-                        continue
-                    SKILLS.append({"name": skill_name, "description": description, "content": skill_content})
-                    added += 1
-
-                elif ext == 'json':
-                    data = json_mod.loads(raw)
-                    items = data if isinstance(data, list) else [data]
-                    for s in items:
-                        if not s.get("name") or not s.get("content"):
-                            continue
-                        if any(existing["name"] == s["name"] for existing in SKILLS):
-                            continue
-                        SKILLS.append({
-                            "name": s["name"],
-                            "description": s.get("description", s["name"]),
-                            "content": s["content"],
-                        })
-                        added += 1
+        # 解压/解码/JSON 解析是 CPU 密集操作，放线程别卡事件循环
+        parsed, errors = await asyncio.to_thread(_parse_skills_zip, content)
     except zipfile.BadZipFile:
         raise HTTPException(400, "无效的 ZIP 文件")
 
-    _sync_skills()
-    return {"ok": True, "added": added}
+    # 对共享列表 SKILLS 的修改留在事件循环单线程内（无 await 间隙），避免并发竞态
+    existing_names = {s["name"] for s in SKILLS}
+    added = 0
+    for s in parsed:
+        if s["name"] in existing_names:
+            continue
+        SKILLS.append(s)
+        existing_names.add(s["name"])
+        added += 1
+
+    await asyncio.to_thread(_sync_skills)  # 部分导入成功也要持久化；磁盘写入放线程
+    return {"ok": True, "added": added, "errors": errors}
 
 
 class SkillScanRequest(BaseModel):
@@ -651,5 +785,5 @@ async def scan_skills_folder(req: SkillScanRequest):
         SKILLS.append({"name": s["name"], "description": s["description"], "content": s["content"]})
         added += 1
 
-    _sync_skills()
+    await asyncio.to_thread(_sync_skills)  # 磁盘写入放线程
     return {"ok": True, "added": added, "skipped": skipped, "total_found": len(found)}

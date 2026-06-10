@@ -3,8 +3,10 @@
 把 router 挂到一个裸 app 上（不走 src.main 的 lifespan/CORS/鉴权），聚焦路由本身。
 """
 
+import json
 import shutil
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -60,6 +62,33 @@ class ApiRouteTests(unittest.TestCase):
         r = self.client.get("/api/chat/history")
         self.assertEqual(r.status_code, 200)
         self.assertTrue(any(s["session_id"] == "hist-2" for s in r.json()))
+
+    def test_corrupt_history_backed_up_not_silently_overwritten(self):
+        """历史 JSON 损坏：坏文件改名 .corrupt.bak 留痕，而不是被静默清零覆盖。"""
+        sid = "corrupt-1"
+        path = Path(self.tmp) / f"{sid}.json"
+        path.write_text("{ 这不是合法JSON", encoding="utf-8")
+        routes._append_chat_history(sid, "user", "新消息")
+        backup = path.with_name(path.name + ".corrupt.bak")
+        self.assertTrue(backup.exists(), "损坏文件应被备份为 .corrupt.bak")
+        self.assertIn("这不是合法JSON", backup.read_text(encoding="utf-8"))
+        history = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual([m["content"] for m in history], ["新消息"])
+
+    def test_concurrent_appends_do_not_lose_messages(self):
+        """同会话并发 append（多标签页/重复点击）：per-session 锁保证不丢消息。"""
+        sid = "concurrent-1"
+        threads = [
+            threading.Thread(target=routes._append_chat_history, args=(sid, "user", f"m{i}"))
+            for i in range(8)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        history = routes._load_chat_history(sid)
+        self.assertEqual(len(history), 8)
+        self.assertEqual({m["content"] for m in history}, {f"m{i}" for i in range(8)})
 
 
 if __name__ == "__main__":

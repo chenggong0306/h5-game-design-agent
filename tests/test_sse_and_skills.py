@@ -1,9 +1,13 @@
 """SSE 流式端点 + Skills API 测试（mock agent 避免调真模型）。"""
 
+import io
+import json
 import shutil
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
+from unittest import mock
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -133,6 +137,36 @@ class SkillsApiTests(unittest.TestCase):
     def test_scan_rejects_system_directories(self):
         r = self.client.post("/api/skills/scan", json={"path": "C:\\Windows"})
         self.assertIn(r.status_code, (400, 403, 404))
+
+    def test_import_zip_partial_success(self):
+        """zip 里单个坏 JSON 只跳过该文件并记入 errors，其余照常导入并持久化。"""
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("good.json", json.dumps(
+                {"name": "zip_good_skill", "description": "ok", "content": "x"}))
+            zf.writestr("bad.json", "{ 不是合法JSON")
+            zf.writestr("doc.md", "# md 技能说明\n正文内容")
+        with mock.patch.object(routes, "_save_custom_skills") as save_mock:
+            r = self.client.post(
+                "/api/skills/import",
+                files={"file": ("skills.zip", buf.getvalue(), "application/zip")},
+            )
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertEqual(body["added"], 2)
+        self.assertEqual(len(body["errors"]), 1)
+        self.assertIn("bad.json", body["errors"][0])
+        names = [s["name"] for s in routes.SKILLS]
+        self.assertIn("zip_good_skill", names)
+        self.assertIn("doc", names)
+        save_mock.assert_called_once()  # 部分导入成功也必须持久化（_sync_skills 被调用）
+
+    def test_import_zip_invalid_zip_400(self):
+        r = self.client.post(
+            "/api/skills/import",
+            files={"file": ("skills.zip", b"not a zip at all", "application/zip")},
+        )
+        self.assertEqual(r.status_code, 400)
 
 
 if __name__ == "__main__":

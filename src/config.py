@@ -66,6 +66,9 @@ class Settings(BaseSettings):
     # 会话 ID 安全校验正则（字母数字/下划线/连字符 1-128 位）
     # 供 HTTP 层和持久化层共用，防路径穿越（一处修改、全局生效）
     safe_session_id_pattern: str = r"^[A-Za-z0-9_-]{1,128}$"
+    # 上传大小上限（字节，默认 20MB）：素材上传与技能 ZIP 导入共用。
+    # 这两个端点都把整个文件读进内存，uvicorn/Starlette 默认不限请求体大小，必须设限防 OOM
+    max_upload_bytes: int = 20 * 1024 * 1024
 
     # 项目
     project_name: str = "AI Game Design Agent"
