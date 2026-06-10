@@ -124,39 +124,6 @@ async function ensureOk(res) {
     return res;
 }
 
-// ============ 工具调用状态跟踪 ============
-class ToolProgressTracker {
-    constructor() {
-        this.activeTools = new Map(); // tool_id -> {name, startTime, status}
-    }
-
-    start(toolId, toolName) {
-        this.activeTools.set(toolId, {
-            name: toolName,
-            startTime: performance.now(),
-            status: 'running'
-        });
-    }
-
-    finish(toolId, success = true) {
-        const tool = this.activeTools.get(toolId);
-        if (tool) {
-            tool.status = success ? 'success' : 'error';
-            tool.duration = performance.now() - tool.startTime;
-        }
-    }
-
-    getStatus(toolId) {
-        return this.activeTools.get(toolId);
-    }
-
-    clear() {
-        this.activeTools.clear();
-    }
-}
-
-const toolTracker = new ToolProgressTracker();
-
 let editor = null;       // Monaco Editor 实例
 let sessionId = localStorage.getItem('gameDesignSessionId') || '';       // 当前会话 ID
 let currentProjectId = ''; // 当前项目 ID
@@ -467,6 +434,27 @@ function renderStreamMessage(state, showCursor = true) {
     chatMessages.scrollTop = chatMessages.scrollHeight;
 }
 
+// rAF 节流：高频流式事件（token/tool_call/tool_result/self_check 等）每帧最多触发一次全量渲染，
+// 渲染频率与 token 速率解耦，避免长回复 O(n²) 重绘卡顿。done/error 收尾仍走同步 renderStreamMessage。
+// showCursor 在回调时按 !state.done 求值，保证收尾后迟到的帧不会把光标加回来。
+function scheduleStreamRender(state) {
+    if (!state || state._raf) return;
+    state._raf = requestAnimationFrame(() => {
+        state._raf = 0;
+        renderStreamMessage(state, !state.done);
+    });
+}
+
+// 收尾前取消挂起的节流帧并做最终同步渲染，确保最后的内容不丢、光标被移除
+function flushStreamRender(state) {
+    if (!state) return;
+    if (state._raf) {
+        cancelAnimationFrame(state._raf);
+        state._raf = 0;
+    }
+    renderStreamMessage(state, false);
+}
+
 window.toggleToolCard = function(id) {
     if (!activeStreamState) return;
     const item = activeStreamState.toolEvents.find(t => t.id === id);
@@ -629,6 +617,7 @@ async function sendMessage(messageOverride = null, options = {}) {
         toolSeq: 0,
         done: false,
         codeUpdated: false,
+        _raf: 0,
     };
 
     try {
@@ -690,10 +679,7 @@ async function sendMessage(messageOverride = null, options = {}) {
                         activeStreamState.toolEvents.push(item);
                         activeStreamState.blocks.push({ type: 'tool', item });
 
-                        // 工具进度跟踪：启动进度条
-                        toolTracker.start(toolId, event.tool);
-
-                        renderStreamMessage(activeStreamState, true);
+                        scheduleStreamRender(activeStreamState);
                     } else if (event.type === 'tool_result') {
                         const target = event.id
                             ? activeStreamState.toolEvents.find(t => t.id === event.id)
@@ -711,9 +697,6 @@ async function sendMessage(messageOverride = null, options = {}) {
                             } else {
                                 target.status = isToolErrorResult(target.result) ? 'error' : 'done';
                             }
-
-                            // 工具进度跟踪
-                            toolTracker.finish(target.id, target.status === 'done');
                         } else {
                             activeStreamState.toolSeq += 1;
                             const toolId = event.id || `tool-${Date.now()}-${activeStreamState.toolSeq}`;
@@ -738,10 +721,10 @@ async function sendMessage(messageOverride = null, options = {}) {
                             activeStreamState.toolEvents.push(item);
                             activeStreamState.blocks.push({ type: 'tool', item });
                         }
-                        renderStreamMessage(activeStreamState, true);
+                        scheduleStreamRender(activeStreamState);
                     } else if (event.type === 'token') {
                         ensureTextBlock(activeStreamState).content += event.content;
-                        renderStreamMessage(activeStreamState, true);
+                        scheduleStreamRender(activeStreamState);
                     } else if (event.type === 'context_usage') {
                         updateContextMeter(event);
 
@@ -756,7 +739,7 @@ async function sendMessage(messageOverride = null, options = {}) {
                             txt = '⚠️ 自检仍有问题（已尽力修复）：\n' + (event.issues || []).map(s => '· ' + s).join('\n');
                         }
                         activeStreamState.blocks.push({ type: 'text', content: '\n' + txt + '\n' });
-                        renderStreamMessage(activeStreamState, true);
+                        scheduleStreamRender(activeStreamState);
 
                     } else if (event.type === 'code_update') {
                         if (editor && event.code) {
@@ -765,11 +748,11 @@ async function sendMessage(messageOverride = null, options = {}) {
                             applyEditorCode(event.code);
                             activeStreamState.codeUpdated = true;
                         }
-                        renderStreamMessage(activeStreamState, true);
+                        scheduleStreamRender(activeStreamState);
 
                     } else if (event.type === 'done') {
                         activeStreamState.done = true;
-                        renderStreamMessage(activeStreamState, false);
+                        flushStreamRender(activeStreamState);
 
                         if (event.code && !activeStreamState.codeUpdated) {
                             // 没有收到过 code_update 时，done 保留兜底同步
@@ -796,7 +779,7 @@ async function sendMessage(messageOverride = null, options = {}) {
                         } else {
                             ensureTextBlock(activeStreamState).content += `\n❌ ${event.content}`;
                         }
-                        renderStreamMessage(activeStreamState, false);
+                        flushStreamRender(activeStreamState);
                     }
                 } catch (e) {
                     // 忽略 JSON 解析错误
@@ -804,7 +787,8 @@ async function sendMessage(messageOverride = null, options = {}) {
             }
         }
 
-        // 确保光标被移除
+        // 确保收尾：先冲掉挂起的节流帧（流结束但未收到 done 事件时兜底），再移除光标
+        if (activeStreamState._raf) flushStreamRender(activeStreamState);
         const cursor = bubble.querySelector('.stream-cursor');
         if (cursor) cursor.remove();
 
@@ -815,7 +799,7 @@ async function sendMessage(messageOverride = null, options = {}) {
         } else {
             ensureTextBlock(activeStreamState).content += `\n❌ 错误: ${err.message}`;
         }
-        renderStreamMessage(activeStreamState, false);
+        flushStreamRender(activeStreamState);
     } finally {
         currentStreamController = null;
         setStreamingUI(false);
@@ -913,7 +897,10 @@ document.getElementById('btn-clear-chat').addEventListener('click', async () => 
         stopCurrentStream();
     }
     if (sessionId) {
-        await fetch(`/api/chat/${sessionId}`, { method: 'DELETE' });
+        // 网络错误不应阻断本地 UI 清理（与 resetCurrentWorkspace 行为一致）
+        try {
+            await fetch(`/api/chat/${sessionId}`, { method: 'DELETE' });
+        } catch (_) {}
     }
     setSessionId('');
     chatMessages.innerHTML = '';
@@ -1316,7 +1303,6 @@ uploadZone.addEventListener('drop', (e) => {
 // ============ 工具函数 ============
 function openModal(id) { document.getElementById(id).classList.remove('hidden'); }
 function closeModal(id) { document.getElementById(id).classList.add('hidden'); }
-function showLoading(show) { document.getElementById('loading').classList.toggle('hidden', !show); }
 
 // 点击弹窗背景关闭
 document.querySelectorAll('.modal').forEach(m => {
@@ -1360,7 +1346,8 @@ async function loadSkills() {
 
 async function viewSkill(name) {
     try {
-        const res = await fetch(`/api/skills/${name}`);
+        const res = await fetch(`/api/skills/${encodeURIComponent(name)}`);
+        await ensureOk(res);
         const skill = await res.json();
         document.getElementById('skill-name').value = skill.name;
         document.getElementById('skill-name').disabled = true;  // 查看时禁止改名
@@ -1377,7 +1364,7 @@ async function viewSkill(name) {
 async function deleteSkill(name) {
     if (!confirm(`确定删除技能 "${name}"？`)) return;
     try {
-        await fetch(`/api/skills/${name}`, { method: 'DELETE' });
+        await ensureOk(await fetch(`/api/skills/${encodeURIComponent(name)}`, { method: 'DELETE' }));
         await loadSkills();
     } catch (err) {
         alert('删除失败: ' + err.message);
@@ -1391,17 +1378,23 @@ document.getElementById('btn-add-skill').addEventListener('click', async () => {
     const desc = document.getElementById('skill-desc').value.trim();
     const content = document.getElementById('skill-content').value.trim();
     if (!name || !desc || !content) { alert('请填写完整'); return; }
+    // 编辑模式：后端 POST 对重名返回 400 且无更新端点，只能"先删旧再建新"。
+    // 为防 DELETE 成功后 POST 失败导致旧技能永久丢失：删除前先取出旧技能备份，失败时回滚恢复。
+    let oldSkill = null;
     try {
-        // 编辑模式：先删除旧的
         if (btn.dataset.mode === 'edit') {
-            await fetch(`/api/skills/${name}`, { method: 'DELETE' });
+            const oldRes = await fetch(`/api/skills/${encodeURIComponent(name)}`);
+            await ensureOk(oldRes);
+            const backup = await oldRes.json();
+            await ensureOk(await fetch(`/api/skills/${encodeURIComponent(name)}`, { method: 'DELETE' }));
+            oldSkill = backup; // 删除确实成功后才需要回滚
         }
         const res = await fetch('/api/skills', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ name, description: desc, content }),
         });
-        if (!res.ok) { const d = await res.json(); throw new Error(d.detail); }
+        await ensureOk(res);
         // 重置表单
         nameInput.value = '';
         nameInput.disabled = false;
@@ -1411,7 +1404,28 @@ document.getElementById('btn-add-skill').addEventListener('click', async () => {
         btn.dataset.mode = 'add';
         await loadSkills();
     } catch (err) {
-        alert('操作失败: ' + err.message);
+        if (oldSkill) {
+            // 旧技能已删但新内容写入失败：重新 POST 旧技能恢复
+            try {
+                await ensureOk(await fetch('/api/skills', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        name: oldSkill.name,
+                        description: oldSkill.description,
+                        content: oldSkill.content,
+                    }),
+                }));
+                alert('❌ 更新失败: ' + err.message + '\n已恢复原技能内容，表单中的修改尚未保存，可重试。');
+            } catch (restoreErr) {
+                alert('❌ 更新失败: ' + err.message
+                    + '\n且自动恢复原技能也失败: ' + restoreErr.message
+                    + '\n请不要关闭页面，表单中仍保留当前内容，请重试保存。');
+            }
+            await loadSkills();
+        } else {
+            alert('操作失败: ' + err.message);
+        }
     }
 });
 

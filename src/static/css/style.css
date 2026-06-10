@@ -257,6 +257,31 @@ body {
     border-bottom-right-radius: var(--radius-sm);
 }
 
+/* 错误气泡（ErrorHandler.showErrorBubble 输出 .msg.error.error-{warning|error}）*/
+.msg.error .msg-content {
+    background: var(--error-bg-critical);
+    border: 1px solid var(--error-border-critical);
+}
+
+/* warning 级别置后覆盖（同特异性，后者生效）*/
+.msg.error-warning .msg-content {
+    background: var(--error-bg-warning);
+    border-color: var(--error-border-warning);
+}
+
+.error-title {
+    font-weight: 600;
+    font-size: 14px;
+    color: var(--text-primary);
+    margin-bottom: 4px;
+}
+
+.error-message {
+    font-size: 13px;
+    line-height: 1.5;
+    color: var(--text-secondary);
+}
+
 .chat-input-area {
     display: flex;
     gap: var(--space-sm);
@@ -481,7 +506,7 @@ body {
     box-shadow: 0 0 18px rgba(239,68,68,0.22);
 }
 .preview-error-badge.hidden { display: none; }
-.runtime-error-modal { width: 720px; }
+.runtime-error-modal { width: min(720px, calc(100vw - 24px)); }
 .runtime-error-hint {
     margin: 0 0 12px;
     color: var(--text-secondary);
@@ -593,7 +618,8 @@ body {
     background: var(--bg-secondary);
     border: 1px solid var(--border);
     border-radius: 12px;
-    width: 600px;
+    /* 窄屏（<624px）退让为视口宽减边距，避免弹窗贴边/溢出；桌面与原 600px 定宽等价 */
+    width: min(600px, calc(100vw - 24px));
     max-height: 80vh;
     display: flex;
     flex-direction: column;
@@ -659,6 +685,8 @@ body {
     font-size: 13px;
 }
 .asset-item .name, .project-item .name { flex: 1; }
+/* 行内 URL 可断行，防止 min-content 撑破窄屏弹窗、把删除按钮挤出屏外 */
+.asset-item code { word-break: break-all; min-width: 0; }
 .asset-item .actions, .project-item .actions { display: flex; gap: 6px; }
 .asset-item .actions button, .project-item .actions button {
     background: none; border: none; cursor: pointer; font-size: 16px; padding: 2px 6px;
@@ -922,237 +950,6 @@ body {
 }
 
 
-/* ============ 企业级错误提示样式 ============ */
-.error-banner {
-    display: flex;
-    align-items: flex-start;
-    gap: 12px;
-    padding: 14px 16px;
-    margin: 8px 0;
-    border-radius: 8px;
-    border: 1px solid;
-    background: var(--glass);
-    backdrop-filter: blur(12px);
-    animation: errorFadeIn 0.3s ease-out;
-}
-
-.error-banner.critical {
-    background: var(--error-bg-critical);
-    border-color: var(--error-border-critical);
-}
-
-.error-banner.warning {
-    background: var(--error-bg-warning);
-    border-color: var(--error-border-warning);
-}
-
-.error-banner.info {
-    background: var(--error-bg-info);
-    border-color: var(--error-border-info);
-}
-
-.error-icon {
-    font-size: 20px;
-    line-height: 1;
-    flex-shrink: 0;
-    margin-top: 2px;
-}
-
-.error-banner.critical .error-icon {
-    color: var(--error-critical);
-}
-
-.error-banner.warning .error-icon {
-    color: var(--error-warning);
-}
-
-.error-banner.info .error-icon {
-    color: var(--error-info);
-}
-
-.error-content {
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-}
-
-.error-title {
-    font-weight: 600;
-    font-size: 14px;
-    color: var(--text-primary);
-}
-
-.error-message {
-    font-size: 13px;
-    line-height: 1.5;
-    color: var(--text-secondary);
-}
-
-.error-close {
-    background: none;
-    border: none;
-    color: var(--text-secondary);
-    cursor: pointer;
-    padding: 4px;
-    font-size: 18px;
-    line-height: 1;
-    opacity: 0.6;
-    transition: opacity 0.2s;
-    flex-shrink: 0;
-}
-
-.error-close:hover {
-    opacity: 1;
-}
-
-@keyframes errorFadeIn {
-    from {
-        opacity: 0;
-        transform: translateY(-10px);
-    }
-    to {
-        opacity: 1;
-        transform: translateY(0);
-    }
-}
-
-
-/* ============ 企业级工具进度指示样式 ============ */
-.tool-progress {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    padding: 10px 14px;
-    margin: 6px 0;
-    background: var(--glass);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    backdrop-filter: blur(8px);
-}
-
-.progress-info {
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-}
-
-.progress-step {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    font-size: 13px;
-    color: var(--text-primary);
-}
-
-.progress-step-icon {
-    width: 16px;
-    height: 16px;
-    border: 2px solid var(--accent);
-    border-radius: 50%;
-    border-top-color: transparent;
-    animation: progressSpin 0.8s linear infinite;
-}
-
-.progress-step-name {
-    font-weight: 500;
-}
-
-.progress-step-time {
-    margin-left: auto;
-    font-size: 12px;
-    color: var(--progress-text);
-    font-variant-numeric: tabular-nums;
-}
-
-.progress-bar-container {
-    width: 100%;
-    height: 3px;
-    background: var(--progress-bg);
-    border-radius: 2px;
-    overflow: hidden;
-}
-
-.progress-bar-fill {
-    height: 100%;
-    background: linear-gradient(90deg, var(--accent), var(--accent-hover));
-    border-radius: 2px;
-    transition: width 0.3s ease-out;
-    box-shadow: 0 0 8px rgba(53, 231, 255, 0.4);
-}
-
-.progress-bar-fill.indeterminate {
-    width: 30%;
-    animation: progressSlide 1.5s ease-in-out infinite;
-}
-
-@keyframes progressSpin {
-    to {
-        transform: rotate(360deg);
-    }
-}
-
-@keyframes progressSlide {
-    0% {
-        transform: translateX(-100%);
-    }
-    100% {
-        transform: translateX(400%);
-    }
-}
-
-
-/* ============ 工具调用状态徽章 ============ */
-.tool-status {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    padding: 4px 10px;
-    border-radius: 12px;
-    font-size: 12px;
-    font-weight: 500;
-    background: var(--glass);
-    border: 1px solid var(--border);
-}
-
-.tool-status.running {
-    border-color: var(--accent);
-    color: var(--accent);
-}
-
-.tool-status.success {
-    border-color: var(--success);
-    color: var(--success);
-}
-
-.tool-status.error {
-    border-color: var(--error-critical);
-    color: var(--error-critical);
-}
-
-.tool-status-dot {
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-    background: currentColor;
-}
-
-.tool-status.running .tool-status-dot {
-    animation: dotPulse 1.5s ease-in-out infinite;
-}
-
-@keyframes dotPulse {
-    0%, 100% {
-        opacity: 1;
-        transform: scale(1);
-    }
-    50% {
-        opacity: 0.5;
-        transform: scale(0.8);
-    }
-}
-
 /* ============ 移动端 / 窄屏响应式（本应用主打手机小游戏，但三栏定宽横排在手机上裂开）============ */
 @media (max-width: 860px) {
     body { height: auto; min-height: 100vh; overflow: auto; }
@@ -1170,4 +967,13 @@ body {
     /* 顶栏按钮换行，避免溢出 */
     .app-header { flex-wrap: wrap; height: auto; padding: var(--space-sm); }
     .header-actions { flex-wrap: wrap; }
+    /* iOS Safari 对 <16px 的输入控件聚焦时强制整页放大且失焦不复原；触屏下输入控件统一 16px */
+    .chat-input-area textarea,
+    .modal input,
+    .modal textarea,
+    .modal select,
+    .upload-zone input,
+    .upload-zone select {
+        font-size: 16px;
+    }
 }

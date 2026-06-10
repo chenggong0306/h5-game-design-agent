@@ -91,8 +91,27 @@ app.add_middleware(
 # 静态文件 & 模板 - 使用绝对路径
 from pathlib import Path
 _BASE = Path(__file__).resolve().parent
-app.mount("/static", StaticFiles(directory=str(_BASE / "static")), name="static")
+
+
+class NoCacheStaticFiles(StaticFiles):
+    """静态资源加 Cache-Control: no-cache：浏览器每次回源做 ETag/Last-Modified 协商（命中返 304），
+    杜绝启发式缓存拿旧文件——即使 ?v= 版本串失效也最多多一次轻量回源。"""
+
+    def file_response(self, *args, **kwargs):
+        response = super().file_response(*args, **kwargs)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
+app.mount("/static", NoCacheStaticFiles(directory=str(_BASE / "static")), name="static")
 templates = Jinja2Templates(directory=str(_BASE / "templates"))
+
+# 静态资源缓存版本号：启动时取 JS/CSS 的最新 mtime，文件一改版本自动变化。
+# 取代 index.html 里手工双处同步的 ?v= 常量（git 历史上曾因忘改导致浏览器拿旧 JS 的事故）。
+_STATIC_VERSION = str(int(max(
+    (_BASE / "static" / "js" / "app.js").stat().st_mtime,
+    (_BASE / "static" / "css" / "style.css").stat().st_mtime,
+)))
 
 
 # 可选鉴权：设置了 API_TOKEN 时，/api/* 写操作需带 X-API-Token 头（只读素材放行，预览 iframe 才能加载）
@@ -118,8 +137,13 @@ app.include_router(router, dependencies=[Depends(require_token)])
 
 @app.get("/")
 async def index(request: Request):
-    """主页"""
-    return templates.TemplateResponse(request=request, name="index.html")
+    """主页（no-cache：HTML 本身不缓存，保证 ?v= 版本串每次都是最新）"""
+    return templates.TemplateResponse(
+        request=request,
+        name="index.html",
+        context={"v": _STATIC_VERSION},
+        headers={"Cache-Control": "no-cache"},
+    )
 
 
 @app.get("/preview")
