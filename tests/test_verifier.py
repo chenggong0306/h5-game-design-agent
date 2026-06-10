@@ -104,5 +104,149 @@ class BlankDetectionTests(unittest.TestCase):
         self.assertFalse(verifier._is_blank_png(png))
 
 
+class _FakeMouse:
+    async def click(self, x, y):
+        pass
+
+
+class _FakeKeyboard:
+    async def press(self, key):
+        pass
+
+
+class _FakePage:
+    def __init__(self, shot, errors):
+        self._shot = shot
+        self._errors = errors
+        self._handlers = {}
+        self.mouse = _FakeMouse()
+        self.keyboard = _FakeKeyboard()
+
+    async def route(self, pattern, handler):
+        pass
+
+    def on(self, event, cb):
+        self._handlers.setdefault(event, []).append(cb)
+
+    async def set_content(self, html, wait_until=None):
+        for e in self._errors:
+            for cb in self._handlers.get("pageerror", []):
+                cb(e)
+
+    async def wait_for_timeout(self, ms):
+        pass
+
+    async def screenshot(self):
+        return self._shot
+
+
+class _FakeBrowser:
+    def __init__(self, page):
+        self._page = page
+
+    async def new_page(self, **kw):
+        return self._page
+
+    async def close(self):
+        pass
+
+
+class _FakeChromium:
+    def __init__(self, browser):
+        self._browser = browser
+
+    async def launch(self, **kw):
+        return self._browser
+
+
+class _FakePlaywright:
+    def __init__(self, page):
+        self._page = page
+
+    def __call__(self):
+        return self
+
+    async def __aenter__(self):
+        class _PW:
+            pass
+        pw = _PW()
+        pw.chromium = _FakeChromium(_FakeBrowser(self._page))
+        return pw
+
+    async def __aexit__(self, *a):
+        return False
+
+
+class RunHeadlessTests(unittest.TestCase):
+    """run_headless 后处理路径回归：截图非空白时结果绝不能被静默丢弃。
+
+    背景：曾因 _run() 只返回 (errs, blank) 而外层引用局部变量 shot，导致
+    非空白截图必抛 NameError → except 吞掉 → return None → 运行时报错全部丢失。
+    """
+
+    def _png(self, size, painter):
+        from io import BytesIO
+        from PIL import Image
+        img = Image.new("RGB", size)
+        px = img.load()
+        for x in range(size[0]):
+            for y in range(size[1]):
+                px[x, y] = painter(x, y)
+        buf = BytesIO()
+        img.save(buf, "PNG")
+        return buf.getvalue()
+
+    def _gradient_png(self):  # 非空白（高方差）、非撕裂（相邻平滑）
+        return self._png((64, 64), lambda x, y: ((x * 4) % 256, (y * 4) % 256, ((x + y) * 2) % 256))
+
+    def _solid_png(self):  # 空白（纯色）
+        return self._png((64, 64), lambda x, y: (20, 30, 40))
+
+    def _noise_png(self):  # 撕裂（相邻像素剧烈跳变）；40×30 与检测分辨率一致，避免缩放平滑
+        import random
+        rng = random.Random(42)
+        return self._png((40, 30), lambda x, y: (rng.randrange(256), rng.randrange(256), rng.randrange(256)))
+
+    def _run_with_fake(self, shot, errors):
+        import sys
+        import types
+        mod = types.ModuleType("playwright.async_api")
+        mod.async_playwright = _FakePlaywright(_FakePage(shot, errors))
+        pkg = types.ModuleType("playwright")
+        pkg.async_api = mod
+        saved = {k: sys.modules.get(k) for k in ("playwright", "playwright.async_api")}
+        sys.modules["playwright"] = pkg
+        sys.modules["playwright.async_api"] = mod
+        try:
+            return asyncio.run(verifier.run_headless("<canvas></canvas><script>1</script></html>"))
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    sys.modules.pop(k, None)
+                else:
+                    sys.modules[k] = v
+
+    def test_runtime_error_reported_on_nonblank_screen(self):
+        issues = self._run_with_fake(self._gradient_png(), ["ReferenceError: h is not defined"])
+        self.assertIsNotNone(issues, "非空白截图时结果被整体丢弃（shot 回归复现）")
+        got = ids(issues)
+        self.assertIn("runtime_error", got)
+        self.assertTrue(any("h is not defined" in i["msg"] for i in issues))
+
+    def test_clean_nonblank_screen_returns_empty_list(self):
+        issues = self._run_with_fake(self._gradient_png(), [])
+        self.assertEqual(issues, [])
+
+    def test_blank_screen_reported(self):
+        issues = self._run_with_fake(self._solid_png(), [])
+        self.assertIsNotNone(issues)
+        self.assertIn("blank_screen", ids(issues))
+
+    def test_visual_tearing_reported(self):
+        issues = self._run_with_fake(self._noise_png(), [])
+        self.assertIsNotNone(issues)
+        self.assertIn("visual_tearing", ids(issues))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1578,9 +1578,11 @@ class GameDesignAgent:
         lock = self._get_session_lock(session_id)  # 串行化同一会话的并发回合
         config = {"configurable": {"thread_id": session_id}, "recursion_limit": 500}
         token = None
+        acquired = False
 
         try:
             await lock.acquire()
+            acquired = True
             token = _begin_code_session(session_id, current_code, code_dirty)
             base_code = _get_current_code()  # 协调后的基准代码
             # 流状态：full_reply 累积文本、last_code_sent 去重 code_update、ctx_key 去重 context_usage
@@ -1608,8 +1610,9 @@ class GameDesignAgent:
             yield {"type": "done", "code": code, "action": action}
 
         except asyncio.CancelledError:
-            # 用户取消请求，正常情况
-            yield {"type": "error", "content": "请求已取消", "error_code": "CANCELLED"}
+            # 用户取消/断开：客户端已收不到任何事件，且取消必须向上传播
+            # （吞掉它继续 yield 会触发 "async generator ignored GeneratorExit"）
+            raise
         except MemoryError as e:
             # 内存不足
             log_error(session_id, ErrorCode.SYSTEM_ERROR, "内存不足", e)
@@ -1625,11 +1628,10 @@ class GameDesignAgent:
         finally:
             if token is not None:
                 _end_code_session(token)
-            # 防御性释放：若 acquire 被 CancelledError 中断，release() 会抛 RuntimeError
-            try:
+            # 只释放自己真正持有的锁：asyncio.Lock 不跟踪持有者，等锁中被取消时
+            # 无条件 release() 会把"别的请求正持有的锁"放掉，串行化随之失效
+            if acquired:
                 lock.release()
-            except RuntimeError:
-                pass
 
     @staticmethod
     def _extract_code(text: str) -> str | None:
