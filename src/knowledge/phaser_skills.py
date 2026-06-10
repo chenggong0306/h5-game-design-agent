@@ -522,8 +522,12 @@ function rotLayer(axis, layer, angle) {
 function proj(w) {
     let v = rotX(w, vRX);
     v = rotY(v, vRY);
-    const f = 400 / (6 + v.z);
-    return { x: W/2 + v.x*100*f, y: H/2 - v.y*100*f, z: v.z };
+    // ★ 关键：scale 用 min(W,H) 自适应屏幕，不要 *100 叠加系数
+    // 错误: v.x*100*400/(6+v.z) → 像素坐标巨大 → 魔方飞到屏幕外
+    // 正确: v.x * scale/(6+v.z) → 魔方占屏幕 35%
+    const scale = Math.min(W, H) * 0.35;
+    const f = scale / (6 + v.z);
+    return { x: W/2 + v.x*f, y: H/2 - v.y*f, z: v.z };
 }
 
 function faceVerts(c, n) {
@@ -538,8 +542,8 @@ function faceVerts(c, n) {
 
 function drawFace(pts3, color) {
     const pts = pts3.map(proj);
-    const cross = (pts[1].x-pts[0].x)*(pts[2].y-pts[0].y) - (pts[1].y-pts[0].y)*(pts[2].x-pts[0].x);
-    if (cross <= 0) return;
+    // ★ 背面剔除已由 drawC 的视角空间法线完成（vn.z <= 0），
+    // 这里不需要再做 2D 叉积——投影后顶点顺序可能因旋转而反转。
     ctx.fillStyle = color; ctx.strokeStyle = 'rgba(0,0,0,.5)'; ctx.lineWidth = 2;
     ctx.beginPath();
     ctx.moveTo(pts[0].x,pts[0].y); ctx.lineTo(pts[1].x,pts[1].y);
@@ -587,18 +591,29 @@ init(); loop();
 
 ## 关键渲染流程（严格照此顺序）
 
-1. **resize**: `setTransform(dpr,0,0,dpr,0,0)` + `canvas.style.width/height`
+1. **resize**: `setTransform(dpr,0,0,dpr,0,0)` + `canvas.style.width = W + 'px'`（禁止 ctx.scale）
 2. **每帧**: `clearRect` → 所有 cubelet 投影拿 z → **按 z 排序（远→近）** → 逐个 drawC
-3. **drawC**: 6 个面 → 法线变到视角空间 → `vn.z <= 0` 跳过 → `faceVerts` 算顶点 → `drawFace`
-4. **drawFace**: 投影 4 个顶点 → 2D 叉积背面剔除 → fill + stroke
-5. **旋转层**: 改 cubelet 的 `p` 和 `orig` → `Math.round(orig)` 量化防止漂移
+3. **drawC**: 6 个面 → 法线变到视角空间 → `vn.z <= 0` 跳过（视角空间背面剔除，不要在 drawFace 里再加 2D 叉积）
+4. **drawFace**: 投影 4 个顶点 → fill + stroke（背面剔除已在 drawC 完成）
+5. **旋转层**: 改 cubelet 的 `p` 和 `orig` → `Math.round(orig)` 量化到 -1/0/1 防止浮点漂移
+
+## 投影公式（最容易出错的点）
+
+```
+错误: v.x * 100 * (600 / (6+v.z))  → 像素坐标 ≈ 10000 → 飞到屏幕外
+正确: v.x * (scale / (6+v.z))      → 其中 scale = Math.min(W, H) * 0.35
+```
+
+不要叠加两个系数！`*100` 或 `*f` 选一个就行，不要 `*100*f`。
 
 ## 如果生成 3D 游戏，请严格参考上述代码的结构和数学逻辑，避免：
+- ❌ `v.x * 数值 * f` 叠加两个缩放因子（投影到屏幕外）
 - ❌ 在世界空间判背面（方向随视角变化会反）
 - ❌ 对 project() 返回的普通对象调 V3 方法
 - ❌ 旋转后不量化 orig（浮点累积漂移）
 - ❌ 忘记 canvas.style.width/height（高分屏放大）
-- ❌ 使用 ctx.scale(dpr)（叠加缩放）"""
+- ❌ 使用 ctx.scale(dpr)（叠加缩放）
+- ❌ drawFace 里再加 2D 叉积背面剔除（与 drawC 重复，可能误杀面）"""
     },
 ]
 

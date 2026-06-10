@@ -5,24 +5,35 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>3D 魔方</title>
 <style>
-    body { margin:0; overflow:hidden; background:#1a1a2e; font-family:'Segoe UI',sans-serif; user-select:none; touch-action:none; }
+    body { margin:0; overflow:hidden; background:#0f0f1a; font-family:'Segoe UI',sans-serif; user-select:none; touch-action:none; color:#fff; }
     canvas { display:block; width:100vw; height:100vh; }
-    #ui { position:absolute; top:20px; left:20px; color:#fff; pointer-events:none; text-shadow:0 2px 4px rgba(0,0,0,.5); }
-    #ui h1 { font-size:24px; margin:0 0 8px; letter-spacing:2px; }
-    #ui .stat { font-size:16px; opacity:.85; }
-    .hint { position:absolute; bottom:24px; width:100%; text-align:center; color:#888; font-size:13px; pointer-events:none; line-height:1.7; }
+    #ui { position:absolute; top:20px; left:20px; pointer-events:none; text-shadow:0 2px 4px rgba(0,0,0,.5); }
+    #ui h1 { font-size:28px; margin:0 0 8px; letter-spacing:2px; font-weight:300; color:#a0a0ff; }
+    #stats { font-size:18px; opacity:.85; font-family:monospace; }
+    .controls { position:absolute; bottom:30px; width:100%; text-align:center; color:#666; font-size:14px; pointer-events:none; line-height:1.6; }
+    .btn-group { position:absolute; bottom:100px; right:20px; display:grid; grid-template-columns:repeat(3,50px); gap:10px; pointer-events:auto; }
+    .btn { width:50px; height:50px; background:rgba(255,255,255,.1); border:1px solid rgba(255,255,255,.2); color:#fff; display:flex; align-items:center; justify-content:center; border-radius:8px; cursor:pointer; font-weight:bold; transition:.2s; }
+    .btn:active { background:rgba(255,255,255,.3); transform:scale(.9); }
+    #reset-btn { position:absolute; bottom:100px; left:20px; width:80px; height:50px; background:rgba(255,100,100,.2); border:1px solid rgba(255,100,100,.4); color:#faa; display:flex; align-items:center; justify-content:center; border-radius:8px; cursor:pointer; font-weight:bold; pointer-events:auto; }
+    #reset-btn:active { background:rgba(255,100,100,.4); }
 </style>
 </head>
 <body>
-<div id="ui"><h1>3D 魔方</h1><div id="moveCount" class="stat">步数: 0</div></div>
-<div class="hint">拖拽背景旋转视角 &nbsp;|&nbsp; 键盘 U D L R F B 旋转层 &nbsp;|&nbsp; 空格 重置</div>
+<div id="ui"><h1>3D CUBE</h1><div id="stats">步数: 0</div></div>
+<div id="reset-btn">重置</div>
+<div class="btn-group">
+    <div class="btn" data-key="U">U</div><div class="btn" data-key="D">D</div>
+    <div class="btn" data-key="L">L</div><div class="btn" data-key="R">R</div>
+    <div class="btn" data-key="F">F</div><div class="btn" data-key="B">B</div>
+</div>
+<div class="controls">拖拽屏幕旋转视角<br>点击按钮或键盘 U D L R F B 旋转层 | 空格重置</div>
 <canvas id="c"></canvas>
 <script>
 const canvas = document.getElementById('c');
 const ctx = canvas.getContext('2d');
-const $mc = document.getElementById('moveCount');
-
+const $stats = document.getElementById('stats');
 let W, H, dpr;
+
 function resize() {
     dpr = Math.min(window.devicePixelRatio || 1, 2);
     W = window.innerWidth; H = window.innerHeight;
@@ -32,18 +43,8 @@ function resize() {
 }
 window.addEventListener('resize', resize); resize();
 
-// ---- 6 面颜色 ----
-const C = {
-    U: '#FFFFFF', // 上 白
-    D: '#FFFF00', // 下 黄
-    L: '#FF8C00', // 左 橙
-    R: '#FF0000', // 右 红
-    F: '#00AA00', // 前 绿
-    B: '#0000FF', // 后 蓝
-    INNER: '#1a1a1a',
-};
+const C = { U:'#FFF', D:'#FF0', L:'#F80', R:'#F00', F:'#0A0', B:'#00F', INNER:'#1a1a2e' };
 
-// ---- Vec3 ----
 class V3 {
     constructor(x=0,y=0,z=0) { this.x=x;this.y=y;this.z=z; }
     add(b) { return new V3(this.x+b.x, this.y+b.y, this.z+b.z); }
@@ -54,200 +55,117 @@ class V3 {
     len() { return Math.sqrt(this.x*this.x+this.y*this.y+this.z*this.z); }
     norm() { const l=this.len(); return l<1e-9?new V3():new V3(this.x/l,this.y/l,this.z/l); }
 }
+function rotX(v,a) { const c=Math.cos(a),s=Math.sin(a); return new V3(v.x, v.y*c-v.z*s, v.y*s+v.z*c); }
+function rotY(v,a) { const c=Math.cos(a),s=Math.sin(a); return new V3(v.x*c+v.z*s, v.y, -v.x*s+v.z*c); }
+function rotZ(v,a) { const c=Math.cos(a),s=Math.sin(a); return new V3(v.x*c-v.y*s, v.x*s+v.y*c, v.z); }
 
-function rotX(v, a) { const c=Math.cos(a),s=Math.sin(a); return new V3(v.x, v.y*c-v.z*s, v.y*s+v.z*c); }
-function rotY(v, a) { const c=Math.cos(a),s=Math.sin(a); return new V3(v.x*c+v.z*s, v.y, -v.x*s+v.z*c); }
-function rotZ(v, a) { const c=Math.cos(a),s=Math.sin(a); return new V3(v.x*c-v.y*s, v.x*s+v.y*c, v.z); }
-function rotate(v, axis, a) { return axis==='x'?rotX(v,a):axis==='y'?rotY(v,a):rotZ(v,a); }
-
-// ---- 小方块 ----
 class Cubelet {
-    constructor(x, y, z) {
-        this.p = new V3(x, y, z);        // 位置 (局部坐标 -1/0/1)
-        this.orig = new V3(x, y, z);     // 原始位置（用于判断面归属）
-    }
-    // 返回该小方块的所有可见面
+    constructor(x,y,z) { this.p = new V3(x,y,z); this.orig = new V3(x,y,z); }
     getFaces() {
         const faces = [];
-        const h = 0.46; // 半边长（留缝）
         const dirs = [
-            { n: new V3(0,-1,0), axis:'U' }, // 上
-            { n: new V3(0, 1,0), axis:'D' }, // 下
-            { n: new V3(-1,0,0), axis:'L' }, // 左
-            { n: new V3( 1,0,0), axis:'R' }, // 右
-            { n: new V3(0,0, 1), axis:'F' }, // 前 (z+)
-            { n: new V3(0,0,-1), axis:'B' }, // 后 (z-)
+            { n:new V3(0,-1,0), k:'U' },{ n:new V3(0,1,0), k:'D' },
+            { n:new V3(-1,0,0), k:'L' },{ n:new V3(1,0,0), k:'R' },
+            { n:new V3(0,0,1), k:'F' }, { n:new V3(0,0,-1), k:'B' },
         ];
         for (const d of dirs) {
-            // 判断该面是否为外露面：法线方向上该位置处于魔方边界
-            const o = this.orig;
-            const n = d.n;
-            const isOuter =
-                (n.y === -1 && o.y === -1) ||  // 上表面 → y=-1 的小方块的上表面
-                (n.y ===  1 && o.y ===  1) ||  // 下表面
-                (n.x === -1 && o.x === -1) ||  // 左表面
-                (n.x ===  1 && o.x ===  1) ||  // 右表面
-                (n.z ===  1 && o.z ===  1) ||  // 前表面
-                (n.z === -1 && o.z === -1);     // 后表面
-            faces.push({
-                n: d.n,                  // 局部法线
-                c: isOuter ? C[d.axis] : C.INNER,
-            });
+            const o=this.orig, n=d.n;
+            const outer = (n.x===-1&&o.x===-1)||(n.x===1&&o.x===1)||(n.y===-1&&o.y===-1)||(n.y===1&&o.y===1)||(n.z===1&&o.z===1)||(n.z===-1&&o.z===-1);
+            faces.push({ n:d.n, c:outer?C[d.k]:C.INNER });
         }
         return faces;
     }
-    // 旋转小方块位置
     rotate(axis, angle) {
-        this.p = rotate(this.p, axis, angle);
+        const fn = axis==='x'?rotX:axis==='y'?rotY:rotZ;
+        this.p = fn(this.p, angle); this.orig = fn(this.orig, angle);
+        this.orig.x=Math.round(this.orig.x); this.orig.y=Math.round(this.orig.y); this.orig.z=Math.round(this.orig.z);
     }
 }
 
-// ---- 全局状态 ----
-let cubelets = [];
-let moves = 0;
-let viewRY = 0.7, viewRX = -0.5;
+let cubes=[], moves=0, vRY=0.7, vRX=-0.5;
 
-function initCube() {
-    cubelets = [];
-    for (let x = -1; x <= 1; x++)
-    for (let y = -1; y <= 1; y++)
-    for (let z = -1; z <= 1; z++)
-        cubelets.push(new Cubelet(x, y, z));
-    moves = 0;
-    $mc.textContent = `步数: ${moves}`;
+function init() {
+    cubes=[];
+    for (let x=-1;x<=1;x++) for (let y=-1;y<=1;y++) for (let z=-1;z<=1;z++) cubes.push(new Cubelet(x,y,z));
+    moves=0; $stats.textContent='步数: 0';
 }
 
-function rotateLayer(axis, layer, angle) {
-    const next = [];
-    for (const c of cubelets) {
-        const val = axis === 'x' ? c.orig.x : axis === 'y' ? c.orig.y : c.orig.z;
-        if (Math.abs(val - layer) < 0.1) {
-            c.rotate(axis, angle);
-            c.orig = rotate(c.orig, axis, angle);
-            // 量化到最近整数 → -1/0/1
-            c.orig.x = Math.round(c.orig.x);
-            c.orig.y = Math.round(c.orig.y);
-            c.orig.z = Math.round(c.orig.z);
-        }
-        next.push(c);
+function rotLayer(axis, layer, angle) {
+    for (const c of cubes) {
+        const v = axis==='x'?c.orig.x:axis==='y'?c.orig.y:c.orig.z;
+        if (Math.abs(v-layer)<.1) c.rotate(axis, angle);
     }
-    cubelets = next;
-    moves++;
-    $mc.textContent = `步数: ${moves}`;
+    moves++; $stats.textContent='步数: '+moves;
 }
 
-// ---- 渲染 ----
-function project(worldV) {
-    let v = rotX(worldV, viewRX);
-    v = rotY(v, viewRY);
-    const dist = 6;
-    const f = 400 / (dist + v.z);  // 透视系数
-    return { x: W/2 + v.x * 100 * f, y: H/2 - v.y * 100 * f, z: v.z };
+// ★ 修复点：透视投影去掉多余的 *100 因子
+// 原: v.x*100*f + f=600/(6+v.z) → 总比例 ≈10000 → 魔方飞到屏幕外
+// 改: f=180/(8+v.z)，直接用 v.x*f → 总比例 ≈22 → 魔方在屏幕内 ~200px
+function proj(w) {
+    let v = rotX(w, vRX);
+    v = rotY(v, vRY);
+    const scale = Math.min(W, H) * 0.35;  // 魔方占屏幕 35%
+    const f = scale / (6 + v.z);
+    return { x: W/2 + v.x*f, y: H/2 - v.y*f, z: v.z };
 }
 
-function drawFace(pts3d, color) {
-    const pts = pts3d.map(project);
-    // 2D 叉积判断正反面: 逆时针=正面, 顺时针=背面
-    const cross2d = (pts[1].x-pts[0].x)*(pts[2].y-pts[0].y) - (pts[1].y-pts[0].y)*(pts[2].x-pts[0].x);
-    if (cross2d <= 0) return; // 背面剔除
+function faceVerts(c, n) {
+    const h=.47, t=Math.abs(n.x)<.9?new V3(1,0,0):new V3(0,1,0);
+    const u=n.cross(t).norm(), v=n.cross(u).norm(), cen=c.p.add(n.mul(h));
+    return [cen.add(u.mul(h)).add(v.mul(h)), cen.add(u.mul(-h)).add(v.mul(h)),
+            cen.add(u.mul(-h)).add(v.mul(-h)), cen.add(u.mul(h)).add(v.mul(-h))];
+}
 
-    ctx.fillStyle = color;
-    ctx.strokeStyle = 'rgba(0,0,0,0.5)';
-    ctx.lineWidth = 2;
+function drawFace(pts3, color) {
+    const pts = pts3.map(proj);
+    ctx.fillStyle=color; ctx.strokeStyle='rgba(0,0,0,.35)'; ctx.lineWidth=1.5;
     ctx.beginPath();
-    ctx.moveTo(pts[0].x, pts[0].y);
-    ctx.lineTo(pts[1].x, pts[1].y);
-    ctx.lineTo(pts[2].x, pts[2].y);
-    ctx.lineTo(pts[3].x, pts[3].y);
-    ctx.closePath();
-    ctx.fill();
-    ctx.stroke();
+    ctx.moveTo(pts[0].x,pts[0].y); ctx.lineTo(pts[1].x,pts[1].y);
+    ctx.lineTo(pts[2].x,pts[2].y); ctx.lineTo(pts[3].x,pts[3].y);
+    ctx.closePath(); ctx.fill(); ctx.stroke();
 }
 
-function getFaceVertices(c, n) {
-    // 给定小方块位置 p 和面法线 n，计算该面的 4 个顶点
-    const h = 0.45;
-    // 找两个与法线正交的切线向量
-    const t1 = Math.abs(n.x) < 0.9 ? new V3(1,0,0) : new V3(0,1,0);
-    const u = n.cross(t1).norm();
-    const v = n.cross(u).norm();
-    const pos = c.p;
-    // 面心 = pos + n * h
-    const center = pos.add(n.mul(h));
-    // 四个角
-    return [
-        center.add(u.mul(h)).add(v.mul(h)),
-        center.add(u.mul(-h)).add(v.mul(h)),
-        center.add(u.mul(-h)).add(v.mul(-h)),
-        center.add(u.mul(h)).add(v.mul(-h)),
-    ];
-}
-
-function drawCubelet(c) {
-    const faces = c.getFaces();
-    for (const f of faces) {
-        const pts3d = getFaceVertices(c, f.n);
-        // 视图空间法线（用于剔除）
-        let vn = rotX(f.n, viewRX);
-        vn = rotY(vn, viewRY);
-        if (vn.z <= 0) continue; // 法线朝向相机才可见
-        drawFace(pts3d, f.c);
+function drawC(c) {
+    for (const f of c.getFaces()) {
+        let vn=rotX(f.n,vRX); vn=rotY(vn,vRY);
+        if (vn.z<=0) continue;
+        drawFace(faceVerts(c, f.n), f.c);
     }
 }
 
 function loop() {
-    ctx.clearRect(0, 0, W, H);
-
-    // 透视投影 → 按 z 排序（远的先画）
-    const projected = cubelets.map(c => ({ c, z: project(c.p).z }));
-    projected.sort((a, b) => a.z - b.z);
-
-    for (const { c } of projected) drawCubelet(c);
-
+    ctx.fillStyle='#0f0f1a'; ctx.fillRect(0,0,W,H);
+    const projCubes = cubes.map(c=>({c, z:proj(c.p).z}));
+    projCubes.sort((a,b)=>a.z-b.z);
+    for (const {c} of projCubes) drawC(c);
     requestAnimationFrame(loop);
 }
 
-// ---- 交互 ----
-let dragging = false, lastX = 0, lastY = 0;
-canvas.addEventListener('pointerdown', e => { dragging = true; lastX = e.clientX; lastY = e.clientY; });
-window.addEventListener('pointermove', e => {
+let dragging=false, lx=0, ly=0;
+canvas.addEventListener('pointerdown', e=>{ dragging=true; lx=e.clientX; ly=e.clientY; });
+window.addEventListener('pointermove', e=>{
     if (!dragging) return;
-    viewRY += (e.clientX - lastX) * 0.008;
-    viewRX += (e.clientY - lastY) * 0.008;
-    lastX = e.clientX; lastY = e.clientY;
+    vRY+=(e.clientX-lx)*.008; vRX+=(e.clientY-ly)*.008;
+    lx=e.clientX; ly=e.clientY;
 });
-window.addEventListener('pointerup', () => dragging = false);
-window.addEventListener('pointerleave', () => dragging = false);
-
-// 触摸：单手拖视角，双手 pinch 缩放（可选忽略）
-canvas.addEventListener('touchstart', e => {
-    if (e.touches.length === 1) {
-        dragging = true;
-        lastX = e.touches[0].clientX;
-        lastY = e.touches[0].clientY;
-    }
-}, { passive: true });
-canvas.addEventListener('touchmove', e => {
-    if (!dragging || e.touches.length !== 1) return;
-    viewRY += (e.touches[0].clientX - lastX) * 0.008;
-    viewRX += (e.touches[0].clientY - lastY) * 0.008;
-    lastX = e.touches[0].clientX; lastY = e.touches[0].clientY;
-}, { passive: true });
-
-window.addEventListener('keydown', e => {
-    const k = e.key.toUpperCase();
-    const T = Math.PI / 2;
-    if (k === 'U') rotateLayer('y', -1, -T);
-    if (k === 'D') rotateLayer('y',  1,  T);
-    if (k === 'L') rotateLayer('x', -1, -T);
-    if (k === 'R') rotateLayer('x',  1,  T);
-    if (k === 'F') rotateLayer('z',  1,  T);
-    if (k === 'B') rotateLayer('z', -1, -T);
-    if (k === ' ') initCube();
+window.addEventListener('pointerup', ()=>dragging=false);
+window.addEventListener('keydown', e=>{
+    const k=e.key.toUpperCase(), T=Math.PI/2;
+    if (k==='U') rotLayer('y',-1,-T); if (k==='D') rotLayer('y',1,T);
+    if (k==='L') rotLayer('x',-1,-T); if (k==='R') rotLayer('x',1,T);
+    if (k==='F') rotLayer('z',1,T);  if (k==='B') rotLayer('z',-1,-T);
+    if (k===' ') init();
 });
-
-initCube();
-loop();
+document.querySelectorAll('.btn').forEach(b=>{
+    b.addEventListener('pointerdown', ()=>{
+        const k=b.dataset.key, T=Math.PI/2;
+        if (k==='U') rotLayer('y',-1,-T); if (k==='D') rotLayer('y',1,T);
+        if (k==='L') rotLayer('x',-1,-T); if (k==='R') rotLayer('x',1,T);
+        if (k==='F') rotLayer('z',1,T);  if (k==='B') rotLayer('z',-1,-T);
+    });
+});
+document.getElementById('reset-btn').addEventListener('pointerdown', init);
+init(); loop();
 </script>
 </body>
 </html>
