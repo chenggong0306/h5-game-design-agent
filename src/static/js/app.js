@@ -206,12 +206,9 @@ const chatInput = document.getElementById('chat-input');
 const contextMeter = document.getElementById('context-meter');
 const contextPercent = document.getElementById('context-percent');
 const contextRing = document.getElementById('context-ring');
-const imageInput = document.getElementById('chat-image-input');
-const attachImageButton = document.getElementById('btn-attach-image');
+let selectedImages = [];
 const imageAttachments = document.getElementById('image-attachments');
 const MAX_CHAT_IMAGE_BYTES = 10 * 1024 * 1024;
-let selectedImages = [];
-
 
 let activeStreamState = null;
 
@@ -834,13 +831,39 @@ chatInput.addEventListener('keydown', (e) => {
     }
 });
 
-if (attachImageButton && imageInput) {
-    attachImageButton.addEventListener('click', () => imageInput.click());
-    imageInput.addEventListener('change', async () => {
-        await addSelectedImageFiles(Array.from(imageInput.files || []));
-        imageInput.value = '';
-    });
-}
+// ---------- 粘贴图片上传 ----------
+chatInput.addEventListener('paste', (e) => {
+    const items = e.clipboardData?.items;
+    if (!items) return;
+    const imageFiles = [];
+    for (const item of items) {
+        if (item.type.startsWith('image/')) {
+            const file = item.getAsFile();
+            if (file) imageFiles.push(file);
+        }
+    }
+    if (imageFiles.length) {
+        e.preventDefault(); // 不把图片二进制贴进文本框
+        addSelectedImageFiles(imageFiles);
+    }
+});
+
+// ---------- 拖拽图片到聊天区上传 ----------
+const chatPanel = document.querySelector('.chat-panel');
+chatPanel.addEventListener('dragover', (e) => {
+    // 只处理文件拖拽（忽略从素材/技能弹窗拖来的文本链接）
+    if (e.dataTransfer.types.includes('Files')) {
+        e.preventDefault();
+        chatPanel.classList.add('drag-over');
+    }
+});
+chatPanel.addEventListener('dragleave', () => chatPanel.classList.remove('drag-over'));
+chatPanel.addEventListener('drop', (e) => {
+    e.preventDefault();
+    chatPanel.classList.remove('drag-over');
+    const imageFiles = Array.from(e.dataTransfer.files || []).filter(f => f.type.startsWith('image/'));
+    if (imageFiles.length) addSelectedImageFiles(imageFiles);
+});
 
 async function resetCurrentWorkspace(message = '👋 已创建新项目。告诉我你想做什么游戏吧！') {
     if (isStreaming) {
