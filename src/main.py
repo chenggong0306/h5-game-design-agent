@@ -1,7 +1,6 @@
 """AI 游戏设计智能体 - 主应用入口"""
 
 import sys
-import os
 from pathlib import Path
 
 # 修复 Windows 控制台编码
@@ -27,7 +26,6 @@ except Exception:
 
 from contextlib import asynccontextmanager
 
-import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
@@ -67,6 +65,13 @@ async def lifespan(app: FastAPI):
         except Exception:
             pass
 
+    # 关停自检常驻的无头浏览器（未启用/未启动过则为空操作）
+    try:
+        from src.agent.verifier import aclose_browser
+        await aclose_browser()
+    except Exception:
+        pass
+
 
 # 创建 FastAPI 应用
 app = FastAPI(
@@ -89,7 +94,6 @@ app.add_middleware(
 )
 
 # 静态文件 & 模板 - 使用绝对路径
-from pathlib import Path
 _BASE = Path(__file__).resolve().parent
 
 
@@ -163,12 +167,3 @@ async def favicon():
 async def chrome_devtools_config():
     """屏蔽 Chrome DevTools 自动探测请求"""
     return Response(status_code=204)
-
-
-if __name__ == "__main__":
-    uvicorn.run(
-        "src.main:app",
-        host=settings.host,
-        port=settings.port,
-        reload=settings.debug,
-    )

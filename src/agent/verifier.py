@@ -125,7 +125,8 @@ def _is_visually_torn(png_bytes: bytes) -> bool:
         import io
         from PIL import Image
         img = Image.open(io.BytesIO(png_bytes)).convert("RGB").resize((40, 30))
-        pixels = list(img.getdata())
+        raw = img.tobytes()  # RGBRGB...（避开已弃用的 Image.getdata）
+        pixels = [(raw[i], raw[i + 1], raw[i + 2]) for i in range(0, len(raw), 3)]
         if not pixels:
             return False
         w, h = 40, 30
@@ -150,51 +151,127 @@ def _is_visually_torn(png_bytes: bytes) -> bool:
         return False
 
 
+# ---- 浏览器实例复用：self_check 默认开启时每回合最多 2-3 次检查，逐次冷启动 Chromium
+# 各付 0.5-1.5 秒；改为懒启动 + 常驻复用（每次检查仍开独立 page），异常即整体丢弃、
+# 空闲 _BROWSER_IDLE_CLOSE_S 秒后自动关停，应用 shutdown 时由 aclose_browser() 兜底。
+_pw = None
+_browser = None
+_browser_lock: asyncio.Lock | None = None
+_idle_close_task: asyncio.Task | None = None
+_BROWSER_IDLE_CLOSE_S = 300.0
+
+
+def _get_browser_lock() -> asyncio.Lock:
+    global _browser_lock
+    if _browser_lock is None:
+        _browser_lock = asyncio.Lock()
+    return _browser_lock
+
+
+async def _get_browser():
+    """懒启动并复用 Chromium 实例；断连自动重启。调用方需持 _browser_lock。"""
+    global _pw, _browser
+    if _browser is not None and _browser.is_connected():
+        return _browser
+    from playwright.async_api import async_playwright
+    if _pw is None:
+        _pw = await async_playwright().start()
+    _browser = await _pw.chromium.launch(headless=True, args=["--no-sandbox", "--disable-gpu"])
+    return _browser
+
+
+async def _discard_browser():
+    """整体丢弃浏览器实例（下次冷启动）。异常/超时后调用，不复用状态不明的进程。"""
+    global _pw, _browser
+    b, _browser = _browser, None
+    pw, _pw = _pw, None
+    if b is not None:
+        try:
+            await b.close()
+        except Exception:
+            pass
+    if pw is not None:
+        try:
+            await pw.stop()
+        except Exception:
+            pass
+
+
+async def aclose_browser():
+    """关停常驻浏览器（应用 shutdown / 空闲超时调用）。未启动过则为空操作。"""
+    global _idle_close_task
+    task, _idle_close_task = _idle_close_task, None
+    if task is not None and task is not asyncio.current_task() and not task.done():
+        task.cancel()
+    async with _get_browser_lock():
+        await _discard_browser()
+
+
+def _schedule_idle_close():
+    global _idle_close_task
+    old = _idle_close_task
+    if old is not None and not old.done():
+        old.cancel()
+
+    async def _idle():
+        try:
+            await asyncio.sleep(_BROWSER_IDLE_CLOSE_S)
+        except asyncio.CancelledError:
+            return
+        await aclose_browser()
+
+    _idle_close_task = asyncio.create_task(_idle())
+
+
 async def run_headless(html: str, timeout_s: float = 15.0) -> list[dict] | None:
     """用 playwright chromium 跑一遍游戏，捕获运行时报错 + 空屏。
     未安装 playwright/chromium 或出错/超时 → 返回 None（视为不可用，降级到纯静态）。
     整个过程有 timeout_s 墙钟上限，卡住的页面不会拖死自检。"""
     try:
-        from playwright.async_api import async_playwright
+        from playwright.async_api import async_playwright  # noqa: F401 仅探测依赖可用性
     except Exception:
         return None
 
+    async with _get_browser_lock():
+        try:
+            browser = await _get_browser()
+        except Exception as e:
+            logger.warning("headless_browser_launch_failed", error=str(e))
+            return None
+
     async def _run() -> tuple[list[str], bool, bytes]:
-        async with async_playwright() as pw:
-            # --no-sandbox：root 容器/AutoDL 等环境下 Chromium 启动的必要条件。
-            # 去掉沙箱降低进程隔离，威胁模型里的缓解措施：
-            #   1. 仅跑不可信 HTML 且拦截外部网络请求（下面 page.route 只放行 data:/about:/blob:）
-            #   2. 整段有 wall-clock timeout（asyncio.wait_for），卡住不会拖死自检
-            #   3. 每次浏览器实例用完立即 close（finally 块保证）
-            browser = await pw.chromium.launch(headless=True, args=["--no-sandbox", "--disable-gpu"])
-            try:
-                page = await browser.new_page(viewport={"width": 390, "height": 740}, device_scale_factor=2)
+        # --no-sandbox：root 容器/AutoDL 等环境下 Chromium 启动的必要条件。
+        # 去掉沙箱降低进程隔离，威胁模型里的缓解措施：
+        #   1. 仅跑不可信 HTML 且拦截外部网络请求（下面 page.route 只放行 data:/about:/blob:）
+        #   2. 整段有 wall-clock timeout（asyncio.wait_for），卡住不会拖死自检
+        #   3. 每次检查用独立 page、用完即关（finally 保证）；浏览器实例复用但异常即弃、空闲超时自动关停
+        page = await browser.new_page(viewport={"width": 390, "height": 740}, device_scale_factor=2)
+        try:
+            # 安全：被检代码是模型生成的不可信 HTML。拦截一切外部请求，只放行内联资源
+            # （data:/about:/blob:），防止 SSRF 打云元数据(169.254.169.254)/内网服务、或读本地文件。
+            async def _block_external(route):
+                scheme = route.request.url.split(":", 1)[0].lower()
+                if scheme in ("data", "about", "blob"):
+                    await route.continue_()
+                else:
+                    await route.abort()
+            await page.route("**/*", _block_external)
 
-                # 安全：被检代码是模型生成的不可信 HTML。拦截一切外部请求，只放行内联资源
-                # （data:/about:/blob:），防止 SSRF 打云元数据(169.254.169.254)/内网服务、或读本地文件。
-                async def _block_external(route):
-                    scheme = route.request.url.split(":", 1)[0].lower()
-                    if scheme in ("data", "about", "blob"):
-                        await route.continue_()
-                    else:
-                        await route.abort()
-                await page.route("**/*", _block_external)
-
-                errs: list[str] = []
-                page.on("pageerror", lambda e: errs.append(str(e)))
-                page.on("console", lambda m: errs.append(m.text) if m.type == "error" else None)
-                await page.set_content(html, wait_until="load")
-                await page.wait_for_timeout(1200)            # 让 requestAnimationFrame 跑起来
-                try:                                          # 模拟"点击开始"+按键，触发进入游戏
-                    await page.mouse.click(195, 370)
-                    await page.keyboard.press("Space")
-                except Exception:
-                    pass
-                await page.wait_for_timeout(800)
-                shot = await page.screenshot()
-                return errs, _is_blank_png(shot), shot
-            finally:
-                await browser.close()  # 即便超时取消，也保证关掉浏览器进程
+            errs: list[str] = []
+            page.on("pageerror", lambda e: errs.append(str(e)))
+            page.on("console", lambda m: errs.append(m.text) if m.type == "error" else None)
+            await page.set_content(html, wait_until="load")
+            await page.wait_for_timeout(1200)            # 让 requestAnimationFrame 跑起来
+            try:                                          # 模拟"点击开始"+按键，触发进入游戏
+                await page.mouse.click(195, 370)
+                await page.keyboard.press("Space")
+            except Exception:
+                pass
+            await page.wait_for_timeout(800)
+            shot = await page.screenshot()
+            return errs, _is_blank_png(shot), shot
+        finally:
+            await page.close()  # 即便超时取消，也保证关掉页面；浏览器实例留给下次复用
 
     issues = []
     try:
@@ -222,10 +299,15 @@ async def run_headless(html: str, timeout_s: float = 15.0) -> list[dict] | None:
     except (NameError, AttributeError, TypeError, UnboundLocalError) as e:
         # 自身编程错误（而非环境性失败）：必须高调记录，否则无头检测会静默退化成"从不报告问题"
         logger.error("headless_verify_bug", error=repr(e))
+        async with _get_browser_lock():
+            await _discard_browser()  # 状态不明的实例不复用，下次冷启动
         return None
     except Exception as e:
         logger.warning("headless_verify_failed", error=str(e))
+        async with _get_browser_lock():
+            await _discard_browser()
         return None
+    _schedule_idle_close()
     return issues
 
 

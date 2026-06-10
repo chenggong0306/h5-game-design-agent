@@ -139,42 +139,54 @@ class _FakePage:
     async def screenshot(self):
         return self._shot
 
+    async def close(self):
+        pass
+
 
 class _FakeBrowser:
     def __init__(self, page):
         self._page = page
+        self._closed = False
+
+    def is_connected(self):
+        return not self._closed
 
     async def new_page(self, **kw):
         return self._page
 
     async def close(self):
-        pass
+        self._closed = True
 
 
 class _FakeChromium:
-    def __init__(self, browser):
-        self._browser = browser
+    def __init__(self, owner):
+        self._owner = owner
 
     async def launch(self, **kw):
-        return self._browser
+        self._owner.launch_count += 1
+        return _FakeBrowser(self._owner._page)
+
+
+class _FakePW:
+    def __init__(self, owner):
+        self.chromium = _FakeChromium(owner)
+
+    async def stop(self):
+        pass
 
 
 class _FakePlaywright:
+    """模拟 async_playwright().start()/stop() 生命周期（verifier 常驻复用浏览器实例）。"""
+
     def __init__(self, page):
         self._page = page
+        self.launch_count = 0
 
     def __call__(self):
         return self
 
-    async def __aenter__(self):
-        class _PW:
-            pass
-        pw = _PW()
-        pw.chromium = _FakeChromium(_FakeBrowser(self._page))
-        return pw
-
-    async def __aexit__(self, *a):
-        return False
+    async def start(self):
+        return _FakePW(self)
 
 
 class RunHeadlessTests(unittest.TestCase):
@@ -207,24 +219,60 @@ class RunHeadlessTests(unittest.TestCase):
         rng = random.Random(42)
         return self._png((40, 30), lambda x, y: (rng.randrange(256), rng.randrange(256), rng.randrange(256)))
 
-    def _run_with_fake(self, shot, errors):
+    def _install_fakes(self, fake):
         import sys
         import types
         mod = types.ModuleType("playwright.async_api")
-        mod.async_playwright = _FakePlaywright(_FakePage(shot, errors))
+        mod.async_playwright = fake
         pkg = types.ModuleType("playwright")
         pkg.async_api = mod
         saved = {k: sys.modules.get(k) for k in ("playwright", "playwright.async_api")}
         sys.modules["playwright"] = pkg
         sys.modules["playwright.async_api"] = mod
+        return saved
+
+    def _restore_modules(self, saved):
+        import sys
+        for k, v in saved.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
+
+    _HTML = "<canvas></canvas><script>1</script></html>"
+
+    def _run_with_fake(self, shot, errors):
+        saved = self._install_fakes(_FakePlaywright(_FakePage(shot, errors)))
+
+        async def _go():
+            try:
+                return await verifier.run_headless(self._HTML)
+            finally:
+                await verifier.aclose_browser()  # 复位常驻实例，避免测试间串台
+
         try:
-            return asyncio.run(verifier.run_headless("<canvas></canvas><script>1</script></html>"))
+            return asyncio.run(_go())
         finally:
-            for k, v in saved.items():
-                if v is None:
-                    sys.modules.pop(k, None)
-                else:
-                    sys.modules[k] = v
+            self._restore_modules(saved)
+
+    def test_browser_instance_reused_across_checks(self):
+        # 同一常驻实例下，连续两次检查只 launch 一次 Chromium
+        fake = _FakePlaywright(_FakePage(self._gradient_png(), []))
+        saved = self._install_fakes(fake)
+
+        async def _go():
+            try:
+                return await verifier.run_headless(self._HTML), await verifier.run_headless(self._HTML)
+            finally:
+                await verifier.aclose_browser()
+
+        try:
+            r1, r2 = asyncio.run(_go())
+        finally:
+            self._restore_modules(saved)
+        self.assertEqual(r1, [])
+        self.assertEqual(r2, [])
+        self.assertEqual(fake.launch_count, 1)
 
     def test_runtime_error_reported_on_nonblank_screen(self):
         issues = self._run_with_fake(self._gradient_png(), ["ReferenceError: h is not defined"])

@@ -33,7 +33,6 @@ class ErrorCode:
     NOT_FOUND = "NOT_FOUND"
     RATE_LIMIT_EXCEEDED = "RATE_LIMIT_EXCEEDED"
     APPEND_TO_EMPTY = "APPEND_TO_EMPTY"
-    MULTIPLE_MATCHES = "MULTIPLE_MATCHES"
     SYSTEM_ERROR = "SYSTEM_ERROR"
 
 
@@ -81,7 +80,8 @@ def _set_current_code(code: str) -> None:
         _code_session_last_access[session_id] = time.time()
         _enforce_cache_limits()
 
-        # 异步持久化（不阻塞主流程）
+        # 同步落盘（调用方负责线程化：@tool 跑在 executor 线程，
+        # 协程路径经 asyncio.to_thread(_autocommit_staging/_reconcile_code_sync) 进来）
         try:
             save_session_code(session_id, code)
         except Exception as e:
@@ -1729,6 +1729,7 @@ class GameDesignAgent:
             _staging_by_session.pop(session_id, None)
             _code_session_last_access.pop(session_id, None)
             try:
-                delete_session_code(session_id)  # 删磁盘文件，否则清空后重开会"复活"旧代码
+                # 删磁盘文件，否则清空后重开会"复活"旧代码；unlink 下沉线程，不在持锁的事件循环上做磁盘 I/O
+                await asyncio.to_thread(delete_session_code, session_id)
             except Exception as e:
                 logger.warning("delete_session_code_failed", session_id=session_id, error=str(e))
