@@ -1,6 +1,7 @@
 """自检静态分析回归测试：复现并验证最近几轮真实出现的 Canvas 样板坑被检出。"""
 
 import asyncio
+import sys
 import unittest
 
 from src.agent import verifier
@@ -349,6 +350,48 @@ class RunHeadlessTests(unittest.TestCase):
         issues = self._run_with_fake(self._noise_png(), [])
         self.assertIsNotNone(issues)
         self.assertIn("visual_tearing", ids(issues))
+
+
+class HeadlessSelectorLoopTests(unittest.TestCase):
+    """回归：Windows 下 uvicorn 跑的是 Selector 事件循环（不支持子进程），playwright
+    曾因此 NotImplementedError、无头检查静默降级成"从不报问题"。现在 playwright 被
+    调度到专属 Proactor 循环线程，Selector 主循环下也必须能跑（真实浏览器冒烟测试；
+    未装 playwright/浏览器的环境自动跳过，CI 上不跑）。"""
+
+    HTML = (
+        "<!DOCTYPE html><html><head><style>canvas{width:100vw;height:100vh;display:block}"
+        "</style></head><body><canvas id='c'></canvas><script>"
+        "const canvas=document.getElementById('c');const ctx=canvas.getContext('2d');"
+        "canvas.addEventListener('pointerdown',e=>{});"
+        "function loop(){ drawCharacter(); requestAnimationFrame(loop); }"  # 故意未定义
+        "loop();</script></body></html>"
+    )
+
+    def tearDown(self):
+        # 复位 verifier 的循环绑定全局，别让真实浏览器测试影响后面的 fake 生命周期测试
+        verifier._browser_lock = None
+        verifier._idle_close_task = None
+
+    def test_headless_catches_runtime_error_under_selector_loop(self):
+        try:
+            import playwright  # noqa: F401
+        except Exception:
+            self.skipTest("playwright 未安装")
+        old_policy = asyncio.get_event_loop_policy()
+        if sys.platform == "win32":
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())  # 复现 uvicorn 环境
+        try:
+            async def scenario():
+                res = await verifier.run_headless(self.HTML, timeout_s=30)
+                await verifier.aclose_browser()
+                return res
+            res = asyncio.run(scenario())
+        finally:
+            asyncio.set_event_loop_policy(old_policy)
+        if res is None:
+            self.skipTest("chromium 浏览器不可用，跳过")
+        self.assertIn("runtime_error", ids(res))
+        self.assertTrue(any("drawCharacter" in i["msg"] for i in res))
 
 
 if __name__ == "__main__":

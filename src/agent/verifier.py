@@ -8,6 +8,8 @@
 
 import asyncio
 import re
+import sys
+import threading
 
 from src.utils.logger import logger
 
@@ -169,6 +171,37 @@ _doomed_browsers: dict[int, object] = {}  # 已报废但仍有人在用的实例
 _BROWSER_IDLE_CLOSE_S = 300.0
 
 
+# ---- Windows 专用：Playwright 专属事件循环线程 ----
+# uvicorn 在 Windows 上跑的是 Selector 事件循环，它不支持 create_subprocess_exec
+# （NotImplementedError），Playwright 连启动 node driver 都做不到 → 无头检查静默降级。
+# 解决：起一个常驻后台线程、自带 Proactor 循环，所有 playwright 工作（含浏览器复用的
+# 锁/定时器/任务）都固定在这个循环上；主循环通过 run_coroutine_threadsafe 调度并 await 结果。
+_pw_loop: asyncio.AbstractEventLoop | None = None
+_pw_loop_guard = threading.Lock()
+
+
+def _get_pw_loop() -> asyncio.AbstractEventLoop:
+    global _pw_loop
+    with _pw_loop_guard:
+        if _pw_loop is not None and not _pw_loop.is_closed():
+            return _pw_loop
+        loop = asyncio.ProactorEventLoop()  # 显式 Proactor：别跟随 uvicorn 可能改过的全局策略
+
+        def _spin():
+            asyncio.set_event_loop(loop)
+            loop.run_forever()
+
+        threading.Thread(target=_spin, name="pw-proactor-loop", daemon=True).start()
+        _pw_loop = loop
+        return loop
+
+
+async def _on_pw_loop(coro):
+    """在 playwright 专属循环上执行协程并等待结果（仅 Windows 路径使用）。"""
+    fut = asyncio.run_coroutine_threadsafe(coro, _get_pw_loop())
+    return await asyncio.wrap_future(fut)
+
+
 def _get_browser_lock() -> asyncio.Lock:
     global _browser_lock
     if _browser_lock is None:
@@ -195,11 +228,26 @@ async def _close_quiet(b) -> None:
         pass
 
 
+def _cancel_task_safely(task) -> None:
+    """取消任务；若任务属于别的事件循环（Windows 上主循环/专属循环并存），
+    必须经它自己的循环 call_soon_threadsafe 取消——跨线程直接 cancel 不是线程安全的。"""
+    if task is None or task.done() or task is asyncio.current_task():
+        return
+    loop = task.get_loop()
+    try:
+        running = asyncio.get_running_loop()
+    except RuntimeError:
+        running = None
+    if loop is running:
+        task.cancel()
+    else:
+        loop.call_soon_threadsafe(task.cancel)
+
+
 def _cancel_idle_close() -> None:
     global _idle_close_task
     task, _idle_close_task = _idle_close_task, None
-    if task is not None and task is not asyncio.current_task() and not task.done():
-        task.cancel()
+    _cancel_task_safely(task)
 
 
 async def _acquire_browser():
@@ -208,7 +256,8 @@ async def _acquire_browser():
         try:
             browser = await _get_browser()
         except Exception as e:
-            logger.warning("headless_browser_launch_failed", error=str(e))
+            # str(NotImplementedError()) 是空串，必须带上类型名才查得了问题
+            logger.warning("headless_browser_launch_failed", error=str(e) or repr(e))
             return None
         _browser_users[id(browser)] = _browser_users.get(id(browser), 0) + 1
         _cancel_idle_close()  # 使用中不许空闲关停
@@ -248,6 +297,22 @@ async def _retire_browser(browser) -> None:
 async def aclose_browser():
     """关停常驻浏览器与 playwright driver（应用 shutdown / 空闲超时调用）。
 
+    Windows 上 playwright 全部状态都在专属循环线程上，必须调度过去执行
+    （跨线程 cancel 任务/关浏览器都不是线程安全的）。"""
+    if sys.platform == "win32":
+        if _pw_loop is None or _pw_loop.is_closed():
+            return  # 从未启动过 playwright，无可关
+        try:
+            await _on_pw_loop(_aclose_browser_impl())
+        except Exception:
+            pass
+        return
+    await _aclose_browser_impl()
+
+
+async def _aclose_browser_impl():
+    """实际关停逻辑（必须在 playwright 所在循环上执行）。
+
     连同报废待关的实例与使用计数一起清掉：shutdown 时进行中的检查随事件循环
     一起终止，不会再来 _release_browser。"""
     global _pw, _browser
@@ -271,16 +336,14 @@ async def aclose_browser():
 
 def _schedule_idle_close():
     global _idle_close_task
-    old = _idle_close_task
-    if old is not None and not old.done():
-        old.cancel()
+    _cancel_task_safely(_idle_close_task)
 
     async def _idle():
         try:
             await asyncio.sleep(_BROWSER_IDLE_CLOSE_S)
         except asyncio.CancelledError:
             return
-        await aclose_browser()
+        await _aclose_browser_impl()  # 本任务就跑在 playwright 所在循环上，直接关
 
     _idle_close_task = asyncio.create_task(_idle())
 
@@ -293,7 +356,17 @@ async def run_headless(html: str, timeout_s: float = 15.0) -> list[dict] | None:
         from playwright.async_api import async_playwright  # noqa: F401 仅探测依赖可用性
     except Exception:
         return None
+    if sys.platform == "win32":
+        # uvicorn 在 Windows 的 Selector 循环不支持子进程 → 整套搬到专属 Proactor 循环执行
+        try:
+            return await _on_pw_loop(_run_headless_impl(html, timeout_s))
+        except Exception as e:
+            logger.warning("headless_verify_failed", error=str(e) or repr(e))
+            return None
+    return await _run_headless_impl(html, timeout_s)
 
+
+async def _run_headless_impl(html: str, timeout_s: float) -> list[dict] | None:
     browser = await _acquire_browser()
     if browser is None:
         return None
