@@ -48,3 +48,4 @@ Thumbs.db
 
 # uv
 .python-version
+.tmp_video_analysis/
