@@ -13,7 +13,6 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 import src.api.routes as routes
-import src.agent.game_agent as game_agent
 from src.agent.game_agent import SKILLS as _orig_skills
 
 

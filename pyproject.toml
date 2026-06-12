@@ -31,3 +31,10 @@ headless = ["playwright>=1.40"]
 
 [project.scripts]
 game-design = "main:main"
+
+[tool.ruff.lint.per-file-ignores]
+# main.py 必须在所有 import 之前 load_dotenv / 注入 truststore，E402 是刻意的
+"src/main.py" = ["E402"]
+# routes/game_agent 的分节延迟 import 是刻意的；File(...) 参数默认值是 FastAPI 标准写法（B008 误报）
+"src/api/routes.py" = ["E402", "B008"]
+"src/agent/game_agent.py" = ["E402"]

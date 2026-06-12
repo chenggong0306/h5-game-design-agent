@@ -638,11 +638,15 @@ def _search_skills_impl(query: str, limit: int = 12) -> str:
         name = s["name"].lower()
         desc = (s.get("description") or "").lower()
         score = 0
-        if q in name: score += 4
-        if q in desc: score += 2
+        if q in name:
+            score += 4
+        if q in desc:
+            score += 2
         for w in terms:
-            if w in name: score += 2
-            elif w in desc: score += 1
+            if w in name:
+                score += 2
+            elif w in desc:
+                score += 1
         if score > 0:
             scored.append((score, s))
     if not scored:
@@ -1279,6 +1283,37 @@ ALL_TOOLS = [
     search_code,
 ]
 
+# write_game/append_game 的入参里装着整份 HTML，而 CodeContextMiddleware 每次调用都会注入
+# 实时代码——历史入参是上下文里唯一会重复的代码副本（生成后到 50% 清理阈值之间、反复重写时
+# 最多冗余 2~4 份 ≈ 20-35K token 死重）。故对这两个工具的旧入参【恒清】（trigger=0 不等阈值）；
+# keep 保护进行中的分段续写：模型续写时要能看到自己刚写的最近几段。
+_WRITE_ARGS_KEEP_RECENT = 8
+
+
+def _build_context_edits(clear_trigger: int) -> list:
+    """构建上下文清理编辑链（顺序敏感：先恒清代码入参，再做通用阈值清理）。"""
+    non_write_tools = tuple(
+        t.name for t in ALL_TOOLS + [load_skill, search_skills]
+        if t.name not in ("write_game", "append_game")
+    )
+    return [
+        # 1) 恒清旧 write/append 入参：代码已生效且每次调用都注入最新版，历史入参纯冗余
+        ClearToolUsesEdit(
+            trigger=0,
+            keep=_WRITE_ARGS_KEEP_RECENT,
+            clear_tool_inputs=True,
+            exclude_tools=non_write_tools,
+            placeholder="[已清理：该段代码已生效，完整代码见系统注入]",
+        ),
+        # 2) 通用清理：超过阈值才清其余旧工具输出（搜索/查看结果等），keep 给足可见窗口
+        ClearToolUsesEdit(
+            trigger=clear_trigger,
+            keep=CLEAR_TOOL_KEEP,
+            clear_tool_inputs=True,
+            placeholder="[已清理]",
+        ),
+    ]
+
 
 class GameDesignAgent:
     """基于 LangGraph create_agent 的游戏设计智能体"""
@@ -1415,17 +1450,11 @@ class GameDesignAgent:
                     SkillMiddleware(),
                     CodeContextMiddleware(),
                     CJKContextEditingMiddleware(
-                        edits=[
-                            ClearToolUsesEdit(
-                                trigger=clear_trigger,
-                                keep=CLEAR_TOOL_KEEP,
-                                clear_tool_inputs=True,  # 同时清理旧工具调用入参（write_game 的整份 HTML），生效代码已在编辑器/磁盘
-                                placeholder="[已清理]",
-                            ),
-                        ],
-                        # ⚠️ 不能用 "approximate"(中文欠计3-4倍/永不触发) 或 "model"
-                        # (gemma/vLLM 非标准模型名→get_num_tokens_from_messages 抛 NotImplementedError/每回合崩)，
+                        # 编辑链见 _build_context_edits：①恒清旧 write/append 入参（消代码副本）
+                        # ②通用阈值清理。⚠️ 计数不能用 "approximate"(中文欠计3-4倍/永不触发)
+                        # 或 "model"(gemma/vLLM 非标准模型名→NotImplementedError/每回合崩)，
                         # CJKContextEditingMiddleware 用 CJK 感知计数器，二者皆免。
+                        edits=_build_context_edits(clear_trigger),
                     ),
                     SafeSummarizationMiddleware(
                         model=summarization_model,

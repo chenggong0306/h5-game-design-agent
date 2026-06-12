@@ -275,8 +275,8 @@ def _validate_chat_images(images: list[ChatImage]) -> list[ChatImage]:
             raise HTTPException(status_code=400, detail=f"图片 {image.name} data URL 格式无效")
         try:
             raw = base64.b64decode(image.data_url[len(prefix):], validate=True)
-        except Exception:
-            raise HTTPException(status_code=400, detail=f"图片 {image.name} base64 无效")
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"图片 {image.name} base64 无效") from e
         if len(raw) > MAX_CHAT_IMAGE_BYTES:
             raise HTTPException(status_code=413, detail=f"图片 {image.name} 超过 10MB 限制")
     return images
@@ -365,7 +365,7 @@ async def chat(req: ChatRequest):
         else:
             logger.exception("chat failed (session=%s)", session_id)
             detail = "AI 对话失败，请稍后重试（详情见服务端日志）"
-        raise HTTPException(status_code=500, detail=detail)
+        raise HTTPException(status_code=500, detail=detail) from e
 
 
 @router.post("/api/chat/stream")
@@ -741,8 +741,8 @@ async def import_skills_zip(file: UploadFile = File(...)):
     try:
         # 解压/解码/JSON 解析是 CPU 密集操作，放线程别卡事件循环
         parsed, errors = await asyncio.to_thread(_parse_skills_zip, content)
-    except zipfile.BadZipFile:
-        raise HTTPException(400, "无效的 ZIP 文件")
+    except zipfile.BadZipFile as e:
+        raise HTTPException(400, "无效的 ZIP 文件") from e
 
     # 对共享列表 SKILLS 的修改留在事件循环单线程内（无 await 间隙），避免并发竞态
     existing_names = {s["name"] for s in SKILLS}
@@ -771,7 +771,8 @@ async def scan_skills_folder(req: SkillScanRequest):
     注意：这是面向本机管理员的便捷功能（默认 HOST=127.0.0.1）。若把服务对外暴露，
     务必同时设置 API_TOKEN —— 否则任意客户端都能让服务端遍历目录、读取 SKILL.md。
     """
-    import os, re as re_mod
+    import os
+    import re as re_mod
     folder_raw = req.path.strip()
     folder = os.path.realpath(folder_raw)
 
@@ -786,7 +787,7 @@ async def scan_skills_folder(req: SkillScanRequest):
     if not any(os.path.commonpath([folder, root]) == root for root in allowed_roots):
         raise HTTPException(
             403,
-            f"出于安全考虑，仅允许扫描项目技能目录和用户家目录。提供的路径不在允许范围内。",
+            "出于安全考虑，仅允许扫描项目技能目录和用户家目录。提供的路径不在允许范围内。",
         )
 
     _MAX_DIRS, _MAX_FOUND = 5000, 500  # 遍历上限：防超大目录树拖垮（DoS）

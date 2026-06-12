@@ -3,7 +3,6 @@
 import os
 import re
 import tempfile
-from pathlib import Path
 from typing import Optional
 from src.config import BASE_DIR, settings
 from src.utils.logger import logger

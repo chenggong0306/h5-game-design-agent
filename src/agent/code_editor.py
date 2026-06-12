@@ -91,7 +91,7 @@ class CodeEditor:
 
         for i in range(len(content_lines) - len(old_lines) + 1):
             potential = content_lines[i:i + len(old_lines)]
-            if all(o.strip() == c.strip() for o, c in zip(old_lines, potential)):
+            if all(o.strip() == c.strip() for o, c in zip(old_lines, potential, strict=False)):
                 # 保留第一行的原始缩进
                 original_indent = len(content_lines[i]) - len(content_lines[i].lstrip())
                 indent_str = content_lines[i][:original_indent]
