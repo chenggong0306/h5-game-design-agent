@@ -1219,29 +1219,54 @@ document.getElementById('btn-assets').addEventListener('click', async () => {
     openModal('modal-assets');
 });
 
+// 批量上传：图片/音频按 MIME 自动分流到对应库（混选不再因类型不符被拒），
+// 其余文件（json/xml 等）用下拉框选的类型；带实时进度 + 成功/失败汇总
+function pickAssetType(file, fallback) {
+    const t = (file.type || '').toLowerCase();
+    if (t.startsWith('audio/')) return 'audio';
+    if (t.startsWith('image/')) return 'image';
+    return fallback;
+}
+
 document.getElementById('btn-upload').addEventListener('click', async () => {
     const fileInput = document.getElementById('file-input');
-    if (!fileInput.files.length) { alert('请选择文件'); return; }
+    const btn = document.getElementById('btn-upload');
+    const files = Array.from(fileInput.files);
+    if (!files.length) { alert('请选择文件'); return; }
 
+    const fallbackType = document.getElementById('asset-type').value;
+    const description = document.getElementById('asset-desc').value;
+    const tags = document.getElementById('asset-tags').value;
+
+    const label = btn.textContent;
+    btn.disabled = true;
     const failed = [];
-    for (const file of fileInput.files) {
+    let done = 0;
+    for (const file of files) {
+        btn.textContent = `⏳ ${done + 1}/${files.length}`;
         const formData = new FormData();
         formData.append('file', file);
-        formData.append('asset_type', document.getElementById('asset-type').value);
-        formData.append('description', document.getElementById('asset-desc').value);
-        formData.append('tags', document.getElementById('asset-tags').value);
+        formData.append('asset_type', pickAssetType(file, fallbackType));
+        formData.append('description', description);
+        formData.append('tags', tags);
         try {
             await ensureOk(await fetch('/api/assets/upload', { method: 'POST', body: formData }));
         } catch (err) {
             failed.push(`${file.name}: ${err.message}`);
         }
+        done++;
     }
+    btn.disabled = false;
+    btn.textContent = label;
     fileInput.value = '';
     document.getElementById('asset-desc').value = '';
     document.getElementById('asset-tags').value = '';
     await loadAssets();
+    const ok = files.length - failed.length;
     // 别再无条件报成功：有失败就如实告知
-    alert(failed.length ? '❌ 部分上传失败：\n' + failed.join('\n') : '✅ 上传成功！');
+    alert(failed.length
+        ? `✅ 成功 ${ok}/${files.length}，❌ 失败 ${failed.length}：\n` + failed.join('\n')
+        : `✅ 全部上传成功！共 ${ok} 个文件`);
 });
 
 async function loadAssets() {

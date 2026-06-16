@@ -117,17 +117,17 @@
             </div>
             <div class="modal-body">
                 <div class="upload-zone" id="upload-zone">
-                    <p>📁 拖拽文件到这里或点击上传</p>
+                    <p>📁 拖一批文件进来，或点击多选（Ctrl/Shift）批量上传</p>
                     <input type="file" id="file-input" multiple accept="image/*,audio/*,.json,.xml">
-                    <select id="asset-type">
+                    <select id="asset-type" title="图片/音频会自动识别，这里只对 json/xml 等其它文件生效">
                         <option value="image">图片</option>
                         <option value="spritesheet">精灵图</option>
                         <option value="audio">音频</option>
                         <option value="tilemap">瓦片地图</option>
                         <option value="font">字体</option>
                     </select>
-                    <input type="text" id="asset-desc" placeholder="素材描述...">
-                    <input type="text" id="asset-tags" placeholder="标签(逗号分隔)...">
+                    <input type="text" id="asset-desc" placeholder="素材描述（整批共用，可留空）...">
+                    <input type="text" id="asset-tags" placeholder="标签（逗号分隔，整批共用，可留空）...">
                     <button id="btn-upload">⬆️ 上传</button>
                 </div>
                 <div id="assets-list" class="assets-list"></div>
