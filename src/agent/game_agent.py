@@ -519,7 +519,7 @@ def _get_context_usage(session_id: str) -> dict[str, int | bool]:
 
 @tool
 def search_assets(query: str) -> str:
-    """搜索知识库中的游戏素材（图片、音频等）。
+    """搜索知识库中的游戏素材（图片、音频等），返回文件名、URL、标签和描述。
 
     Args:
         query: 搜索关键词，如 "玩家" "背景" "爆炸音效"
@@ -536,8 +536,38 @@ def search_assets(query: str) -> str:
         aid = a.get("asset_id", "")
         ext = a.get("extension", "")
         url = f"/assets/{atype}/{aid}{ext}"
-        lines.append(f"- [{atype}] {fname} → URL: {url}")
+        tags_str = a.get("tags", "")
+        desc = _extract_desc(a.get("document", ""))
+        line = f"- [{atype}] **{fname}**"
+        if tags_str and tags_str != "[]":
+            line += f"  🏷️ {_human_tags(tags_str)}"
+        if desc:
+            line += f"  📝 {desc}"
+        line += f"\n  → `{url}`"
+        lines.append(line)
     return "\n".join(lines)
+
+
+def _extract_desc(document: str) -> str:
+    """从 ChromaDB document 字段中提取纯文本描述（去掉前缀和标签后缀）。"""
+    if not document:
+        return ""
+    # 格式: [audio] filename - description | 标签: tag1, tag2
+    import re
+    m = re.search(r"\]\s+\S+\s*-\s*(.+?)(?:\s*\|\s*标签:.*)?$", document)
+    return m.group(1).strip() if m else ""
+
+
+def _human_tags(tags_raw) -> str:
+    """把 tags 字段转成人类可读格式。"""
+    import json
+    try:
+        tags = json.loads(tags_raw) if isinstance(tags_raw, str) else tags_raw
+    except Exception:
+        return tags_raw
+    if isinstance(tags, list):
+        return "、".join(t for t in tags if t)
+    return str(tags)
 
 # ============ Skills 机制 ============
 
