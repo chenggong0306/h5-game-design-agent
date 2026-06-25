@@ -130,6 +130,18 @@
                     <input type="text" id="asset-tags" placeholder="标签（逗号分隔，整批共用，可留空）...">
                     <button id="btn-upload">⬆️ 上传</button>
                 </div>
+                <div class="batch-import-zone">
+                    <div class="batch-import-title">📋 CSV 标注批量导入</div>
+                    <p style="color:#aaa;font-size:12px;margin:0 0 8px">
+                        选好上方音频文件和一份 CSV 标注，点导入即可按文件名自动匹配标签与描述入库</p>
+                    <div class="batch-import-row">
+                        <label class="csv-label">📄 CSV 标注文件
+                            <input type="file" id="csv-import-file" accept=".csv">
+                        </label>
+                        <button id="btn-batch-import">📥 批量导入</button>
+                    </div>
+                    <div id="batch-import-status" class="batch-import-status hidden"></div>
+                </div>
                 <div id="assets-list" class="assets-list"></div>
             </div>
         </div>

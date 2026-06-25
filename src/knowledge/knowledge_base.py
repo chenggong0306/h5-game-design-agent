@@ -159,12 +159,13 @@ class KnowledgeBase:
     def list_assets(self, asset_type: Optional[str] = None) -> list[dict]:
         """列出所有素材"""
         where_filter = {"asset_type": asset_type} if asset_type else None
-        results = self.assets_collection.get(where=where_filter)
+        results = self.assets_collection.get(where=where_filter, include=["documents", "metadatas"])
         items = []
         if results and results["ids"]:
             for i, aid in enumerate(results["ids"]):
                 meta = results["metadatas"][i] if results["metadatas"] else {}
-                items.append({"id": aid, **meta})
+                doc = results["documents"][i] if results.get("documents") else ""
+                items.append({"id": aid, "document": doc, **meta})
         return items
 
     def delete_asset(self, asset_id: str) -> bool:

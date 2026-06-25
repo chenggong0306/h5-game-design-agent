@@ -571,6 +571,232 @@ async def delete_asset(asset_id: str):
     return {"ok": True}
 
 
+# ============ CSV 批量导入 ============
+
+_CSV_ENCODINGS = ("utf-8-sig", "utf-8", "gbk", "gb2312", "gb18030", "latin-1")
+
+
+def _parse_csv_metadata(content: bytes) -> tuple[dict[str, dict], list[str]]:
+    """解析 CSV 标注文件，返回 {文件名: {tags, description}} 和解析错误列表。
+
+    自动检测编码（UTF-8 BOM → UTF-8 → GBK → ...），
+    列名按位置识别（标注员/文件名/文件路径/标签/描述）。
+    """
+    # 解码
+    text = None
+    for enc in _CSV_ENCODINGS:
+        try:
+            text = content.decode(enc)
+            break
+        except (UnicodeDecodeError, LookupError):
+            continue
+    if text is None:
+        return {}, ["CSV 文件编码无法识别，尝试了 GBK/UTF-8 等均失败"]
+
+    # 解析（csv.DictReader 需要文件头）
+    import csv as _csv
+    import io as _io
+    reader = _csv.reader(_io.StringIO(text))
+    rows = list(reader)
+    if len(rows) < 2:
+        return {}, ["CSV 文件为空或仅有一行表头"]
+
+    errors: list[str] = []
+    meta: dict[str, dict] = {}
+    for i, row in enumerate(rows[1:], start=2):  # 从第2行开始（1-based行号）
+        if not row or all(not c.strip() for c in row):
+            continue  # 空行
+        if len(row) < 5:
+            errors.append(f"第{i}行：列数不足 ({len(row)}列，期望≥5)")
+            continue
+        fname = row[1].strip() if len(row) > 1 else ""
+        tag = row[3].strip() if len(row) > 3 else ""
+        desc = row[4].strip() if len(row) > 4 else ""
+        if not fname:
+            errors.append(f"第{i}行：文件名为空，跳过")
+            continue
+        meta[fname] = {"tags": tag, "description": desc}
+
+    return meta, errors
+
+
+def _do_import_batch(
+    files: list[tuple[str, bytes]],  # [(filename, content), ...]
+    csv_content: bytes,
+) -> dict:
+    """批量导入的核心逻辑（纯数据，不依赖 Request/UploadFile）。
+
+    files 在线程池里从 UploadFile 读取后传入；kb I/O 也在线程池。
+    """
+    csv_meta, csv_errors = _parse_csv_metadata(csv_content)
+
+    success = 0
+    failed: list[str] = []
+    matched_csv_names: set[str] = set()
+
+    for fname, fcontent in files:
+        meta = csv_meta.get(fname)
+        if meta:
+            matched_csv_names.add(fname)
+            tags_str = meta["tags"]
+            description = meta["description"]
+        else:
+            tags_str = ""
+            description = ""
+
+        tag_list = [t.strip() for t in tags_str.split(",") if t.strip()] if tags_str else []
+
+        # 写临时文件 → upload_asset（复用已有逻辑，包括扩展名白名单校验）
+        suffix = os.path.splitext(fname)[1].lower()
+        tmp_path = _write_upload_tmp(fcontent, suffix)
+        try:
+            kb.upload_asset(
+                file_path=tmp_path,
+                file_name=fname,
+                asset_type="audio",
+                description=description,
+                tags=tag_list,
+            )
+            success += 1
+        except Exception as e:
+            failed.append(f"{fname}: {e}")
+        finally:
+            _unlink_missing_ok(tmp_path)
+
+    # CSV 里有标注但没传文件的
+    not_found = [n for n in csv_meta if n not in matched_csv_names]
+
+    result: dict = {"ok": True, "success": success, "failed": failed, "total": len(files)}
+    if csv_errors:
+        result["csv_errors"] = csv_errors
+    if not_found:
+        result["not_found"] = not_found[:50]  # 最多显示前50个
+        result["not_found_count"] = len(not_found)
+    return result
+
+
+@router.post("/api/assets/import/batch")
+async def import_assets_batch(
+    csv_file: UploadFile = File(...),
+    files: list[UploadFile] = File(...),
+):
+    """CSV 标注 + 音频文件批量导入。
+
+    上传一份 CSV 标注文件 + 多份音频文件，按文件名自动匹配标注（标签+描述）并入库。
+    CSV 格式：标注员,文件名,文件路径,标签,描述（UTF-8 或 GBK 编码均可）
+    """
+    if len(files) > 500:
+        raise HTTPException(status_code=400, detail="单次最多导入 500 个文件")
+    if not csv_file.filename or not csv_file.filename.endswith(".csv"):
+        raise HTTPException(status_code=400, detail="CSV 文件须为 .csv 格式")
+
+    csv_content = await csv_file.read()
+    if len(csv_content) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="CSV 文件超过 5MB 限制")
+
+    # 读所有上传文件内容到内存（音频通常几MB以内，最多500个）
+    total_bytes = 0
+    file_data: list[tuple[str, bytes]] = []
+    for f in files:
+        content = await f.read()
+        total_bytes += len(content)
+        if total_bytes > _settings.max_upload_bytes * 50:  # 总额 1GB
+            raise HTTPException(status_code=413, detail="文件总量超过 1GB 上限")
+        # 扩展名白名单校验（复用已有规则）
+        suffix = os.path.splitext(f.filename or "")[1].lower()
+        if suffix not in _ALLOWED_ASSET_EXTS.get("audio", set()):
+            raise HTTPException(status_code=400,
+                detail=f"不支持的文件格式: {suffix}（仅支持 mp3/wav/ogg/m4a/flac/aac/opus）")
+        file_data.append((f.filename or "unknown", content))
+
+    # kb.upload_asset 内部做 shutil.copy2 + ChromaDB 写入，全是阻塞 I/O → 放线程池
+    result = await asyncio.to_thread(_do_import_batch, file_data, csv_content)
+    return result
+
+
+def _annotate_existing(csv_content: bytes) -> dict:
+    """事后补标注：拿 CSV 匹配已有素材，填写标签和描述。
+
+    按文件名匹配已有素材，收集所有更新后一次性提交给 ChromaDB（避免逐条 I/O 超时）。
+    """
+    csv_meta, csv_errors = _parse_csv_metadata(csv_content)
+
+    # 获取所有已有素材，建文件名→资产列表索引
+    all_assets = kb.list_assets()
+    by_fname: dict[str, list[dict]] = {}
+    for a in all_assets:
+        fn = a.get("file_name", "")
+        by_fname.setdefault(fn, []).append(a)
+
+    # 收集批量更新数据（三个并行列表）
+    update_ids: list[str] = []
+    update_metas: list[dict] = []
+    update_docs: list[str] = []
+    not_found: list[str] = []
+
+    for fname, meta in csv_meta.items():
+        matches = by_fname.get(fname, [])
+        if not matches:
+            not_found.append(fname)
+            continue
+        for asset in matches:
+            aid = asset.get("id") or asset.get("asset_id", "")
+            if not aid:
+                continue
+            tag_list = [t.strip() for t in meta["tags"].split(",") if t.strip()] if meta["tags"] else []
+            doc = f"[{asset.get('asset_type', 'audio')}] {asset.get('file_name', fname)}"
+            if meta["description"]:
+                doc += f" - {meta['description']}"
+            if tag_list:
+                doc += f" | 标签: {', '.join(tag_list)}"
+            update_ids.append(aid)
+            update_metas.append({
+                "asset_id": aid,
+                "file_name": asset.get("file_name", fname),
+                "asset_type": asset.get("asset_type", "audio"),
+                "file_path": asset.get("file_path", ""),
+                "extension": asset.get("extension", ""),
+                "tags": json.dumps(tag_list, ensure_ascii=False),
+            })
+            update_docs.append(doc)
+
+    # 一次性批量提交（避免 181 次逐条 ChromaDB I/O）
+    if update_ids:
+        try:
+            kb.assets_collection.update(
+                ids=update_ids,
+                metadatas=update_metas,
+                documents=update_docs,
+            )
+        except Exception as e:
+            logger.error("annotate_batch_update_failed", error=str(e)[:200])
+            return {"ok": False, "error": f"批量更新失败: {e}"}
+
+    result: dict = {"ok": True, "updated": len(update_ids), "csv_entries": len(csv_meta)}
+    if not_found:
+        result["not_found"] = not_found[:50]
+        result["not_found_count"] = len(not_found)
+    if csv_errors:
+        result["csv_errors"] = csv_errors
+    return result
+
+
+@router.post("/api/assets/annotate/batch")
+async def annotate_assets_batch(csv_file: UploadFile = File(...)):
+    """CSV 事后补标注：用 CSV 匹配已有素材，自动填写标签和描述。
+
+    只传 CSV 文件，不传素材文件。按文件名匹配已有素材并更新其元数据。
+    适用于先上传了素材但没带 CSV，或分批导入后有遗漏标注的情况。
+    """
+    if not csv_file.filename or not csv_file.filename.endswith(".csv"):
+        raise HTTPException(status_code=400, detail="CSV 文件须为 .csv 格式")
+    csv_content = await csv_file.read()
+    if len(csv_content) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="CSV 文件超过 5MB 限制")
+    result = await asyncio.to_thread(_annotate_existing, csv_content)
+    return result
+
+
 _ASSET_HEADERS = {"X-Content-Type-Options": "nosniff"}
 
 

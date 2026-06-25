@@ -673,6 +673,70 @@ body {
     font-weight: 600;
 }
 
+/* CSV 批量导入 */
+.batch-import-zone {
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px 18px;
+    margin-bottom: 16px;
+    background: var(--bg-primary);
+}
+.batch-import-title { font-weight: 600; font-size: 14px; margin-bottom: 4px; }
+.batch-import-row {
+    display: flex; gap: 12px; align-items: center; flex-wrap: wrap;
+}
+.csv-label {
+    display: inline-flex; align-items: center; gap: 8px;
+    cursor: pointer; font-size: 13px; color: var(--text-secondary);
+}
+.csv-label input[type="file"] { max-width: 220px; }
+#btn-batch-import {
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    padding: 7px 18px;
+    border-radius: 8px;
+    cursor: pointer;
+    font-weight: 600;
+    font-size: 13px;
+}
+#btn-batch-import:disabled { opacity: 0.6; cursor: not-allowed; }
+.batch-import-status {
+    margin-top: 10px;
+    padding: 10px 14px;
+    border-radius: 8px;
+    font-size: 13px;
+    line-height: 1.6;
+    white-space: pre-wrap;
+}
+.batch-import-status.success { background: rgba(78,201,176,0.15); color: var(--success); }
+.batch-import-status.error   { background: rgba(233,69,96,0.15); color: var(--accent); }
+
+.asset-tags { display: flex; gap: 4px; flex-wrap: wrap; align-items: center; }
+.asset-tag {
+    display: inline-block;
+    padding: 1px 8px;
+    border-radius: 10px;
+    font-size: 11px;
+    font-weight: 500;
+    background: rgba(233,69,96,0.15);
+    color: var(--accent);
+}
+.asset-tag.none {
+    background: transparent;
+    color: #666;
+    font-style: italic;
+}
+.asset-info { display: flex; flex-direction: column; gap: 4px; min-width: 0; flex: 1; }
+.asset-desc {
+    font-size: 12px;
+    color: #888;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 400px;
+}
+
 /* 素材列表 */
 .assets-list, .projects-list { display: flex; flex-direction: column; gap: 8px; }
 .asset-item, .project-item {

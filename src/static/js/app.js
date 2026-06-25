@@ -312,6 +312,16 @@ function escapeHtml(value) {
         .replace(/'/g, '&#039;');
 }
 
+function parseAssetTags(tags) {
+    if (!tags) return [];
+    if (Array.isArray(tags)) return tags.filter(Boolean);
+    if (typeof tags === 'string') {
+        try { const p = JSON.parse(tags); return Array.isArray(p) ? p.filter(Boolean) : []; }
+        catch { return tags ? [tags] : []; }
+    }
+    return [];
+}
+
 // 在 HTML 属性内的 JS 字符串字面量中安全使用（先 JS 转义反斜杠/单引号，再 HTML 转义）
 function jsStr(value) {
     return escapeHtml(String(value ?? '').replace(/\\/g, '\\\\').replace(/'/g, "\\'"));
@@ -1269,6 +1279,69 @@ document.getElementById('btn-upload').addEventListener('click', async () => {
         : `✅ 全部上传成功！共 ${ok} 个文件`);
 });
 
+// ============ CSV 标注批量导入 ============
+document.getElementById('btn-batch-import').addEventListener('click', async () => {
+    const btn = document.getElementById('btn-batch-import');
+    const statusEl = document.getElementById('batch-import-status');
+    const csvInput = document.getElementById('csv-import-file');
+    const fileInput = document.getElementById('file-input');
+
+    const csvFile = csvInput.files[0];
+    const audioFiles = Array.from(fileInput.files);
+    if (!csvFile) { alert('请先选择 CSV 标注文件'); return; }
+    if (!audioFiles.length) { alert('请先在上方选择要导入的音频文件'); return; }
+
+    const label = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = '⏳ 导入中...';
+    statusEl.classList.add('hidden');
+    statusEl.className = 'batch-import-status hidden';
+
+    const formData = new FormData();
+    formData.append('csv_file', csvFile);
+    for (const f of audioFiles) {
+        formData.append('files', f);
+    }
+
+    try {
+        const res = await fetch('/api/assets/import/batch', { method: 'POST', body: formData });
+        if (!res.ok) {
+            const detail = await res.text();
+            statusEl.className = 'batch-import-status error';
+            statusEl.textContent = `❌ 请求失败 (${res.status}): ${detail}`;
+            statusEl.classList.remove('hidden');
+            return;
+        }
+        const result = await res.json();
+        // 构建结果汇总
+        const lines = [];
+        lines.push(`✅ 成功导入: ${result.success} 个`);
+        if (result.failed && result.failed.length) {
+            lines.push(`❌ 失败 ${result.failed.length} 个: ${result.failed.join(', ')}`);
+        }
+        if (result.not_found && result.not_found.length) {
+            const nf = result.not_found;
+            const extra = result.not_found_count > nf.length ? `（共 ${result.not_found_count} 个，仅显示前 ${nf.length} 个）` : '';
+            lines.push(`⚠️ CSV 有标注但未传文件 (${result.not_found_count || nf.length} 个)${extra}: ${nf.join(', ')}`);
+        }
+        if (result.csv_errors && result.csv_errors.length) {
+            lines.push(`📝 CSV 解析问题: ${result.csv_errors.join('; ')}`);
+        }
+        statusEl.className = result.failed && result.failed.length ? 'batch-import-status error' : 'batch-import-status success';
+        statusEl.textContent = lines.join('\n');
+        statusEl.classList.remove('hidden');
+        csvInput.value = '';
+        await loadAssets();
+    } catch (err) {
+        statusEl.className = 'batch-import-status error';
+        statusEl.textContent = '❌ 导入失败: ' + err.message;
+        statusEl.classList.remove('hidden');
+    } finally {
+        btn.disabled = false;
+        btn.textContent = label;
+    }
+});
+
 async function loadAssets() {
     try {
         const res = await fetch('/api/assets');
@@ -1282,10 +1355,23 @@ async function loadAssets() {
         list.innerHTML = assets.map(a => {
             const aid = a.id || a.asset_id;
             const url = `/assets/${a.asset_type}/${aid}${a.extension || ''}`;
+            const tags = parseAssetTags(a.tags);
+            const tagBadges = tags.length
+                ? tags.map(t => `<span class="asset-tag">${escapeHtml(t)}</span>`).join('')
+                : '<span class="asset-tag none">无标注</span>';
+            // 从 document 中提取纯描述文本（去掉 [audio] 前缀和 | 标签: 后缀）
+            const docText = a.document || '';
+            const descMatch = docText.match(/\]\s+\S+\s*-\s*(.+?)(?:\s*\|\s*标签:.*)?$/);
+            const desc = descMatch ? descMatch[1] : '';
+            const descHtml = desc ? `<span class="asset-desc">${escapeHtml(desc)}</span>` : '';
             return `
             <div class="asset-item">
-                <span class="name">${getTypeIcon(a.asset_type)} ${escapeHtml(a.file_name || '')}</span>
-                <code style="font-size:11px;color:#888;margin:0 8px">${escapeHtml(url)}</code>
+                <div class="asset-info">
+                    <span class="name">${getTypeIcon(a.asset_type)} ${escapeHtml(a.file_name || '')}</span>
+                    <span class="asset-tags">${tagBadges}</span>
+                    ${descHtml}
+                </div>
+                <code style="font-size:11px;color:#666;margin:0 8px;white-space:nowrap">${escapeHtml(url)}</code>
                 <div class="actions">
                     <button onclick="deleteAsset('${aid}')" title="删除">🗑️</button>
                 </div>
