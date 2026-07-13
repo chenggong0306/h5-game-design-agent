@@ -18,7 +18,7 @@
 | 📝 **代码编辑器** | Monaco Editor（VS Code 同款），语法高亮 + 自动补全 |
 | 🎮 **实时预览** | iframe 沙盒预览，代码改完即时运行 |
 | 🎨 **素材管理** | 上传图片/音频素材，AI 自动在生成的代码中引用 |
-| 🧠 **技能系统** | 内置 7 个 H5 游戏开发技能，支持自定义导入（JSON/MD/ZIP/本地扫描） |
+| 🧠 **技能系统** | 内置通用与品类技能，支持自定义说明、标准技能包和完整源码参考项目 |
 | 💾 **项目管理** | 保存 / 加载 / 删除游戏项目 |
 | 🧠 **上下文压缩** | 对话历史自动总结，长对话不丢失上下文 |
 
@@ -29,7 +29,7 @@
                 │              │
                 │         Middleware 层
                 │          ├── track_context_usage（上下文监控）
-                │          ├── SkillMiddleware（技能列表注入 + load_skill 工具）
+                │          ├── SkillMiddleware（技能检索 + 源码按文件读取）
                 │          ├── ContextEditingMiddleware（清理旧工具结果）
                 │          └── SummarizationMiddleware（历史自动总结）
                 │
@@ -53,6 +53,7 @@
 |------|------|
 | `search_assets` | 搜索知识库中的游戏素材 |
 | `load_skill` | 加载技能完整内容（由 SkillMiddleware 注册） |
+| `load_skill_source` | 按文件、按行读取技能关联的源码参考项目 |
 | `str_replace_code` | 写入/编辑代码（new_str 以 `<!DOCTYPE` 开头=重置覆盖；`append=True`=分段追加；`old_str` 非空=替换片段） |
 | `view_code` | 查看代码（每次最多100行） |
 | `search_code` | 搜索代码关键字（返回匹配行+上下文） |
@@ -147,6 +148,15 @@ uv run python main.py
                    ctx.drawImage(img, x, y, w, h);
 ```
 
+### 导入源码参考技能
+
+1. 点击顶部 **🧠 技能**。
+2. 填写名称和描述，例如“超级玛丽类平台跳跃”与“横版平台跳跃、关卡闯关、跳跃踩敌玩法”。
+3. 选择一个源码文件夹或一个源码 ZIP；补充说明在上传源码时可以留空。
+4. 保存后，一个源码项目对应一个技能。HTML/JS/CSS 等文本源码保留相对目录，图片和音频只记录依赖路径，第三方压缩库与构建目录会跳过。
+
+源码不会整包塞入一次模型调用。智能体先通过 `load_skill` 查看项目清单，再用 `load_skill_source` 按文件、按行读取入口和核心逻辑。默认只复用玩法、架构和交互模式，不把第三方品牌、美术或音频视为可再分发资产。
+
 ## 📁 项目结构
 
 ```
@@ -163,8 +173,9 @@ h5-game-design-agent/
 │   │   └── game_agent.py            # AI 智能体（对话 + 流式输出 + 代码提取）
 │   │
 │   ├── knowledge/
-│   │   ├── knowledge_base.py        # ChromaDB 知识库（素材/技能/项目 CRUD）
-│   │   └── phaser_skills.py         # 7 个 H5 游戏开发技能文档
+│   │   ├── knowledge_base.py        # ChromaDB 素材知识库
+│   │   ├── phaser_skills.py         # 通用 H5 游戏开发技能文档
+│   │   └── genre_skills.json        # 游戏品类技能
 │   │
 │   ├── api/
 │   │   └── routes.py                # REST API + SSE 流式端点
@@ -224,6 +235,17 @@ data: [DONE]                                      ← 结束
 | GET | `/api/projects/{id}` | 获取项目详情 |
 | DELETE | `/api/projects/{id}` | 删除项目 |
 
+### 技能
+
+| 方法 | 路径 | 说明 |
+| ---- | ---- | ---- |
+| GET | `/api/skills` | 列出技能及源码文件数量 |
+| POST | `/api/skills` | 新建文本技能 |
+| PUT | `/api/skills/{name}` | 原子更新技能说明并保留源码 |
+| POST | `/api/skills/source` | 将一个源码文件夹或 ZIP 新建为源码参考技能 |
+| PUT | `/api/skills/{name}/source` | 替换现有技能的源码参考项目 |
+| DELETE | `/api/skills/{name}` | 删除技能 |
+
 ### 知识库
 
 | 方法 | 路径 | 说明 |
@@ -246,7 +268,7 @@ data: [DONE]                                      ← 结束
 
 ## 📝 内置知识库
 
-启动时自动加载 7 个 H5 游戏开发技能文档：
+启动时自动加载通用 H5 游戏开发技能与游戏品类技能，包括：
 
 1. **Canvas 游戏基础结构** — 游戏循环、画布自适应
 2. **触摸与键盘输入** — 移动端触摸 + PC 键盘兼容

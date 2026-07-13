@@ -1428,6 +1428,58 @@ document.getElementById('btn-skills').addEventListener('click', () => {
     loadSkills();
 });
 
+const skillSourceFolderInput = document.getElementById('skill-source-folder');
+const skillSourceZipInput = document.getElementById('skill-source-zip');
+const skillSourceStatus = document.getElementById('skill-source-status');
+const clearSkillSourceBtn = document.getElementById('btn-clear-skill-source');
+let selectedSkillSourceFiles = [];
+
+function clearSelectedSkillSource(statusText = '尚未选择源码；也可以只填写上面的技能说明。') {
+    selectedSkillSourceFiles = [];
+    skillSourceFolderInput.value = '';
+    skillSourceZipInput.value = '';
+    clearSkillSourceBtn.classList.add('hidden');
+    skillSourceStatus.classList.remove('ready');
+    skillSourceStatus.textContent = statusText;
+}
+
+function selectSkillSource(files, kind) {
+    selectedSkillSourceFiles = Array.from(files || []);
+    if (!selectedSkillSourceFiles.length) {
+        clearSelectedSkillSource();
+        return;
+    }
+    const totalBytes = selectedSkillSourceFiles.reduce((sum, file) => sum + file.size, 0);
+    const sizeMB = (totalBytes / 1024 / 1024).toFixed(totalBytes > 1024 * 1024 ? 1 : 2);
+    skillSourceStatus.textContent = `已选择${kind}：${selectedSkillSourceFiles.length} 个文件，共 ${sizeMB} MB。保存后后端会筛选可读源码并保留目录结构。`;
+    skillSourceStatus.classList.add('ready');
+    clearSkillSourceBtn.classList.remove('hidden');
+}
+
+skillSourceFolderInput.addEventListener('change', (event) => {
+    skillSourceZipInput.value = '';
+    selectSkillSource(event.target.files, '源码文件夹');
+});
+
+skillSourceZipInput.addEventListener('change', (event) => {
+    skillSourceFolderInput.value = '';
+    selectSkillSource(event.target.files, '源码 ZIP');
+});
+
+clearSkillSourceBtn.addEventListener('click', () => clearSelectedSkillSource());
+
+function resetSkillEditor() {
+    const btn = document.getElementById('btn-add-skill');
+    const nameInput = document.getElementById('skill-name');
+    nameInput.value = '';
+    nameInput.disabled = false;
+    document.getElementById('skill-desc').value = '';
+    document.getElementById('skill-content').value = '';
+    btn.textContent = '➕ 添加技能';
+    btn.dataset.mode = 'add';
+    clearSelectedSkillSource();
+}
+
 async function loadSkills() {
     const list = document.getElementById('skills-list');
     list.innerHTML = '<p style="color:#888;text-align:center">加载中...</p>';
@@ -1443,7 +1495,7 @@ async function loadSkills() {
             <div class="skill-item">
                 <div class="skill-info">
                     <strong>${escapeHtml(s.name || '')}</strong>
-                    <span>${escapeHtml(s.description || '')}</span>
+                    <span>${escapeHtml(s.description || '')}${s.source_file_count ? ` · 📦 ${s.source_file_count} 个源码文件` : ''}</span>
                 </div>
                 <div class="skill-actions">
                     <button onclick="viewSkill('${jsStr(s.name)}')" title="查看">👁</button>
@@ -1466,6 +1518,12 @@ async function viewSkill(name) {
         document.getElementById('skill-name').disabled = true;  // 查看时禁止改名
         document.getElementById('skill-desc').value = skill.description;
         document.getElementById('skill-content').value = skill.content;
+        clearSelectedSkillSource(
+            skill.source_file_count
+                ? `已保存 ${skill.source_file_count} 个源码文件、${skill.asset_file_count || 0} 个资源路径。重新选择文件夹/ZIP 可在保存时替换源码。`
+                : '此技能没有源码项目；可选择文件夹/ZIP 添加参考源码。'
+        );
+        if (skill.source_file_count) skillSourceStatus.classList.add('ready');
         // 切换按钮文字
         document.getElementById('btn-add-skill').textContent = '✏️ 更新技能';
         document.getElementById('btn-add-skill').dataset.mode = 'edit';
@@ -1490,60 +1548,51 @@ document.getElementById('btn-add-skill').addEventListener('click', async () => {
     const name = nameInput.value.trim();
     const desc = document.getElementById('skill-desc').value.trim();
     const content = document.getElementById('skill-content').value.trim();
-    if (!name || !desc || !content) { alert('请填写完整'); return; }
-    // 编辑模式：后端 POST 对重名返回 400 且无更新端点，只能"先删旧再建新"。
-    // 为防 DELETE 成功后 POST 失败导致旧技能永久丢失：删除前先取出旧技能备份，失败时回滚恢复。
-    let oldSkill = null;
+    const hasSource = selectedSkillSourceFiles.length > 0;
+    const isEdit = btn.dataset.mode === 'edit';
+    if (!name || !desc) { alert('请填写技能名称和描述'); return; }
+    if (!content && !hasSource && !isEdit) { alert('请填写技能说明，或选择一个源码文件夹/ZIP'); return; }
+    btn.disabled = true;
     try {
-        if (btn.dataset.mode === 'edit') {
-            const oldRes = await fetch(`/api/skills/${encodeURIComponent(name)}`);
-            if (oldRes.status === 404) {
-                // 旧技能已不存在（弹窗里被删 / 另一标签页删除）：跳过删除直接新建，
-                // 否则保存被永久阻断且表单卡死在编辑模式
-            } else {
-                await ensureOk(oldRes);
-                const backup = await oldRes.json();
-                await ensureOk(await fetch(`/api/skills/${encodeURIComponent(name)}`, { method: 'DELETE' }));
-                oldSkill = backup; // 删除确实成功后才需要回滚
+        let res;
+        if (hasSource) {
+            const formData = new FormData();
+            formData.append('name', name);
+            formData.append('description', desc);
+            formData.append('content', content);
+            for (const file of selectedSkillSourceFiles) {
+                formData.append('files', file, file.webkitRelativePath || file.name);
             }
+            res = await fetch(
+                isEdit
+                    ? `/api/skills/${encodeURIComponent(name)}/source`
+                    : '/api/skills/source',
+                { method: isEdit ? 'PUT' : 'POST', body: formData },
+            );
+        } else if (isEdit) {
+            res = await fetch(`/api/skills/${encodeURIComponent(name)}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ description: desc, content }),
+            });
+        } else {
+            res = await fetch('/api/skills', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name, description: desc, content }),
+            });
         }
-        const res = await fetch('/api/skills', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ name, description: desc, content }),
-        });
         await ensureOk(res);
-        // 重置表单
-        nameInput.value = '';
-        nameInput.disabled = false;
-        document.getElementById('skill-desc').value = '';
-        document.getElementById('skill-content').value = '';
-        btn.textContent = '➕ 添加技能';
-        btn.dataset.mode = 'add';
+        const result = await res.json();
+        if (hasSource) {
+            alert(`✅ 已保存技能“${name}”：导入 ${result.source_file_count} 个源码文件，记录 ${result.asset_file_count} 个资源路径，跳过 ${result.skipped_count} 项。`);
+        }
+        resetSkillEditor();
         await loadSkills();
     } catch (err) {
-        if (oldSkill) {
-            // 旧技能已删但新内容写入失败：重新 POST 旧技能恢复
-            try {
-                await ensureOk(await fetch('/api/skills', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        name: oldSkill.name,
-                        description: oldSkill.description,
-                        content: oldSkill.content,
-                    }),
-                }));
-                alert('❌ 更新失败: ' + err.message + '\n已恢复原技能内容，表单中的修改尚未保存，可重试。');
-            } catch (restoreErr) {
-                alert('❌ 更新失败: ' + err.message
-                    + '\n且自动恢复原技能也失败: ' + restoreErr.message
-                    + '\n请不要关闭页面，表单中仍保留当前内容，请重试保存。');
-            }
-            await loadSkills();
-        } else {
-            alert('操作失败: ' + err.message);
-        }
+        alert('操作失败: ' + err.message);
+    } finally {
+        btn.disabled = false;
     }
 });
 

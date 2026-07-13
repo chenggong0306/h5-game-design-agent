@@ -182,19 +182,41 @@
             </div>
             <div class="modal-body">
                 <div class="skill-add-form">
-                    <input type="text" id="skill-name" placeholder="技能名称（英文，如 rpg_combat）">
-                    <input type="text" id="skill-desc" placeholder="技能描述（中文）">
-                    <textarea id="skill-content" rows="6" placeholder="技能内容（代码模板、规则等）"></textarea>
+                    <div class="skill-form-help">
+                        <strong>一个源码项目可以作为一个技能参考</strong>
+                        <span>例：名称“超级玛丽类平台跳跃”，描述“横版平台跳跃、关卡闯关、跳跃踩敌玩法”。名称和描述用于检索，源码会按文件保存、按需读取。</span>
+                    </div>
+                    <input type="text" id="skill-name" placeholder="技能名称，如：超级玛丽类平台跳跃">
+                    <input type="text" id="skill-desc" placeholder="技能描述，如：横版平台跳跃、关卡闯关、跳跃踩敌玩法">
+                    <textarea id="skill-content" rows="5" placeholder="补充说明/复用规则（上传源码时可留空；不上传源码时必填）"></textarea>
+                    <div class="skill-source-box">
+                        <div>
+                            <strong>参考源码（可选）</strong>
+                            <p>一个文件夹或一个 ZIP 视为一个游戏项目。保留 HTML/JS/CSS 等源码结构；图片、音频只记录路径；压缩库和构建目录会跳过。</p>
+                        </div>
+                        <div class="skill-source-actions">
+                            <label class="skill-source-label">
+                                📁 选择源码文件夹
+                                <input type="file" id="skill-source-folder" webkitdirectory directory multiple hidden>
+                            </label>
+                            <label class="skill-source-label">
+                                📦 选择源码 ZIP
+                                <input type="file" id="skill-source-zip" accept=".zip" hidden>
+                            </label>
+                            <button type="button" id="btn-clear-skill-source" class="secondary hidden">清除选择</button>
+                        </div>
+                        <div id="skill-source-status" class="skill-source-status">尚未选择源码；也可以只填写上面的技能说明。</div>
+                    </div>
                     <div class="skill-add-actions">
                         <button id="btn-add-skill">➕ 添加技能</button>
                         <label class="skill-import-label">
-                            📥 导入文件
+                            📥 导入技能包（JSON/MD/ZIP）
                             <input type="file" id="skill-import-file" accept=".json,.md,.zip" style="display:none">
                         </label>
                     </div>
                     <div class="skill-scan-row">
-                        <input type="text" id="skill-scan-path" placeholder="本地文件夹路径，如 C:\skills 或 /home/user/skills">
-                        <button id="btn-scan-skills">📂 扫描导入</button>
+                        <input type="text" id="skill-scan-path" placeholder="标准 SKILL.md 文件夹路径，如 C:\skills">
+                        <button id="btn-scan-skills">📂 扫描 SKILL.md</button>
                     </div>
                 </div>
                 <div id="skills-list" class="skills-list"></div>

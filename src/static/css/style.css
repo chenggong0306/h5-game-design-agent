@@ -769,6 +769,31 @@ body {
     border-radius: 6px; font-size: 13px; font-family: inherit;
 }
 .skill-add-form textarea { resize: vertical; min-height: 80px; }
+.skill-form-help {
+    display: flex; flex-direction: column; gap: 4px;
+    padding: 10px 12px; border-radius: 8px;
+    background: rgba(74, 144, 226, 0.1); border: 1px solid rgba(74, 144, 226, 0.25);
+    color: var(--text-secondary); font-size: 12px; line-height: 1.55;
+}
+.skill-form-help strong { color: var(--text-primary); font-size: 13px; }
+.skill-source-box {
+    display: flex; flex-direction: column; gap: 9px;
+    padding: 12px; border: 1px solid var(--border); border-radius: 8px;
+    background: var(--bg-primary);
+}
+.skill-source-box p { margin: 4px 0 0; color: var(--text-secondary); font-size: 12px; line-height: 1.5; }
+.skill-source-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.skill-source-label, #btn-clear-skill-source {
+    padding: 7px 11px; border-radius: 7px; border: 1px solid var(--border);
+    background: var(--bg-secondary); color: var(--text-primary);
+    cursor: pointer; font-size: 12px; font-weight: 600;
+}
+#btn-clear-skill-source.secondary { background: transparent; }
+.skill-source-status {
+    color: var(--text-secondary); font-size: 12px; line-height: 1.45;
+    word-break: break-word;
+}
+.skill-source-status.ready { color: var(--success, #63d391); }
 .skill-add-actions { display: flex; gap: 10px; }
 .skill-add-actions button, .skill-import-label {
     padding: 8px 16px; border-radius: 8px;

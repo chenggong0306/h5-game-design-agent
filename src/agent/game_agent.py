@@ -426,7 +426,7 @@ def _compute_system_overhead_tokens() -> int:
     overhead = _estimate_tokens(SYSTEM_PROMPT)
     overhead += _estimate_tokens(_skills_prompt) + 60  # SkillMiddleware 每次注入技能列表
     try:
-        for t in ALL_TOOLS + [load_skill, search_skills]:
+        for t in ALL_TOOLS + [load_skill, load_skill_source, search_skills]:
             desc = getattr(t, "description", "") or ""
             overhead += int(_estimate_tokens(desc) * 1.4) + 20  # 描述 + 参数 schema 放大
     except Exception:
@@ -600,9 +600,10 @@ def _save_custom_skills() -> None:
     builtin_names = {skill["category"] for skill in H5_GAME_SKILLS}
     reserved = builtin_names | _GENRE_SKILL_NAMES  # 内置 + 品类模板都不算自定义
     custom = [s for s in SKILLS if s["name"] not in reserved]
-    _CUSTOM_SKILLS_FILE.write_text(
-        _json.dumps(custom, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    # 源码参考技能可能较大，先完整写临时文件再原子替换，避免进程中断留下半截 JSON。
+    tmp_file = _CUSTOM_SKILLS_FILE.with_suffix(_CUSTOM_SKILLS_FILE.suffix + ".tmp")
+    tmp_file.write_text(_json.dumps(custom, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp_file.replace(_CUSTOM_SKILLS_FILE)
 
 
 # 随仓库分发的品类模板技能（动作/平台/射击/消除/跑酷/塔防），由 load_skill 按需加载
@@ -653,9 +654,95 @@ def load_skill(skill_name: str) -> str:
     """
     for skill in SKILLS:
         if skill["name"] == skill_name:
-            return f"## 技能: {skill['description']}\n\n{skill['content']}"
+            result = f"## 技能: {skill['description']}\n\n{skill['content']}"
+            source_files = skill.get("source_files") or []
+            if source_files:
+                entrypoint = (skill.get("source_summary") or {}).get("entrypoint")
+                source_lines = [
+                    f"- `{item['path']}` ({item.get('language', 'text')}, "
+                    f"{item.get('lines', '?')} 行, {item.get('size', 0)} bytes)"
+                    for item in source_files[:300]
+                ]
+                if len(source_files) > 300:
+                    source_lines.append(f"- …另有 {len(source_files) - 300} 个源码文件")
+                assets = skill.get("asset_paths") or []
+                asset_lines = [f"- `{path}`" for path in assets[:200]]
+                if len(assets) > 200:
+                    asset_lines.append(f"- …另有 {len(assets) - 200} 个资源文件")
+                result += (
+                    "\n\n## 源码参考项目\n\n"
+                    "源码按文件保存，避免一次把整个项目塞进上下文。先从入口 HTML、主脚本和核心玩法文件开始，"
+                    "使用 `load_skill_source(skill_name, file_path, start_line, line_count)` 按需读取。"
+                    + (f"\n\n推荐入口：`{entrypoint}`" if entrypoint else "")
+                    + "\n\n"
+                    "### 源码文件\n" + "\n".join(source_lines)
+                )
+                if asset_lines:
+                    result += (
+                        "\n\n### 资源路径（仅用于理解依赖，不代表可复制或再分发）\n"
+                        + "\n".join(asset_lines)
+                    )
+            return result
     # 名称不存在：给出相近建议而非全量列表（技能可能上百个）
     return f"技能 '{skill_name}' 不存在。可能想找：\n{_search_skills_impl(skill_name, limit=8)}"
+
+
+@tool
+def load_skill_source(
+    skill_name: str,
+    file_path: str,
+    start_line: int = 1,
+    line_count: int = 300,
+    start_char: int = 0,
+) -> str:
+    """按文件、按行读取源码参考技能中的一个文本文件。
+
+    先调用 load_skill 查看源码清单，再读取入口 HTML、主脚本或核心逻辑。不要把第三方品牌、
+    美术和音频当作可复用资产；源码很长时分段读取。
+
+    Args:
+        skill_name: 源码参考技能名称
+        file_path: load_skill 清单中的精确相对路径
+        start_line: 起始行，最小为 1
+        line_count: 读取行数，范围 1-400
+        start_char: 所选行片段内的起始字符，通常为 0；单行超长文件用它继续分页
+    """
+    skill = next((s for s in SKILLS if s["name"] == skill_name), None)
+    if skill is None:
+        return f"技能 '{skill_name}' 不存在。"
+    source_files = skill.get("source_files") or []
+    source = next((item for item in source_files if item.get("path") == file_path), None)
+    if source is None:
+        candidates = [item.get("path", "") for item in source_files]
+        close = [path for path in candidates if file_path.lower() in path.lower()][:12]
+        hint = "\n".join(f"- `{path}`" for path in (close or candidates[:12]))
+        return f"源码文件 '{file_path}' 不存在。可选文件：\n{hint or '（该技能没有源码文件）'}"
+    start = max(1, int(start_line or 1))
+    count = max(1, min(400, int(line_count or 300)))
+    lines = str(source.get("content", "")).splitlines()
+    if start > len(lines):
+        return f"起始行 {start} 超出文件范围（共 {len(lines)} 行）。"
+    end = min(len(lines), start + count - 1)
+    selected = "\n".join(lines[start - 1:end])
+    char_offset = max(0, int(start_char or 0))
+    if char_offset >= len(selected) and selected:
+        return f"起始字符 {char_offset} 超出所选行片段范围（共 {len(selected)} 字符）。"
+    body = selected[char_offset:char_offset + 40000]
+    truncated_by_chars = char_offset + len(body) < len(selected)
+    language = source.get("language", "text")
+    suffix = ""
+    if truncated_by_chars:
+        suffix = (
+            "\n\n（所选行片段仍有内容；保持 start_line/line_count 不变，"
+            f"下一段从 start_char={char_offset + len(body)} 开始。）"
+        )
+    elif end < len(lines):
+        suffix = f"\n\n（还有内容；下一段从 start_line={end + 1} 开始。）"
+    return (
+        f"## {skill_name} / {file_path}\n\n"
+        f"行 {start}-{end} / {len(lines)}，片段字符起点 {char_offset}\n\n"
+        f"```{language}\n{body}\n```{suffix}"
+    )
 
 
 def _search_skills_impl(query: str, limit: int = 12) -> str:
@@ -724,6 +811,7 @@ def _inject_skills_into_request(request: ModelRequest) -> ModelRequest:
     skills_addendum = (
         f"\n\n## 可用技能\n\n{_skills_prompt}\n\n"
         "需要技能的详细指南/代码时调用 load_skill(skill_name)；"
+        "若技能含源码参考项目，再用 load_skill_source 按文件、按行读取；"
         "未列出的技能先用 search_skills(\"关键词\") 检索。"
     )
     new_content = list(request.system_message.content_blocks) + [
@@ -736,7 +824,7 @@ def _inject_skills_into_request(request: ModelRequest) -> ModelRequest:
 class SkillMiddleware(AgentMiddleware):
     """将技能列表注入到 system prompt，AI 需要时通过 load_skill 工具加载完整内容。"""
 
-    tools = [load_skill, search_skills]
+    tools = [load_skill, load_skill_source, search_skills]
 
     def wrap_model_call(self, request, handler):
         return handler(_inject_skills_into_request(request))
@@ -1323,7 +1411,7 @@ _WRITE_ARGS_KEEP_RECENT = 8
 def _build_context_edits(clear_trigger: int) -> list:
     """构建上下文清理编辑链（顺序敏感：先恒清代码入参，再做通用阈值清理）。"""
     non_write_tools = tuple(
-        t.name for t in ALL_TOOLS + [load_skill, search_skills]
+        t.name for t in ALL_TOOLS + [load_skill, load_skill_source, search_skills]
         if t.name not in ("write_game", "append_game")
     )
     return [

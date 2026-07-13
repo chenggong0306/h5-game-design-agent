@@ -13,7 +13,11 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 import src.api.routes as routes
-from src.agent.game_agent import SKILLS as _orig_skills
+from src.agent.game_agent import (
+    SKILLS as _orig_skills,
+    load_skill,
+    load_skill_source,
+)
 
 
 class SseStreamTests(unittest.TestCase):
@@ -166,6 +170,84 @@ class SkillsApiTests(unittest.TestCase):
             files={"file": ("skills.zip", b"not a zip at all", "application/zip")},
         )
         self.assertEqual(r.status_code, 400)
+
+    def test_import_source_folder_as_one_skill(self):
+        files = [
+            ("files", ("demo/index.html", b"<canvas id='game'></canvas>", "text/html")),
+            ("files", ("demo/js/game.js", b"function startGame() { return true; }", "text/javascript")),
+            ("files", ("demo/js/jquery.min.js", b"/*! vendor */", "text/javascript")),
+            ("files", ("demo/images/player.png", b"\x89PNG\r\n", "image/png")),
+        ]
+        with mock.patch.object(routes, "_save_custom_skills"):
+            r = self.client.post(
+                "/api/skills/source",
+                data={
+                    "name": "platform_demo",
+                    "description": "平台跳跃游戏参考",
+                    "content": "重点参考关卡和跳跃手感。",
+                },
+                files=files,
+            )
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertEqual(body["source_file_count"], 2)
+        self.assertEqual(body["asset_file_count"], 1)
+        self.assertEqual(body["entrypoint"], "demo/index.html")
+        self.assertGreaterEqual(body["skipped_count"], 1)
+
+        detail = self.client.get("/api/skills/platform_demo").json()
+        self.assertEqual(detail["source_file_count"], 2)
+        self.assertEqual(
+            [item["path"] for item in detail["source_files"]],
+            ["demo/index.html", "demo/js/game.js"],
+        )
+        self.assertNotIn("content", detail["source_files"][0])
+
+        overview = load_skill.invoke({"skill_name": "platform_demo"})
+        self.assertIn("demo/index.html", overview)
+        self.assertIn("load_skill_source", overview)
+        source = load_skill_source.invoke({
+            "skill_name": "platform_demo",
+            "file_path": "demo/js/game.js",
+            "start_line": 1,
+            "line_count": 20,
+        })
+        self.assertIn("function startGame", source)
+
+    def test_update_source_skill_preserves_files(self):
+        with mock.patch.object(routes, "_save_custom_skills"):
+            created = self.client.post(
+                "/api/skills/source",
+                data={"name": "source_edit", "description": "旧描述", "content": "旧说明"},
+                files={"files": ("game/index.html", b"<h1>game</h1>", "text/html")},
+            )
+            self.assertEqual(created.status_code, 200, created.text)
+            updated = self.client.put(
+                "/api/skills/source_edit",
+                json={"description": "新描述", "content": "新说明"},
+            )
+        self.assertEqual(updated.status_code, 200, updated.text)
+        skill = next(s for s in routes.SKILLS if s["name"] == "source_edit")
+        self.assertEqual(skill["description"], "新描述")
+        self.assertEqual(skill["source_files"][0]["path"], "game/index.html")
+
+    def test_source_zip_rejects_traversal_and_keeps_safe_source(self):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("../outside.js", "alert('bad')")
+            zf.writestr("project/index.html", "<canvas></canvas>")
+        with mock.patch.object(routes, "_save_custom_skills"):
+            r = self.client.post(
+                "/api/skills/source",
+                data={"name": "safe_zip", "description": "安全 ZIP", "content": ""},
+                files={"files": ("safe.zip", buf.getvalue(), "application/zip")},
+            )
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertEqual(body["source_file_count"], 1)
+        self.assertTrue(any("不安全路径" in item for item in body["skipped"]))
+        detail = self.client.get("/api/skills/safe_zip").json()
+        self.assertEqual(detail["source_files"][0]["path"], "project/index.html")
 
 
 if __name__ == "__main__":

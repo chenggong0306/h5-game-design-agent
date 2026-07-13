@@ -13,7 +13,7 @@ import zipfile
 import zlib
 
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException
 from fastapi.responses import FileResponse
@@ -871,10 +871,239 @@ class SkillCreateRequest(BaseModel):
     description: str
     content: str
 
+
+class SkillUpdateRequest(BaseModel):
+    description: str
+    content: str
+
+
+_SOURCE_TEXT_EXTS = {
+    ".html", ".htm", ".css", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx",
+    ".json", ".md", ".txt", ".xml", ".yaml", ".yml", ".py", ".lua", ".glsl",
+    ".vert", ".frag", ".shader", ".csv", ".ini", ".toml",
+}
+_SOURCE_ASSET_EXTS = {
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".ico",
+    ".mp3", ".wav", ".ogg", ".m4a", ".flac", ".aac", ".opus", ".swf",
+    ".ttf", ".otf", ".woff", ".woff2", ".map", ".tmx",
+}
+_SOURCE_IGNORED_DIRS = {
+    ".git", ".svn", "__macosx", "node_modules", "bower_components", "vendor",
+    "dist", "build", ".idea", ".vscode", "coverage", "__pycache__",
+}
+_SOURCE_MAX_FILES = 500
+_SOURCE_MAX_ARCHIVE_ENTRIES = 5000
+_SOURCE_MAX_FILE_BYTES = 2 * 1024 * 1024
+_SOURCE_MAX_TEXT_BYTES = 2 * 1024 * 1024
+_SOURCE_MAX_ASSET_PATHS = 2000
+
+
+def _safe_source_path(raw_path: str) -> str | None:
+    """把浏览器/ZIP 文件名归一成安全的项目相对路径。"""
+    value = (raw_path or "").replace("\\", "/").strip("/")
+    if not value:
+        return None
+    path = PurePosixPath(value)
+    if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+        return None
+    return "/".join(path.parts)
+
+
+def _decode_source_text(raw: bytes) -> str | None:
+    if b"\x00" in raw:
+        return None
+    for encoding in ("utf-8-sig", "gb18030"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    decoded = raw.decode("utf-8", errors="replace")
+    if decoded.count("\ufffd") > max(8, len(decoded) // 100):
+        return None
+    return decoded
+
+
+def _source_language(path: str) -> str:
+    return {
+        ".html": "html", ".htm": "html", ".css": "css", ".js": "javascript",
+        ".jsx": "jsx", ".mjs": "javascript", ".cjs": "javascript",
+        ".ts": "typescript", ".tsx": "tsx", ".json": "json", ".md": "markdown",
+        ".py": "python", ".lua": "lua", ".xml": "xml", ".yaml": "yaml",
+        ".yml": "yaml", ".glsl": "glsl", ".vert": "glsl", ".frag": "glsl",
+        ".shader": "glsl", ".toml": "toml",
+    }.get(PurePosixPath(path).suffix.lower(), "text")
+
+
+def _expand_source_uploads(uploaded: list[tuple[str, bytes]]) -> tuple[list[tuple[str, bytes]], list[str]]:
+    """展开普通多文件上传和单个源码 ZIP，并保留安全的相对路径。"""
+    entries: list[tuple[str, bytes]] = []
+    errors: list[str] = []
+    expanded_bytes = 0
+    for filename, raw in uploaded:
+        safe_name = _safe_source_path(filename)
+        if not safe_name:
+            errors.append(f"跳过不安全路径: {filename or '(空文件名)'}")
+            continue
+        if PurePosixPath(safe_name).suffix.lower() != ".zip":
+            entries.append((safe_name, raw))
+            expanded_bytes += len(raw)
+            continue
+        try:
+            with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+                infos = [info for info in zf.infolist() if not info.is_dir()]
+                if len(infos) > _SOURCE_MAX_ARCHIVE_ENTRIES:
+                    errors.append(f"{safe_name}: ZIP 文件数超过 {_SOURCE_MAX_ARCHIVE_ENTRIES} 个")
+                    continue
+                for info in infos:
+                    inner = _safe_source_path(info.filename)
+                    if not inner:
+                        errors.append(f"{safe_name}: 跳过不安全路径 {info.filename}")
+                        continue
+                    expanded_bytes += info.file_size
+                    if expanded_bytes > _settings.max_upload_bytes * 3:
+                        errors.append(f"{safe_name}: 解压后内容超过安全上限")
+                        return entries, errors
+                    entries.append((inner, zf.read(info)))
+        except zipfile.BadZipFile:
+            errors.append(f"{safe_name}: 无效的 ZIP 文件")
+    if expanded_bytes > _settings.max_upload_bytes * 3:
+        errors.append("源码项目展开后超过安全上限")
+    return entries, errors
+
+
+def _build_source_reference(uploaded: list[tuple[str, bytes]]) -> tuple[list[dict], list[str], dict, list[str]]:
+    """把源码项目整理为按需读取的文本文件集合和资源路径清单。"""
+    entries, errors = _expand_source_uploads(uploaded)
+    source_files: list[dict] = []
+    asset_paths: list[str] = []
+    skipped: list[str] = list(errors)
+    total_text_bytes = 0
+    seen: set[str] = set()
+
+    for path, raw in entries:
+        if path in seen:
+            skipped.append(f"{path}: 重复路径")
+            continue
+        seen.add(path)
+        pure = PurePosixPath(path)
+        parts_lower = {part.lower() for part in pure.parts[:-1]}
+        suffix = pure.suffix.lower()
+        name_lower = pure.name.lower()
+        if parts_lower & _SOURCE_IGNORED_DIRS:
+            skipped.append(f"{path}: 第三方或构建目录")
+            continue
+        if suffix in _SOURCE_ASSET_EXTS:
+            if len(asset_paths) < _SOURCE_MAX_ASSET_PATHS:
+                asset_paths.append(path)
+            continue
+        if suffix not in _SOURCE_TEXT_EXTS:
+            skipped.append(f"{path}: 不支持的文件类型")
+            continue
+        if name_lower.endswith((".min.js", ".min.css")) or name_lower in {
+            "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "uv.lock",
+        }:
+            skipped.append(f"{path}: 压缩库或锁文件")
+            continue
+        if len(source_files) >= _SOURCE_MAX_FILES:
+            skipped.append(f"{path}: 源码文件数超过 {_SOURCE_MAX_FILES} 个")
+            continue
+        if len(raw) > _SOURCE_MAX_FILE_BYTES:
+            skipped.append(f"{path}: 单文件超过 {_SOURCE_MAX_FILE_BYTES // (1024 * 1024)}MB")
+            continue
+        if total_text_bytes + len(raw) > _SOURCE_MAX_TEXT_BYTES:
+            skipped.append(f"{path}: 源码总量超过 {_SOURCE_MAX_TEXT_BYTES // (1024 * 1024)}MB")
+            continue
+        text = _decode_source_text(raw)
+        if text is None:
+            skipped.append(f"{path}: 不是可读文本")
+            continue
+        source_files.append({
+            "path": path,
+            "language": _source_language(path),
+            "size": len(raw),
+            "lines": text.count("\n") + 1,
+            "content": text,
+        })
+        total_text_bytes += len(raw)
+
+    source_files.sort(key=lambda item: item["path"].lower())
+    asset_paths.sort(key=str.lower)
+    html_entries = [
+        item["path"] for item in source_files
+        if PurePosixPath(item["path"]).name.lower() in {"index.html", "index.htm"}
+    ]
+    entrypoint = (
+        min(html_entries, key=lambda path: (len(PurePosixPath(path).parts), path.lower()))
+        if html_entries else None
+    )
+    summary = {
+        "source_file_count": len(source_files),
+        "asset_file_count": len(asset_paths),
+        "source_bytes": total_text_bytes,
+        "skipped_count": len(skipped),
+        "entrypoint": entrypoint,
+    }
+    return source_files, asset_paths, summary, skipped
+
+
+async def _read_source_uploads(files: list[UploadFile]) -> list[tuple[str, bytes]]:
+    uploaded: list[tuple[str, bytes]] = []
+    total = 0
+    for file in files:
+        raw = await file.read()
+        total += len(raw)
+        if total > _settings.max_upload_bytes:
+            raise HTTPException(
+                413,
+                f"源码上传总量超过 {_settings.max_upload_bytes // (1024 * 1024)}MB 上限",
+            )
+        uploaded.append((file.filename or "", raw))
+    return uploaded
+
+
+def _source_skill_record(
+    name: str,
+    description: str,
+    content: str,
+    source_files: list[dict],
+    asset_paths: list[str],
+    summary: dict,
+) -> dict:
+    notes = content.strip() or (
+        "这是一个完整游戏项目的源码参考。先查看源码清单，按需读取入口文件和核心逻辑；"
+        "复用玩法、架构和交互模式，不要照搬第三方品牌、受版权保护的美术或外部压缩库。"
+    )
+    return {
+        "name": name.strip(),
+        "description": description.strip(),
+        "content": notes,
+        "source_files": source_files,
+        "asset_paths": asset_paths,
+        "source_summary": summary,
+    }
+
+
+def _public_skill(skill: dict, *, detail: bool = False) -> dict:
+    payload = {
+        "name": skill["name"],
+        "description": skill.get("description", ""),
+        "source_file_count": len(skill.get("source_files") or []),
+        "asset_file_count": len(skill.get("asset_paths") or []),
+    }
+    if detail:
+        payload["content"] = skill.get("content", "")
+        payload["source_files"] = [
+            {key: item.get(key) for key in ("path", "language", "size", "lines")}
+            for item in skill.get("source_files") or []
+        ]
+        payload["asset_paths"] = skill.get("asset_paths") or []
+        payload["source_summary"] = skill.get("source_summary") or {}
+    return payload
+
 @router.get("/api/skills")
 async def list_skills():
     """列出所有技能"""
-    return [{"name": s["name"], "description": s["description"]} for s in SKILLS]
+    return [_public_skill(s) for s in SKILLS]
 
 @router.post("/api/skills")
 async def add_skill(req: SkillCreateRequest):
@@ -885,6 +1114,91 @@ async def add_skill(req: SkillCreateRequest):
     SKILLS.append({"name": req.name, "description": req.description, "content": req.content})
     await asyncio.to_thread(_sync_skills)  # 磁盘写入放线程
     return {"ok": True, "name": req.name}
+
+
+@router.put("/api/skills/{skill_name}")
+async def update_skill(skill_name: str, req: SkillUpdateRequest):
+    """更新技能说明，同时保留已上传的源码参考。"""
+    for s in SKILLS:
+        if s["name"] == skill_name:
+            s["description"] = req.description
+            s["content"] = req.content
+            await asyncio.to_thread(_sync_skills)
+            return {"ok": True, "name": skill_name}
+    raise HTTPException(404, f"技能 '{skill_name}' 不存在")
+
+
+async def _save_source_skill(
+    *,
+    name: str,
+    description: str,
+    content: str,
+    files: list[UploadFile],
+    replace: bool,
+) -> dict:
+    clean_name = name.strip()
+    clean_description = description.strip()
+    if not clean_name or not clean_description:
+        raise HTTPException(400, "技能名称和描述不能为空")
+    existing_index = next((i for i, s in enumerate(SKILLS) if s["name"] == clean_name), None)
+    if replace and existing_index is None:
+        raise HTTPException(404, f"技能 '{clean_name}' 不存在")
+    if not replace and existing_index is not None:
+        raise HTTPException(400, f"技能 '{clean_name}' 已存在")
+    if not files:
+        raise HTTPException(400, "请选择源码文件夹或源码 ZIP")
+
+    uploaded = await _read_source_uploads(files)
+    source_files, asset_paths, summary, skipped = await asyncio.to_thread(
+        _build_source_reference, uploaded
+    )
+    if not source_files:
+        detail = skipped[0] if skipped else "没有找到可读的源码文件"
+        raise HTTPException(400, f"没有导入源码：{detail}")
+    record = _source_skill_record(
+        clean_name, clean_description, content, source_files, asset_paths, summary
+    )
+    if replace:
+        SKILLS[existing_index] = record
+    else:
+        SKILLS.append(record)
+    await asyncio.to_thread(_sync_skills)
+    return {
+        "ok": True,
+        "name": clean_name,
+        **summary,
+        "skipped": skipped[:50],
+    }
+
+
+@router.post("/api/skills/source")
+async def add_source_skill(
+    name: str = Form(...),
+    description: str = Form(...),
+    content: str = Form(""),
+    files: list[UploadFile] = File(...),
+):
+    """把一个源码文件夹或 ZIP 作为一个游戏参考技能导入。"""
+    return await _save_source_skill(
+        name=name, description=description, content=content, files=files, replace=False
+    )
+
+
+@router.put("/api/skills/{skill_name}/source")
+async def replace_source_skill(
+    skill_name: str,
+    description: str = Form(...),
+    content: str = Form(""),
+    files: list[UploadFile] = File(...),
+):
+    """替换现有技能的源码参考。"""
+    return await _save_source_skill(
+        name=skill_name,
+        description=description,
+        content=content,
+        files=files,
+        replace=True,
+    )
 
 @router.delete("/api/skills/{skill_name}")
 async def delete_skill(skill_name: str):
@@ -901,7 +1215,7 @@ async def get_skill(skill_name: str):
     """获取技能完整内容"""
     for s in SKILLS:
         if s["name"] == skill_name:
-            return s
+            return _public_skill(s, detail=True)
     raise HTTPException(404, f"技能 '{skill_name}' 不存在")
 
 
