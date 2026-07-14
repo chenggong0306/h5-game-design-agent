@@ -28,6 +28,8 @@ data/sessions/
 
 # 用户自定义技能（运行时生成）
 data/skills/custom_skills.json
+data/skills/source_assets/**
+!data/skills/source_assets/.gitkeep
 
 # 运行日志（运行时生成）
 logs/

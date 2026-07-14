@@ -35,13 +35,17 @@ from fastapi.requests import Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from src.config import settings
-from src.api.routes import router, kb, agent
+from src.api.routes import router, kb, agent, cleanup_source_asset_temp_dirs
 from src.agent.game_agent import SKILLS
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """启动时恢复素材索引 + 打印技能/知识库状态（取代已弃用的 @app.on_event）。"""
+    cleaned_source_temps = cleanup_source_asset_temp_dirs()
+    if cleaned_source_temps:
+        print(f"[Startup] Cleaned {cleaned_source_temps} incomplete source asset bundles")
+
     # 1. 自动恢复：扫描 data/assets/ 把已有文件重建索引（ChromaDB 被清空时救命用）
     rebuilt = kb.rebuild_assets_index()
     if rebuilt > 0:

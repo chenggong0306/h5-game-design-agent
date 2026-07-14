@@ -2,10 +2,12 @@
 
 import asyncio
 import base64
+import hashlib
 import io
 import json
 import logging
 import os
+import shutil
 import tempfile
 import threading
 import uuid
@@ -21,7 +23,17 @@ from starlette.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from src.knowledge.knowledge_base import KnowledgeBase
-from src.agent.game_agent import GameDesignAgent, SKILLS, _save_custom_skills
+from src.knowledge.source_asset_metadata import (
+    SOURCE_ASSET_METADATA_KEYS,
+    SOURCE_ASSET_METADATA_VERSION,
+    enrich_source_asset_metadata,
+)
+from src.agent.game_agent import (
+    GameDesignAgent,
+    SKILLS,
+    _save_custom_skills,
+    build_source_web_manifest,
+)
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -798,12 +810,61 @@ async def annotate_assets_batch(csv_file: UploadFile = File(...)):
 
 
 _ASSET_HEADERS = {"X-Content-Type-Options": "nosniff"}
+_SOURCE_ASSET_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "Cache-Control": "public, max-age=31536000, immutable",
+    "Access-Control-Allow-Origin": "*",
+    "Cross-Origin-Resource-Policy": "cross-origin",
+}
+_SOURCE_ASSET_MEDIA_TYPES = {
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp",
+    ".ico": "image/x-icon", ".avif": "image/avif", ".tif": "image/tiff",
+    ".tiff": "image/tiff", ".mp3": "audio/mpeg", ".wav": "audio/wav",
+    ".ogg": "audio/ogg", ".m4a": "audio/mp4", ".flac": "audio/flac",
+    ".aac": "audio/aac", ".opus": "audio/ogg", ".ttf": "font/ttf",
+    ".otf": "font/otf", ".woff": "font/woff", ".woff2": "font/woff2",
+    ".json": "application/json", ".tmx": "application/xml",
+}
+_SOURCE_ASSET_MANIFEST = "manifest.json"
+
+
+def _resolve_source_asset_path(bundle_id: str, filename: str) -> str:
+    """按技能清单校验源码素材，不允许通过 bundle URL 枚举或读取未登记文件。"""
+    if not _SOURCE_ASSET_BUNDLE_RE.fullmatch(bundle_id) or not _SAFE_FILENAME.fullmatch(filename):
+        raise HTTPException(status_code=404, detail="文件不存在")
+    suffix = Path(filename).suffix.lower()
+    if suffix not in _SOURCE_USABLE_ASSET_EXTS:
+        raise HTTPException(status_code=404, detail="文件不存在")
+    root = _source_asset_root().resolve()
+    bundle_dir = (root / bundle_id).resolve()
+    target = (bundle_dir / filename).resolve()
+    if bundle_dir.parent != root or target.parent != bundle_dir or not target.is_file():
+        raise HTTPException(status_code=404, detail="文件不存在")
+    try:
+        manifest = json.loads((bundle_dir / _SOURCE_ASSET_MANIFEST).read_text(encoding="utf-8"))
+        registered = filename in manifest.get("files", [])
+    except (OSError, ValueError, TypeError):
+        registered = False
+    if not registered:
+        raise HTTPException(status_code=404, detail="文件不存在")
+    return str(target)
 
 
 @router.get("/api/assets/file/{asset_type}/{filename}")
 async def serve_asset(asset_type: str, filename: str):
     """提供素材文件访问（API路径）。路径已做白名单+穿越校验。"""
     return FileResponse(_resolve_asset_path(asset_type, filename), headers=_ASSET_HEADERS)
+
+
+@router.get("/assets/source/{bundle_id}/{filename}")
+async def serve_source_asset(bundle_id: str, filename: str):
+    """提供源码技能内已保存的图片、音频、字体和地图资源。"""
+    return FileResponse(
+        _resolve_source_asset_path(bundle_id, filename),
+        media_type=_SOURCE_ASSET_MEDIA_TYPES[Path(filename).suffix.lower()],
+        headers=_SOURCE_ASSET_HEADERS,
+    )
 
 
 @router.get("/assets/{asset_type}/{filename}")
@@ -856,25 +917,31 @@ async def delete_project(project_id: str):
 # _sync_skills 的磁盘全量重写会卡事件循环，调用方一律 `await asyncio.to_thread(_sync_skills)`；
 # 进线程后失去事件循环的天然串行化，用线程锁防止并发技能变更交错重写同一文件
 _skills_sync_guard = threading.Lock()
+_skills_mutation_lock = asyncio.Lock()
 
 
 def _sync_skills():
     """更新 SkillMiddleware 的 prompt 缓存 + 持久化到磁盘（同步函数，放线程调用）"""
     with _skills_sync_guard:
         import src.agent.game_agent as ga
+        # 旧版源码技能没有图片尺寸/精灵帧元数据。同步前补齐一次，这样任何后续技能
+        # 变更都会把兼容性回填一并持久化，而不是只在当前进程内临时可见。
+        backfill_source_asset_metadata()
+        # 先原子持久化，再发布新的 prompt 缓存；磁盘失败时调用方可安全回滚 SKILLS，
+        # 不会留下“内存已回滚但模型仍看到新技能”的三态不一致。
+        _save_custom_skills()
         ga._rebuild_skills_prompt()  # 只列常用技能 + 检索提示（不再注入全部上百条）
         ga._invalidate_system_overhead()  # 技能变了，固定开销需重新计算（影响上下文圆环）
-        _save_custom_skills()
 
 class SkillCreateRequest(BaseModel):
-    name: str
-    description: str
-    content: str
+    name: str = Field(min_length=1, max_length=100)
+    description: str = Field(min_length=1, max_length=500)
+    content: str = Field(max_length=100000)
 
 
 class SkillUpdateRequest(BaseModel):
-    description: str
-    content: str
+    description: str = Field(min_length=1, max_length=500)
+    content: str = Field(max_length=100000)
 
 
 _SOURCE_TEXT_EXTS = {
@@ -884,6 +951,7 @@ _SOURCE_TEXT_EXTS = {
 }
 _SOURCE_ASSET_EXTS = {
     ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".ico",
+    ".avif", ".tif", ".tiff",
     ".mp3", ".wav", ".ogg", ".m4a", ".flac", ".aac", ".opus", ".swf",
     ".ttf", ".otf", ".woff", ".woff2", ".map", ".tmx",
 }
@@ -893,15 +961,142 @@ _SOURCE_IGNORED_DIRS = {
 }
 _SOURCE_MAX_FILES = 500
 _SOURCE_MAX_ARCHIVE_ENTRIES = 5000
+_SOURCE_MAX_UPLOAD_PARTS = 5000
 _SOURCE_MAX_FILE_BYTES = 2 * 1024 * 1024
 _SOURCE_MAX_TEXT_BYTES = 2 * 1024 * 1024
 _SOURCE_MAX_ASSET_PATHS = 2000
+_SOURCE_USABLE_ASSET_EXTS = set().union(*_ALLOWED_ASSET_EXTS.values())
+_SOURCE_ASSET_BUNDLE_RE = _re.compile(r"^[a-f0-9]{32}$")
+_SOURCE_ASSET_TEMP_RE = _re.compile(r"^\.tmp-[a-f0-9]{32}$")
+
+
+class _SourceImportLimitError(ValueError):
+    pass
+
+
+def _source_asset_kind(suffix: str) -> str | None:
+    """把安全扩展名映射为浏览器可用的源码素材类型。"""
+    if suffix in _ALLOWED_ASSET_EXTS["image"]:
+        return "image"
+    if suffix in _ALLOWED_ASSET_EXTS["audio"]:
+        return "audio"
+    if suffix in _ALLOWED_ASSET_EXTS["font"]:
+        return "font"
+    if suffix in _ALLOWED_ASSET_EXTS["tilemap"]:
+        return "tilemap"
+    return None
+
+
+def _source_asset_root() -> Path:
+    return Path(_settings.skills_dir) / "source_assets"
+
+
+def cleanup_source_asset_temp_dirs() -> int:
+    """启动时清理上次进程中断遗留的未发布临时素材包。"""
+    root = _source_asset_root()
+    if not root.is_dir():
+        return 0
+    cleaned = 0
+    for child in root.iterdir():
+        if not child.is_dir() or not _SOURCE_ASSET_TEMP_RE.fullmatch(child.name):
+            continue
+        try:
+            shutil.rmtree(child)
+            cleaned += 1
+        except OSError as exc:
+            logger.warning(
+                "source_asset_temp_cleanup_failed",
+                extra={"path": str(child), "error": str(exc)[:200]},
+            )
+    return cleaned
+
+
+def _delete_source_asset_bundle(bundle_id: str | None) -> None:
+    """只删除 skills/source_assets 下符合 UUID 规则的单个素材包。"""
+    if not bundle_id or not _SOURCE_ASSET_BUNDLE_RE.fullmatch(bundle_id):
+        return
+    root = _source_asset_root().resolve()
+    target = (root / bundle_id).resolve()
+    if target.parent == root:
+        try:
+            shutil.rmtree(target)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            logger.warning(
+                "source_asset_bundle_delete_failed",
+                extra={"path": str(target), "error": str(exc)[:200]},
+            )
+
+
+def _delete_unreferenced_source_asset_bundle(bundle_id: str | None) -> None:
+    """仅当当前没有技能引用素材包时删除，避免导入记录伪造 bundle id 后误删。"""
+    if not bundle_id:
+        return
+    if any(item.get("source_asset_bundle_id") == bundle_id for item in SKILLS):
+        return
+    _delete_source_asset_bundle(bundle_id)
+
+
+def _persist_source_asset_bundle(asset_files: list[dict]) -> tuple[str | None, list[dict]]:
+    """原子落盘源码素材，返回不可猜 bundle id 与不含二进制内容的公开清单。"""
+    if not asset_files:
+        return None, []
+    root = _source_asset_root()
+    root.mkdir(parents=True, exist_ok=True)
+    bundle_id = uuid.uuid4().hex
+    tmp_dir = root / f".tmp-{bundle_id}"
+    final_dir = root / bundle_id
+    tmp_dir.mkdir()
+    manifest: list[dict] = []
+    try:
+        for item in asset_files:
+            path = str(item["path"])
+            suffix = PurePosixPath(path).suffix.lower()
+            digest = hashlib.sha256(path.encode("utf-8")).hexdigest()[:32]
+            stored_name = f"{digest}{suffix}"
+            (tmp_dir / stored_name).write_bytes(item["content"])
+            manifest_item = {
+                "path": path,
+                "file_name": PurePosixPath(path).name,
+                "kind": item["kind"],
+                "size": item["size"],
+                "stored_name": stored_name,
+                "url": f"/assets/source/{bundle_id}/{stored_name}",
+            }
+            for key in SOURCE_ASSET_METADATA_KEYS:
+                if key in item:
+                    manifest_item[key] = item[key]
+            manifest.append(manifest_item)
+        (tmp_dir / _SOURCE_ASSET_MANIFEST).write_text(
+            json.dumps(
+                {"version": 1, "files": [item["stored_name"] for item in manifest]},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+            encoding="utf-8",
+        )
+        # Windows Defender/索引器可能在刚写完大量图片时短暂持有目录句柄，导致
+        # 同卷原子 rename 报 WinError 5；短暂退避重试，仍失败才整体回滚。
+        for attempt in range(8):
+            try:
+                tmp_dir.rename(final_dir)
+                break
+            except PermissionError:
+                if attempt == 7:
+                    raise
+                _time.sleep(0.05 * (attempt + 1))
+        return bundle_id, manifest
+    except Exception:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        shutil.rmtree(final_dir, ignore_errors=True)
+        raise
 
 
 def _safe_source_path(raw_path: str) -> str | None:
     """把浏览器/ZIP 文件名归一成安全的项目相对路径。"""
     value = (raw_path or "").replace("\\", "/").strip("/")
-    if not value:
+    if not value or len(value) > 500:
         return None
     path = PurePosixPath(value)
     if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
@@ -936,6 +1131,8 @@ def _source_language(path: str) -> str:
 
 def _expand_source_uploads(uploaded: list[tuple[str, bytes]]) -> tuple[list[tuple[str, bytes]], list[str]]:
     """展开普通多文件上传和单个源码 ZIP，并保留安全的相对路径。"""
+    if len(uploaded) > _SOURCE_MAX_UPLOAD_PARTS:
+        raise _SourceImportLimitError(f"上传文件数超过 {_SOURCE_MAX_UPLOAD_PARTS} 个")
     entries: list[tuple[str, bytes]] = []
     errors: list[str] = []
     expanded_bytes = 0
@@ -945,6 +1142,10 @@ def _expand_source_uploads(uploaded: list[tuple[str, bytes]]) -> tuple[list[tupl
             errors.append(f"跳过不安全路径: {filename or '(空文件名)'}")
             continue
         if PurePosixPath(safe_name).suffix.lower() != ".zip":
+            if len(entries) >= _SOURCE_MAX_ARCHIVE_ENTRIES:
+                raise _SourceImportLimitError(
+                    f"源码项目文件数超过 {_SOURCE_MAX_ARCHIVE_ENTRIES} 个"
+                )
             entries.append((safe_name, raw))
             expanded_bytes += len(raw)
             continue
@@ -952,8 +1153,9 @@ def _expand_source_uploads(uploaded: list[tuple[str, bytes]]) -> tuple[list[tupl
             with zipfile.ZipFile(io.BytesIO(raw)) as zf:
                 infos = [info for info in zf.infolist() if not info.is_dir()]
                 if len(infos) > _SOURCE_MAX_ARCHIVE_ENTRIES:
-                    errors.append(f"{safe_name}: ZIP 文件数超过 {_SOURCE_MAX_ARCHIVE_ENTRIES} 个")
-                    continue
+                    raise _SourceImportLimitError(
+                        f"{safe_name}: ZIP 文件数超过 {_SOURCE_MAX_ARCHIVE_ENTRIES} 个"
+                    )
                 for info in infos:
                     inner = _safe_source_path(info.filename)
                     if not inner:
@@ -961,21 +1163,27 @@ def _expand_source_uploads(uploaded: list[tuple[str, bytes]]) -> tuple[list[tupl
                         continue
                     expanded_bytes += info.file_size
                     if expanded_bytes > _settings.max_upload_bytes * 3:
-                        errors.append(f"{safe_name}: 解压后内容超过安全上限")
-                        return entries, errors
+                        raise _SourceImportLimitError(f"{safe_name}: 解压后内容超过安全上限")
+                    if len(entries) >= _SOURCE_MAX_ARCHIVE_ENTRIES:
+                        raise _SourceImportLimitError(
+                            f"源码项目文件数超过 {_SOURCE_MAX_ARCHIVE_ENTRIES} 个"
+                        )
                     entries.append((inner, zf.read(info)))
         except zipfile.BadZipFile:
             errors.append(f"{safe_name}: 无效的 ZIP 文件")
     if expanded_bytes > _settings.max_upload_bytes * 3:
-        errors.append("源码项目展开后超过安全上限")
+        raise _SourceImportLimitError("源码项目展开后超过安全上限")
     return entries, errors
 
 
-def _build_source_reference(uploaded: list[tuple[str, bytes]]) -> tuple[list[dict], list[str], dict, list[str]]:
-    """把源码项目整理为按需读取的文本文件集合和资源路径清单。"""
+def _build_source_reference(
+    uploaded: list[tuple[str, bytes]],
+) -> tuple[list[dict], list[dict], dict, list[str]]:
+    """把源码项目整理为文本源码、可持久化二进制素材、摘要和跳过清单。"""
     entries, errors = _expand_source_uploads(uploaded)
     source_files: list[dict] = []
-    asset_paths: list[str] = []
+    asset_files: list[dict] = []
+    path_statuses: dict[str, str] = {}
     skipped: list[str] = list(errors)
     total_text_bytes = 0
     seen: set[str] = set()
@@ -990,31 +1198,52 @@ def _build_source_reference(uploaded: list[tuple[str, bytes]]) -> tuple[list[dic
         suffix = pure.suffix.lower()
         name_lower = pure.name.lower()
         if parts_lower & _SOURCE_IGNORED_DIRS:
+            path_statuses[path] = "skipped_vendor"
             skipped.append(f"{path}: 第三方或构建目录")
             continue
         if suffix in _SOURCE_ASSET_EXTS:
-            if len(asset_paths) < _SOURCE_MAX_ASSET_PATHS:
-                asset_paths.append(path)
+            kind = _source_asset_kind(suffix)
+            if not kind:
+                path_statuses[path] = "unsupported"
+                skipped.append(f"{path}: 该资源类型不允许浏览器回源")
+                continue
+            if len(asset_files) >= _SOURCE_MAX_ASSET_PATHS:
+                path_statuses[path] = "skipped"
+                skipped.append(f"{path}: 资源文件数超过 {_SOURCE_MAX_ASSET_PATHS} 个")
+                continue
+            path_statuses[path] = "asset"
+            asset_files.append({
+                "path": path,
+                "kind": kind,
+                "size": len(raw),
+                "content": raw,
+            })
             continue
         if suffix not in _SOURCE_TEXT_EXTS:
+            path_statuses[path] = "unsupported"
             skipped.append(f"{path}: 不支持的文件类型")
             continue
         if name_lower.endswith((".min.js", ".min.css")) or name_lower in {
             "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "uv.lock",
         }:
+            path_statuses[path] = "skipped_vendor"
             skipped.append(f"{path}: 压缩库或锁文件")
             continue
         if len(source_files) >= _SOURCE_MAX_FILES:
+            path_statuses[path] = "skipped"
             skipped.append(f"{path}: 源码文件数超过 {_SOURCE_MAX_FILES} 个")
             continue
         if len(raw) > _SOURCE_MAX_FILE_BYTES:
+            path_statuses[path] = "skipped"
             skipped.append(f"{path}: 单文件超过 {_SOURCE_MAX_FILE_BYTES // (1024 * 1024)}MB")
             continue
         if total_text_bytes + len(raw) > _SOURCE_MAX_TEXT_BYTES:
+            path_statuses[path] = "skipped"
             skipped.append(f"{path}: 源码总量超过 {_SOURCE_MAX_TEXT_BYTES // (1024 * 1024)}MB")
             continue
         text = _decode_source_text(raw)
         if text is None:
+            path_statuses[path] = "skipped"
             skipped.append(f"{path}: 不是可读文本")
             continue
         source_files.append({
@@ -1024,10 +1253,12 @@ def _build_source_reference(uploaded: list[tuple[str, bytes]]) -> tuple[list[dic
             "lines": text.count("\n") + 1,
             "content": text,
         })
+        path_statuses[path] = "readable"
         total_text_bytes += len(raw)
 
     source_files.sort(key=lambda item: item["path"].lower())
-    asset_paths.sort(key=str.lower)
+    asset_files.sort(key=lambda item: item["path"].lower())
+    enrich_source_asset_metadata(source_files, asset_files)
     html_entries = [
         item["path"] for item in source_files
         if PurePosixPath(item["path"]).name.lower() in {"index.html", "index.htm"}
@@ -1036,17 +1267,29 @@ def _build_source_reference(uploaded: list[tuple[str, bytes]]) -> tuple[list[dic
         min(html_entries, key=lambda path: (len(PurePosixPath(path).parts), path.lower()))
         if html_entries else None
     )
+    web_bundle = build_source_web_manifest(source_files, entrypoint, path_statuses)
+    web_dependencies = web_bundle.get("dependencies") or []
     summary = {
+        "asset_metadata_version": SOURCE_ASSET_METADATA_VERSION,
         "source_file_count": len(source_files),
-        "asset_file_count": len(asset_paths),
+        "asset_file_count": len(asset_files),
+        "usable_asset_count": len(asset_files),
+        "asset_bytes": sum(item["size"] for item in asset_files),
         "source_bytes": total_text_bytes,
         "skipped_count": len(skipped),
         "entrypoint": entrypoint,
+        "web_dependency_count": len(web_dependencies),
+        "web_readable_dependency_count": sum(
+            1 for item in web_dependencies if item.get("status") == "readable"
+        ),
+        "web_bundle": web_bundle,
     }
-    return source_files, asset_paths, summary, skipped
+    return source_files, asset_files, summary, skipped
 
 
 async def _read_source_uploads(files: list[UploadFile]) -> list[tuple[str, bytes]]:
+    if len(files) > _SOURCE_MAX_UPLOAD_PARTS:
+        raise HTTPException(413, f"源码上传文件数超过 {_SOURCE_MAX_UPLOAD_PARTS} 个上限")
     uploaded: list[tuple[str, bytes]] = []
     total = 0
     for file in files:
@@ -1066,29 +1309,79 @@ def _source_skill_record(
     description: str,
     content: str,
     source_files: list[dict],
-    asset_paths: list[str],
+    source_assets: list[dict],
+    source_asset_bundle_id: str | None,
     summary: dict,
 ) -> dict:
     notes = content.strip() or (
         "这是一个完整游戏项目的源码参考。先查看源码清单，按需读取入口文件和核心逻辑；"
-        "复用玩法、架构和交互模式，不要照搬第三方品牌、受版权保护的美术或外部压缩库。"
+        "复用玩法、架构和交互模式；项目内已保存的图片、音频和字体可通过资源清单按需使用。"
     )
     return {
         "name": name.strip(),
         "description": description.strip(),
         "content": notes,
         "source_files": source_files,
-        "asset_paths": asset_paths,
+        "asset_paths": [item["path"] for item in source_assets],
+        "source_assets": source_assets,
+        "source_asset_bundle_id": source_asset_bundle_id,
         "source_summary": summary,
     }
 
 
+def _ensure_source_skill_asset_metadata(skill: dict) -> bool:
+    """Best-effort metadata backfill for source skills saved before this metadata layer."""
+    assets = skill.get("source_assets") or []
+    if not assets:
+        return False
+    source_summary = skill.setdefault("source_summary", {})
+    if source_summary.get("asset_metadata_version") == SOURCE_ASSET_METADATA_VERSION:
+        return False
+    bundle_id = str(skill.get("source_asset_bundle_id") or "")
+    if not _SOURCE_ASSET_BUNDLE_RE.fullmatch(bundle_id):
+        return False
+    bundle_dir = _source_asset_root() / bundle_id
+
+    def load_content(asset: dict) -> bytes | None:
+        stored_name = str(asset.get("stored_name") or "")
+        if not stored_name:
+            url_name = PurePosixPath(str(asset.get("url") or "")).name
+            stored_name = url_name
+        if not _SAFE_FILENAME.fullmatch(stored_name):
+            return None
+        path = bundle_dir / stored_name
+        if not path.is_file():
+            return None
+        return path.read_bytes()
+
+    enrich_source_asset_metadata(
+        skill.get("source_files") or [],
+        assets,
+        content_loader=load_content,
+    )
+    source_summary["asset_metadata_version"] = SOURCE_ASSET_METADATA_VERSION
+    return True
+
+
+def backfill_source_asset_metadata() -> int:
+    """Enrich all legacy source skills in memory; return changed skill count."""
+    changed = 0
+    for skill in SKILLS:
+        if _ensure_source_skill_asset_metadata(skill):
+            changed += 1
+    return changed
+
+
 def _public_skill(skill: dict, *, detail: bool = False) -> dict:
+    _ensure_source_skill_asset_metadata(skill)
+    source_summary = skill.get("source_summary") or {}
     payload = {
         "name": skill["name"],
         "description": skill.get("description", ""),
         "source_file_count": len(skill.get("source_files") or []),
         "asset_file_count": len(skill.get("asset_paths") or []),
+        "usable_asset_count": len(skill.get("source_assets") or []),
+        "web_dependency_count": source_summary.get("web_dependency_count", 0),
     }
     if detail:
         payload["content"] = skill.get("content", "")
@@ -1097,8 +1390,25 @@ def _public_skill(skill: dict, *, detail: bool = False) -> dict:
             for item in skill.get("source_files") or []
         ]
         payload["asset_paths"] = skill.get("asset_paths") or []
-        payload["source_summary"] = skill.get("source_summary") or {}
+        payload["source_assets"] = [
+            {
+                key: item.get(key)
+                for key in (
+                    "path", "file_name", "kind", "size", "url",
+                    *SOURCE_ASSET_METADATA_KEYS,
+                )
+                if key in item or key in {"path", "file_name", "kind", "size", "url"}
+            }
+            for item in skill.get("source_assets") or []
+        ]
+        payload["source_summary"] = source_summary
     return payload
+
+
+# Source skills are loaded by game_agent before this route module.  Backfill once at
+# import so tools sharing the same SKILLS objects can immediately see the metadata;
+# _sync_skills persists it on the next skill mutation.
+backfill_source_asset_metadata()
 
 @router.get("/api/skills")
 async def list_skills():
@@ -1108,23 +1418,36 @@ async def list_skills():
 @router.post("/api/skills")
 async def add_skill(req: SkillCreateRequest):
     """添加自定义技能"""
-    for s in SKILLS:
-        if s["name"] == req.name:
+    async with _skills_mutation_lock:
+        if any(s["name"] == req.name for s in SKILLS):
             raise HTTPException(400, f"技能 '{req.name}' 已存在")
-    SKILLS.append({"name": req.name, "description": req.description, "content": req.content})
-    await asyncio.to_thread(_sync_skills)  # 磁盘写入放线程
+        record = {"name": req.name, "description": req.description, "content": req.content}
+        SKILLS.append(record)
+        try:
+            await asyncio.to_thread(_sync_skills)  # 磁盘写入放线程
+        except Exception:
+            SKILLS.remove(record)
+            raise
     return {"ok": True, "name": req.name}
 
 
 @router.put("/api/skills/{skill_name}")
 async def update_skill(skill_name: str, req: SkillUpdateRequest):
     """更新技能说明，同时保留已上传的源码参考。"""
-    for s in SKILLS:
-        if s["name"] == skill_name:
-            s["description"] = req.description
-            s["content"] = req.content
-            await asyncio.to_thread(_sync_skills)
-            return {"ok": True, "name": skill_name}
+    async with _skills_mutation_lock:
+        for s in SKILLS:
+            if s["name"] == skill_name:
+                old_description = s.get("description", "")
+                old_content = s.get("content", "")
+                s["description"] = req.description
+                s["content"] = req.content
+                try:
+                    await asyncio.to_thread(_sync_skills)
+                except Exception:
+                    s["description"] = old_description
+                    s["content"] = old_content
+                    raise
+                return {"ok": True, "name": skill_name}
     raise HTTPException(404, f"技能 '{skill_name}' 不存在")
 
 
@@ -1140,29 +1463,66 @@ async def _save_source_skill(
     clean_description = description.strip()
     if not clean_name or not clean_description:
         raise HTTPException(400, "技能名称和描述不能为空")
-    existing_index = next((i for i, s in enumerate(SKILLS) if s["name"] == clean_name), None)
-    if replace and existing_index is None:
-        raise HTTPException(404, f"技能 '{clean_name}' 不存在")
-    if not replace and existing_index is not None:
-        raise HTTPException(400, f"技能 '{clean_name}' 已存在")
+    if len(clean_name) > 100 or len(clean_description) > 500:
+        raise HTTPException(400, "技能名称最多 100 个字符，描述最多 500 个字符")
+    if len(content) > 100000:
+        raise HTTPException(400, "技能补充说明最多 100000 个字符")
     if not files:
         raise HTTPException(400, "请选择源码文件夹或源码 ZIP")
 
     uploaded = await _read_source_uploads(files)
-    source_files, asset_paths, summary, skipped = await asyncio.to_thread(
-        _build_source_reference, uploaded
-    )
+    try:
+        source_files, asset_files, summary, skipped = await asyncio.to_thread(
+            _build_source_reference, uploaded
+        )
+    except _SourceImportLimitError as exc:
+        raise HTTPException(413, str(exc)) from exc
     if not source_files:
         detail = skipped[0] if skipped else "没有找到可读的源码文件"
         raise HTTPException(400, f"没有导入源码：{detail}")
-    record = _source_skill_record(
-        clean_name, clean_description, content, source_files, asset_paths, summary
+    bundle_id, source_assets = await asyncio.to_thread(
+        _persist_source_asset_bundle, asset_files
     )
-    if replace:
-        SKILLS[existing_index] = record
-    else:
-        SKILLS.append(record)
-    await asyncio.to_thread(_sync_skills)
+    record = _source_skill_record(
+        clean_name,
+        clean_description,
+        content,
+        source_files,
+        source_assets,
+        bundle_id,
+        summary,
+    )
+    committed = False
+    try:
+        async with _skills_mutation_lock:
+            existing_index = next(
+                (i for i, s in enumerate(SKILLS) if s["name"] == clean_name),
+                None,
+            )
+            if replace and existing_index is None:
+                raise HTTPException(404, f"技能 '{clean_name}' 不存在")
+            if not replace and existing_index is not None:
+                raise HTTPException(400, f"技能 '{clean_name}' 已存在")
+            old_record = SKILLS[existing_index] if replace else None
+            try:
+                if replace:
+                    SKILLS[existing_index] = record
+                else:
+                    SKILLS.append(record)
+                await asyncio.to_thread(_sync_skills)
+            except Exception:
+                if replace:
+                    SKILLS[existing_index] = old_record
+                elif record in SKILLS:
+                    SKILLS.remove(record)
+                raise
+            committed = True
+    except Exception:
+        if not committed:
+            await asyncio.to_thread(_delete_unreferenced_source_asset_bundle, bundle_id)
+        raise
+    # 已生成/保存的游戏会直接引用 bundle URL。替换技能后保留旧包，避免历史项目丢图；
+    # 只有提交持久化失败、URL 从未对调用方生效时才回滚删除新包。
     return {
         "ok": True,
         "name": clean_name,
@@ -1203,11 +1563,17 @@ async def replace_source_skill(
 @router.delete("/api/skills/{skill_name}")
 async def delete_skill(skill_name: str):
     """删除技能"""
-    for i, s in enumerate(SKILLS):
-        if s["name"] == skill_name:
-            SKILLS.pop(i)
-            await asyncio.to_thread(_sync_skills)  # 磁盘写入放线程
-            return {"ok": True}
+    async with _skills_mutation_lock:
+        for i, s in enumerate(SKILLS):
+            if s["name"] == skill_name:
+                removed = SKILLS.pop(i)
+                try:
+                    await asyncio.to_thread(_sync_skills)  # 磁盘写入放线程
+                except Exception:
+                    SKILLS.insert(i, removed)
+                    raise
+                # 素材 URL 可能已写入其它已保存项目；删除技能仅移除参考记录，不破坏历史游戏。
+                return {"ok": True}
     raise HTTPException(404, f"技能 '{skill_name}' 不存在")
 
 @router.get("/api/skills/{skill_name}")
@@ -1284,17 +1650,23 @@ async def import_skills_zip(file: UploadFile = File(...)):
     except zipfile.BadZipFile as e:
         raise HTTPException(400, "无效的 ZIP 文件") from e
 
-    # 对共享列表 SKILLS 的修改留在事件循环单线程内（无 await 间隙），避免并发竞态
-    existing_names = {s["name"] for s in SKILLS}
-    added = 0
-    for s in parsed:
-        if s["name"] in existing_names:
-            continue
-        SKILLS.append(s)
-        existing_names.add(s["name"])
-        added += 1
-
-    await asyncio.to_thread(_sync_skills)  # 部分导入成功也要持久化；磁盘写入放线程
+    async with _skills_mutation_lock:
+        existing_names = {s["name"] for s in SKILLS}
+        added_records = []
+        for s in parsed:
+            if s["name"] in existing_names:
+                continue
+            SKILLS.append(s)
+            added_records.append(s)
+            existing_names.add(s["name"])
+        try:
+            await asyncio.to_thread(_sync_skills)  # 部分导入成功也要持久化；磁盘写入放线程
+        except Exception:
+            for record in added_records:
+                if record in SKILLS:
+                    SKILLS.remove(record)
+            raise
+        added = len(added_records)
     return {"ok": True, "added": added, "errors": errors}
 
 
@@ -1370,15 +1742,29 @@ async def scan_skills_folder(req: SkillScanRequest):
     if not found:
         raise HTTPException(404, f"在 {folder} 中未找到 SKILL.md 文件")
 
-    # 导入（跳过重名）
-    added = 0
-    skipped = []
-    for s in found:
-        if any(existing["name"] == s["name"] for existing in SKILLS):
-            skipped.append(s["name"])
-            continue
-        SKILLS.append({"name": s["name"], "description": s["description"], "content": s["content"]})
-        added += 1
-
-    await asyncio.to_thread(_sync_skills)  # 磁盘写入放线程
+    # 导入（跳过重名）；提交阶段串行化，避免扫描期间其它请求新增同名技能。
+    async with _skills_mutation_lock:
+        existing_names = {item["name"] for item in SKILLS}
+        skipped = []
+        added_records = []
+        for s in found:
+            if s["name"] in existing_names:
+                skipped.append(s["name"])
+                continue
+            record = {
+                "name": s["name"],
+                "description": s["description"],
+                "content": s["content"],
+            }
+            SKILLS.append(record)
+            added_records.append(record)
+            existing_names.add(s["name"])
+        try:
+            await asyncio.to_thread(_sync_skills)  # 磁盘写入放线程
+        except Exception:
+            for record in added_records:
+                if record in SKILLS:
+                    SKILLS.remove(record)
+            raise
+        added = len(added_records)
     return {"ok": True, "added": added, "skipped": skipped, "total_found": len(found)}

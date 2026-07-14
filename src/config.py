@@ -19,8 +19,10 @@ class Settings(BaseSettings):
     llm_provider: str = "openai"
 
     # 生成质量调参
-    # temperature：写代码宜偏低（0.2~0.4 更稳、bug 更少）；想要更多玩法/视觉变化可调高
-    temperature: float = 0.3
+    # 默认使用确定性更高的生成参数：游戏代码对重现性和正确性的要求
+    # 高于文案创意性。如果明确需要“换一种方案”，可通过环境变量调高。
+    temperature: float = 0.0
+    top_p: float = 1.0
     # 单次输出上限。务必 ≤ 你所用模型的真实最大输出（如 deepseek-chat≈8192、gpt-4o≈16384）。
     # 太大可能被 provider 拒绝/截断；配合"分段写入"使用，单段建议 ≤300 行。
     max_output_tokens: int = 8192

@@ -29,7 +29,7 @@
                 │              │
                 │         Middleware 层
                 │          ├── track_context_usage（上下文监控）
-                │          ├── SkillMiddleware（技能检索 + 源码按文件读取）
+                │          ├── SkillMiddleware（技能检索 + 源码/素材按需读取）
                 │          ├── ContextEditingMiddleware（清理旧工具结果）
                 │          └── SummarizationMiddleware（历史自动总结）
                 │
@@ -53,6 +53,8 @@
 |------|------|
 | `search_assets` | 搜索知识库中的游戏素材 |
 | `load_skill` | 加载技能完整内容（由 SkillMiddleware 注册） |
+| `load_skill_assets` | 获取源码技能中已保存图片、音频和字体的可加载 URL |
+| `load_skill_web_bundle` | 按入口 HTML 的加载顺序，把本地 CSS/JS 组合为一个整体参考视图 |
 | `load_skill_source` | 按文件、按行读取技能关联的源码参考项目 |
 | `str_replace_code` | 写入/编辑代码（new_str 以 `<!DOCTYPE` 开头=重置覆盖；`append=True`=分段追加；`old_str` 非空=替换片段） |
 | `view_code` | 查看代码（每次最多100行） |
@@ -153,9 +155,9 @@ uv run python main.py
 1. 点击顶部 **🧠 技能**。
 2. 填写名称和描述，例如“超级玛丽类平台跳跃”与“横版平台跳跃、关卡闯关、跳跃踩敌玩法”。
 3. 选择一个源码文件夹或一个源码 ZIP；补充说明在上传源码时可以留空。
-4. 保存后，一个源码项目对应一个技能。HTML/JS/CSS 等文本源码保留相对目录，图片和音频只记录依赖路径，第三方压缩库与构建目录会跳过。
+4. 保存后，一个源码项目对应一个技能。HTML/JS/CSS 等文本源码保留相对目录；系统会解析入口 HTML 的 `<link>` 与 `<script src>`，并把安全的图片、音频、字体保存到独立素材包，生成 `/assets/source/...` URL。图片还会记录宽高，并从源码声明中识别精灵表的帧尺寸与卡牌图集坐标。
 
-源码不会整包塞入一次模型调用。智能体先通过 `load_skill` 查看项目清单，再用 `load_skill_source` 按文件、按行读取入口和核心逻辑。默认只复用玩法、架构和交互模式，不把第三方品牌、美术或音频视为可再分发资产。
+匹配到用户源码参考技能后，智能体先通过 `load_skill` 查看依赖图，再调用 `load_skill_web_bundle` 获取按原加载顺序组合的 HTML+CSS+JS 视图，并用 `load_skill_assets` 获取项目图片/音频 URL；超长或未被入口直接引用的文件才用 `load_skill_source` 分段补读。精灵表和卡牌图集必须用九参数 `drawImage` 按帧裁剪，自检会阻止把整张图集缩放成单个角色或卡牌。原源码文件不会被拼接覆盖，组合视图在调用时即时生成。用户上传且有权使用的项目素材会优先用于成品；未获授权的外部品牌素材和第三方库仍不会自动复制。
 
 ## 📁 项目结构
 

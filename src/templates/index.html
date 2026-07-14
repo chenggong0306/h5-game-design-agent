@@ -184,15 +184,15 @@
                 <div class="skill-add-form">
                     <div class="skill-form-help">
                         <strong>一个源码项目可以作为一个技能参考</strong>
-                        <span>例：名称“超级玛丽类平台跳跃”，描述“横版平台跳跃、关卡闯关、跳跃踩敌玩法”。名称和描述用于检索，源码会按文件保存、按需读取。</span>
+                        <span>例：名称“超级玛丽类平台跳跃”，描述“横版平台跳跃、关卡闯关、跳跃踩敌玩法”。名称和描述用于自动匹配；命中后会先加载 HTML+CSS+JS 组合参考，再生成新游戏。</span>
                     </div>
-                    <input type="text" id="skill-name" placeholder="技能名称，如：超级玛丽类平台跳跃">
-                    <input type="text" id="skill-desc" placeholder="技能描述，如：横版平台跳跃、关卡闯关、跳跃踩敌玩法">
-                    <textarea id="skill-content" rows="5" placeholder="补充说明/复用规则（上传源码时可留空；不上传源码时必填）"></textarea>
+                    <input type="text" id="skill-name" maxlength="100" placeholder="技能名称，如：超级玛丽类平台跳跃">
+                    <input type="text" id="skill-desc" maxlength="500" placeholder="技能描述，如：横版平台跳跃、关卡闯关、跳跃踩敌玩法">
+                    <textarea id="skill-content" rows="5" maxlength="100000" placeholder="补充说明/复用规则（上传源码时可留空；不上传源码时必填）"></textarea>
                     <div class="skill-source-box">
                         <div>
                             <strong>参考源码（可选）</strong>
-                            <p>一个文件夹或一个 ZIP 视为一个游戏项目。保留 HTML/JS/CSS 等源码结构；图片、音频只记录路径；压缩库和构建目录会跳过。</p>
+                            <p>一个文件夹或一个 ZIP 视为一个游戏项目。原始 HTML/JS/CSS 按目录保存并自动组合参考；安全的图片、音频和字体也会保存，并生成游戏内可直接加载的素材 URL。</p>
                         </div>
                         <div class="skill-source-actions">
                             <label class="skill-source-label">

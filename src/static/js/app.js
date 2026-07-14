@@ -331,6 +331,9 @@ function getToolMeta(tool) {
     const map = {
         search_assets: ['🔎', '搜索素材'],
         load_skill: ['📚', '加载技能'],
+        load_skill_assets: ['🖼️', '加载源码素材'],
+        load_skill_web_bundle: ['🧩', '组合源码参考'],
+        load_skill_source: ['📄', '读取源码文件'],
         search_code: ['⌕', '搜索代码'],
         view_code: ['👁', '查看代码'],
         write_game: ['✍️', '写入游戏'],
@@ -742,11 +745,11 @@ async function sendMessage(messageOverride = null, options = {}) {
                         // 自检+自修闭环状态：在对话里展示一条系统提示（content 为原始文本，渲染时统一走 renderMarkdown 转义）
                         let txt;
                         if (event.status === 'repairing') {
-                            txt = '🔧 自检发现问题，正在自动修复：\n' + (event.issues || []).map(s => '· ' + s).join('\n');
+                            txt = '🔧 基础运行检查发现问题，正在自动修复：\n' + (event.issues || []).map(s => '· ' + s).join('\n');
                         } else if (event.status === 'passed') {
-                            txt = '✅ 自检通过';
+                            txt = '✅ 基础运行检查通过（不代表玩法与素材语义已完全验证）';
                         } else {
-                            txt = '⚠️ 自检仍有问题（已尽力修复）：\n' + (event.issues || []).map(s => '· ' + s).join('\n');
+                            txt = '⚠️ 基础运行检查仍有问题（已尽力修复）：\n' + (event.issues || []).map(s => '· ' + s).join('\n');
                         }
                         activeStreamState.blocks.push({ type: 'text', content: '\n' + txt + '\n' });
                         scheduleStreamRender(activeStreamState);
@@ -1451,7 +1454,7 @@ function selectSkillSource(files, kind) {
     }
     const totalBytes = selectedSkillSourceFiles.reduce((sum, file) => sum + file.size, 0);
     const sizeMB = (totalBytes / 1024 / 1024).toFixed(totalBytes > 1024 * 1024 ? 1 : 2);
-    skillSourceStatus.textContent = `已选择${kind}：${selectedSkillSourceFiles.length} 个文件，共 ${sizeMB} MB。保存后后端会筛选可读源码并保留目录结构。`;
+    skillSourceStatus.textContent = `已选择${kind}：${selectedSkillSourceFiles.length} 个文件，共 ${sizeMB} MB。保存后会保留源码结构，并把安全的图片、音频和字体保存为生成游戏可直接加载的素材。`;
     skillSourceStatus.classList.add('ready');
     clearSkillSourceBtn.classList.remove('hidden');
 }
@@ -1495,7 +1498,7 @@ async function loadSkills() {
             <div class="skill-item">
                 <div class="skill-info">
                     <strong>${escapeHtml(s.name || '')}</strong>
-                    <span>${escapeHtml(s.description || '')}${s.source_file_count ? ` · 📦 ${s.source_file_count} 个源码文件` : ''}</span>
+                    <span>${escapeHtml(s.description || '')}${s.source_file_count ? ` · 📦 ${s.source_file_count} 个源码文件 · 🖼️ ${s.usable_asset_count || 0} 个可用素材 · 🧩 ${s.web_dependency_count || 0} 个网页依赖` : ''}</span>
                 </div>
                 <div class="skill-actions">
                     <button onclick="viewSkill('${jsStr(s.name)}')" title="查看">👁</button>
@@ -1520,7 +1523,7 @@ async function viewSkill(name) {
         document.getElementById('skill-content').value = skill.content;
         clearSelectedSkillSource(
             skill.source_file_count
-                ? `已保存 ${skill.source_file_count} 个源码文件、${skill.asset_file_count || 0} 个资源路径。重新选择文件夹/ZIP 可在保存时替换源码。`
+                ? `已保存 ${skill.source_file_count} 个源码文件、${skill.usable_asset_count || 0} 个可加载素材；已识别 ${skill.web_dependency_count || 0} 个 HTML→CSS/JS 依赖。生成时会提供组合参考和素材 URL。`
                 : '此技能没有源码项目；可选择文件夹/ZIP 添加参考源码。'
         );
         if (skill.source_file_count) skillSourceStatus.classList.add('ready');
@@ -1585,7 +1588,7 @@ document.getElementById('btn-add-skill').addEventListener('click', async () => {
         await ensureOk(res);
         const result = await res.json();
         if (hasSource) {
-            alert(`✅ 已保存技能“${name}”：导入 ${result.source_file_count} 个源码文件，记录 ${result.asset_file_count} 个资源路径，跳过 ${result.skipped_count} 项。`);
+            alert(`✅ 已保存技能“${name}”：导入 ${result.source_file_count} 个源码文件、${result.usable_asset_count || 0} 个可加载素材，识别 ${result.web_dependency_count || 0} 个 HTML→CSS/JS 依赖，跳过 ${result.skipped_count} 项。`);
         }
         resetSkillEditor();
         await loadSkills();
