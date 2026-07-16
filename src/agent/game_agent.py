@@ -57,6 +57,9 @@ _current_session_id: ContextVar[str] = ContextVar("current_session_id", default=
 _code_by_session: dict[str, str] = {}
 _staging_by_session: dict[str, str] = {}  # 分段写入新游戏的暂存区，校验通过后才提交到 _code_by_session
 _source_specs_by_session: dict[str, dict[str, dict]] = {}
+# 回合参考收集器：{session_id: {技能名: {"web_bundle": bool, "source_reads": int, "assets": int}}}
+# 供 done 事件 / chat() 的 reference_summary；随其它会话缓存在 _enforce_cache_limits/_cleanup_old_sessions 里同周期清理
+_turn_skill_refs_by_session: dict[str, dict[str, dict]] = {}
 _code_session_last_access: dict[str, float] = {}  # 记录最后访问时间，用于清理
 CODE_SESSION_TIMEOUT = 3600  # 1小时未访问的会话代码将被清理
 # code_update 全量推送的最小间隔（秒）：一回合几十次编辑时去抖中间版本，
@@ -117,6 +120,7 @@ def _enforce_cache_limits() -> None:
         for session_id, _ in sorted_sessions[:to_remove]:
             _code_by_session.pop(session_id, None)
             _source_specs_by_session.pop(session_id, None)
+            _turn_skill_refs_by_session.pop(session_id, None)
             _code_session_last_access.pop(session_id, None)
 
     # 2. 检查总大小限制
@@ -132,6 +136,7 @@ def _enforce_cache_limits() -> None:
             code_size = len(_code_by_session.get(session_id, ""))
             _code_by_session.pop(session_id, None)
             _source_specs_by_session.pop(session_id, None)
+            _turn_skill_refs_by_session.pop(session_id, None)
             _code_session_last_access.pop(session_id, None)
             total_size -= code_size
 
@@ -204,6 +209,59 @@ def _end_code_session(token) -> None:
     _current_session_id.reset(token)
 
 
+def restore_session_code(session_id: str, code: str) -> None:
+    """版本恢复入口（同步，供 routes 版本恢复端点在 asyncio.to_thread 里调用）。
+
+    走 _set_current_code 的现有写入路径：更新会话内存代码（下一轮对话经
+    _reconcile_code_sync 就以恢复后的代码为基准）并落盘；save_session_code 会先把
+    当前磁盘代码归档为新版本，恢复操作本身因此可回退。contextvar 在本线程内
+    set/reset（to_thread 的上下文拷贝不会传播回协程，不污染调用方）。
+    """
+    token = _current_session_id.set(session_id)
+    try:
+        _set_current_code(code)
+        # 分段写入暂存区属于恢复前的旧代码流，保留会让下一次 append 接错底稿
+        _staging_by_session.pop(session_id, None)
+    finally:
+        _current_session_id.reset(token)
+
+
+# -------- 回合参考收集器（reference_summary 数据源） --------
+
+def _reset_turn_skill_refs(session_id: str) -> None:
+    """回合开始清零参考收集器；自修轮次发生在同一回合内，记录自然累计。"""
+    _turn_skill_refs_by_session.pop(session_id, None)
+
+
+def _record_skill_reference(skill_name: str, kind: str) -> None:
+    """在技能工具的成功路径记录本回合参考了哪些技能、用了哪些工具。
+
+    @tool 在 executor 线程运行，contextvar 随任务上下文拷贝传入，能取到会话 id；
+    dict 的 setdefault/自增在 GIL 下原子，无需加锁。kind="load" 仅登记技能名。
+    """
+    session_id = _current_session_id.get()
+    if not session_id:
+        return
+    refs = _turn_skill_refs_by_session.setdefault(session_id, {})
+    entry = refs.setdefault(
+        skill_name, {"web_bundle": False, "source_reads": 0, "assets": 0}
+    )
+    if kind == "web_bundle":
+        entry["web_bundle"] = True
+    elif kind == "source_read":
+        entry["source_reads"] += 1
+    elif kind == "assets":
+        entry["assets"] += 1
+
+
+def _build_reference_summary(session_id: str) -> dict | None:
+    """组装本回合的参考摘要；未用任何技能工具时返回 None（契约要求）。"""
+    refs = _turn_skill_refs_by_session.get(session_id)
+    if not refs:
+        return None
+    return {"skills": [{"name": name, **entry} for name, entry in refs.items()]}
+
+
 def _cleanup_old_sessions() -> None:
     """清理超过1小时未访问的会话代码，防止内存泄漏。"""
     current_time = time.time()
@@ -221,6 +279,7 @@ def _cleanup_old_sessions() -> None:
         _code_by_session.pop(sid, None)
         _staging_by_session.pop(sid, None)  # 暂存区不再每回合清空，过期时一并回收
         _source_specs_by_session.pop(sid, None)
+        _turn_skill_refs_by_session.pop(sid, None)  # 回合参考收集器同周期回收
         _code_session_last_access.pop(sid, None)
         _context_usage_by_session.pop(sid, None)  # 上下文圆环缓存同周期回收，防无限增长
         log_session_event(sid, "session_expired")
@@ -1296,6 +1355,7 @@ def load_skill(skill_name: str) -> str:
     """
     for skill in SKILLS:
         if skill["name"] == skill_name:
+            _record_skill_reference(skill_name, "load")
             result = f"## 技能: {skill['description']}\n\n{skill['content']}"
             source_files = skill.get("source_files") or []
             if source_files:
@@ -1445,6 +1505,7 @@ def load_skill_assets(
     shown = selected[:count]
     if not shown:
         return f"技能 '{skill_name}' 中没有匹配的源码素材。"
+    _record_skill_reference(skill_name, "assets")
     lines = []
     for asset in shown:
         details = [f"{asset.get('size', 0)} bytes"]
@@ -1717,6 +1778,7 @@ def load_skill_web_bundle(
                 high = middle - 1
         combined = combined[:best]
         result = render(combined, notes)
+    _record_skill_reference(skill_name, "web_bundle")
     return result
 
 
@@ -1778,6 +1840,7 @@ def load_skill_source(
         if asset_lines
         else ""
     )
+    _record_skill_reference(skill_name, "source_read")
     return (
         f"## {skill_name} / {file_path}\n\n"
         f"行 {start}-{end} / {len(lines)}，片段字符起点 {char_offset}\n\n"
@@ -1919,6 +1982,7 @@ def search_skill_source(
             break
         output.append(block_text)
         rendered_chars += len(block_text)
+    _record_skill_reference(skill_name, "source_read")
     return "\n\n".join(output)
 
 
@@ -2874,6 +2938,7 @@ class GameDesignAgent:
             # contextvar 绑定必须留在协程内（to_thread 里 set 不会传播回来）；
             # 磁盘读写（load/save_session_code）下沉线程，不卡事件循环上的并发 SSE 流
             token = _current_session_id.set(session_id)
+            _reset_turn_skill_refs(session_id)  # 回合开始清零参考收集器（自修轮次同回合累计）
             await asyncio.to_thread(_reconcile_code_sync, session_id, current_code, code_dirty)
             base_code = _get_current_code()  # 协调后的基准代码
             try:
@@ -2924,7 +2989,12 @@ class GameDesignAgent:
 
                 code = self._resolve_final_code(base_code, reply)
                 action = "generate" if code and not base_code else "edit" if code else "chat"
-                return {"reply": reply, "code": code, "action": action}
+                return {
+                    "reply": reply,
+                    "code": code,
+                    "action": action,
+                    "reference_summary": _build_reference_summary(session_id),
+                }
             finally:
                 _end_code_session(token)
 
@@ -3142,6 +3212,7 @@ class GameDesignAgent:
             # contextvar 绑定必须留在协程内（to_thread 里 set 不会传播回来）；
             # 磁盘读写（load/save_session_code）下沉线程，不卡事件循环上的并发 SSE 流
             token = _current_session_id.set(session_id)
+            _reset_turn_skill_refs(session_id)  # 回合开始清零参考收集器（自修轮次同回合累计）
             await asyncio.to_thread(_reconcile_code_sync, session_id, current_code, code_dirty)
             base_code = _get_current_code()  # 协调后的基准代码
             # 流状态：full_reply 累积文本、last_code_sent/last_code_emit_ts 去重+去抖 code_update、
@@ -3176,7 +3247,12 @@ class GameDesignAgent:
             # 本回合已通过 code_update 推过同样内容时，done 不再重复携带整份代码
             # （app.js 仅在未收到过 code_update 时才用 done.code 兜底；routes.py 对空值有 or 兜底）
             done_code = None if (code and ss["code_pushed"] and code == ss["last_code_sent"]) else code
-            yield {"type": "done", "code": done_code, "action": action}
+            yield {
+                "type": "done",
+                "code": done_code,
+                "action": action,
+                "reference_summary": _build_reference_summary(session_id),
+            }
 
         except asyncio.CancelledError:
             # 用户取消/断开：客户端已收不到任何事件，且取消必须向上传播
@@ -3247,6 +3323,7 @@ class GameDesignAgent:
             _code_by_session.pop(session_id, None)
             _staging_by_session.pop(session_id, None)
             _source_specs_by_session.pop(session_id, None)
+            _turn_skill_refs_by_session.pop(session_id, None)
             _code_session_last_access.pop(session_id, None)
             try:
                 # 删磁盘文件，否则清空后重开会"复活"旧代码；unlink 下沉线程，不在持锁的事件循环上做磁盘 I/O

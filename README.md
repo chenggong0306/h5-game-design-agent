@@ -207,6 +207,8 @@ h5-game-design-agent/
 | POST | `/api/chat` | 非流式对话（兼容） |
 | POST | `/api/chat/stream` | **流式对话（SSE）** |
 | DELETE | `/api/chat/{session_id}` | 清除对话历史 |
+| GET | `/api/chat/{session_id}/versions` | 列出代码历史版本（每会话最多 10 个，新→旧） |
+| POST | `/api/chat/{session_id}/versions/{version_id}/restore` | 恢复到指定版本（恢复前自动归档当前代码） |
 
 **流式对话 SSE 事件格式：**
 
@@ -214,9 +216,11 @@ h5-game-design-agent/
 data: {"type":"session","session_id":"uuid"}     ← 会话ID
 data: {"type":"token","content":"你"}             ← 逐字输出
 data: {"type":"token","content":"好"}
-data: {"type":"done","code":"...","action":"generate"}  ← 完成+代码
+data: {"type":"done","code":"...","action":"generate","reference_summary":{"skills":[...]}}  ← 完成+代码+参考摘要
 data: [DONE]                                      ← 结束
 ```
+
+`reference_summary` 为本回合技能参考摘要（`name`/`web_bundle`/`source_reads`/`assets`），未用任何技能工具时为 `null`。
 
 ### 素材
 
@@ -244,9 +248,17 @@ data: [DONE]                                      ← 结束
 | GET | `/api/skills` | 列出技能及源码文件数量 |
 | POST | `/api/skills` | 新建文本技能 |
 | PUT | `/api/skills/{name}` | 原子更新技能说明并保留源码 |
-| POST | `/api/skills/source` | 将一个源码文件夹或 ZIP 新建为源码参考技能 |
-| PUT | `/api/skills/{name}/source` | 替换现有技能的源码参考项目 |
+| POST | `/api/skills/import` | ZIP 批量导入技能文档（误传纯源码项目返回 422 `SOURCE_PROJECT_DETECTED`） |
+| POST | `/api/skills/source` | 将一个源码文件夹或 ZIP 新建为源码参考技能（响应含 `skipped_details` 跳过明细） |
+| PUT | `/api/skills/{name}/source` | 替换现有技能的源码参考项目（同上含 `skipped_details`） |
 | DELETE | `/api/skills/{name}` | 删除技能 |
+
+### 真机预览
+
+| 方法 | 路径 | 说明 |
+| ---- | ---- | ---- |
+| GET | `/play/{session_id}` | 以 text/html 直出会话代码（手机扫码用，免 token） |
+| GET | `/api/server-info` | 局域网 IP 与端口（`{"lan_ip": str\|null, "port": int}`） |
 
 ### 知识库
 

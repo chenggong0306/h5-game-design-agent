@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import shutil
+import socket
 import tempfile
 import threading
 import uuid
@@ -18,7 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from starlette.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -33,6 +34,7 @@ from src.agent.game_agent import (
     SKILLS,
     _save_custom_skills,
     build_source_web_manifest,
+    restore_session_code,
 )
 
 router = APIRouter()
@@ -322,6 +324,9 @@ class ChatResponse(BaseModel):
     reply: str
     code: str | None = None
     action: str = "chat"
+    # 本回合参考摘要：{"skills": [{"name", "web_bundle", "source_reads", "assets"}]}；
+    # 未用任何技能工具时为 null（与流式 done 事件的同名字段保持一致）
+    reference_summary: dict | None = None
 
 
 class ProjectSaveRequest(BaseModel):
@@ -489,6 +494,101 @@ async def clear_chat(session_id: str):
 
     await asyncio.to_thread(_unlink_history)
     return {"ok": True}
+
+
+# ============ 代码版本历史 API ============
+
+@router.get("/api/chat/{session_id}/versions")
+async def list_code_versions(session_id: str):
+    """列出会话代码的历史版本（新→旧；无版本返回空数组）。"""
+    _require_safe_session_id(session_id)
+    from src.utils.persistence import list_session_versions
+    versions = await asyncio.to_thread(list_session_versions, session_id)
+    return {"versions": versions}
+
+
+@router.post("/api/chat/{session_id}/versions/{version_id}/restore")
+async def restore_code_version(session_id: str, version_id: str):
+    """恢复指定历史版本的代码。
+
+    恢复前 save_session_code 会先把当前代码归档为新版本（恢复操作本身可回退）；
+    同时经 game_agent 的会话代码写入路径更新内存，保证下一轮对话基于恢复后的代码。
+    version_id 由 persistence 层白名单正则校验（防路径穿越），非法/不存在一律 404。
+    """
+    _require_safe_session_id(session_id)
+    from src.utils.persistence import load_session_version
+    # 持会话锁：与进行中的对话回合（读改写权威代码）串行，防交错覆盖
+    async with agent._get_session_lock(session_id):
+        code = await asyncio.to_thread(load_session_version, session_id, version_id)
+        if code is None:
+            raise HTTPException(status_code=404, detail="版本不存在")
+        # 磁盘 I/O（归档旧版 + 写新代码）下沉线程，不卡事件循环
+        await asyncio.to_thread(restore_session_code, session_id, code)
+    return {"code": code}
+
+
+# ============ 真机预览 API ============
+
+@router.get("/play/{session_id}")
+async def play_session(session_id: str):
+    """真机预览：直接以 text/html 返回该会话的磁盘代码（data/sessions/{id}.html）。
+
+    免 token 理由与 /assets 相同：手机扫码打开是裸浏览器 GET，无法携带 X-API-Token
+    自定义头，main.py 的 require_token 对本路径放行。风险同样受控：session_id 是
+    不可猜的 UUID（同素材文件名策略），且已按安全正则校验防路径穿越；无文件 404。
+    """
+    _require_safe_session_id(session_id)
+    from src.utils.persistence import load_session_code
+    code = await asyncio.to_thread(load_session_code, session_id)
+    if code is None:
+        raise HTTPException(status_code=404, detail="会话代码不存在")
+    return HTMLResponse(code)
+
+
+@router.get("/api/server-info")
+async def server_info():
+    """返回局域网 IP 与端口，供前端生成真机预览（手机扫码）地址。"""
+
+    def _is_virtual_or_unusable(ip: str) -> bool:
+        # 代理 TUN（Clash 等默认 198.18.0.0/15）、链路本地、回环——手机扫码连不上这些地址
+        return (
+            ip.startswith("198.18.") or ip.startswith("198.19.")
+            or ip.startswith("169.254.") or ip.startswith("127.")
+        )
+
+    def _detect_lan_ip() -> str | None:
+        # UDP connect 技巧：让内核选出通往外网的本机地址，不真正发包。
+        # 开着代理 TUN 时内核会选中虚拟网卡（如 Clash 的 198.18.0.1），
+        # 这种地址手机连不上，需回退到枚举本机真实私网地址。
+        candidate = None
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                s.connect(("8.8.8.8", 80))
+                candidate = s.getsockname()[0]
+            finally:
+                s.close()
+        except OSError:
+            pass
+        if candidate and not _is_virtual_or_unusable(candidate):
+            return candidate
+        try:
+            infos = socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)
+            private = [
+                ip for ip in {i[4][0] for i in infos}
+                if not _is_virtual_or_unusable(ip)
+                and (ip.startswith("192.168.") or ip.startswith("10.")
+                     or any(ip.startswith(f"172.{n}.") for n in range(16, 32)))
+            ]
+            if private:
+                return sorted(private)[0]
+        except OSError:
+            pass
+        return candidate
+
+    # getsockname 本身不阻塞，但 socket 创建在个别环境（无网卡/防火墙钩子）可能变慢，放线程稳妥
+    lan_ip = await asyncio.to_thread(_detect_lan_ip)
+    return {"lan_ip": lan_ip, "port": _settings.port}
 
 
 
@@ -1129,17 +1229,36 @@ def _source_language(path: str) -> str:
     }.get(PurePosixPath(path).suffix.lower(), "text")
 
 
-def _expand_source_uploads(uploaded: list[tuple[str, bytes]]) -> tuple[list[tuple[str, bytes]], list[str]]:
-    """展开普通多文件上传和单个源码 ZIP，并保留安全的相对路径。"""
+# 跳过项的中文后果说明（skipped_details.hint）。third_party_lib 的措辞为前后端契约，勿改。
+_SKIP_HINT_THIRD_PARTY = "AI 无法直接使用该库，只能用原生 Canvas 重实现相关效果，还原度会打折"
+
+
+def _skip_detail(path: str, reason: str, hint: str) -> dict:
+    """skipped_details 单项：reason ∈ third_party_lib/unsupported_type/too_large/unsafe。"""
+    return {"path": path, "reason": reason, "hint": hint}
+
+
+def _expand_source_uploads(
+    uploaded: list[tuple[str, bytes]],
+) -> tuple[list[tuple[str, bytes]], list[str], list[dict]]:
+    """展开普通多文件上传和单个源码 ZIP，并保留安全的相对路径。
+
+    返回 (entries, errors, error_details)：errors 是给响应 skipped 的文案，
+    error_details 是同一批跳过项的结构化清单（path/reason/hint）。
+    """
     if len(uploaded) > _SOURCE_MAX_UPLOAD_PARTS:
         raise _SourceImportLimitError(f"上传文件数超过 {_SOURCE_MAX_UPLOAD_PARTS} 个")
     entries: list[tuple[str, bytes]] = []
     errors: list[str] = []
+    error_details: list[dict] = []
     expanded_bytes = 0
     for filename, raw in uploaded:
         safe_name = _safe_source_path(filename)
         if not safe_name:
             errors.append(f"跳过不安全路径: {filename or '(空文件名)'}")
+            error_details.append(_skip_detail(
+                filename or "(空文件名)", "unsafe",
+                "路径含越界或非法字符，为安全起见未导入，游戏无法引用该文件"))
             continue
         if PurePosixPath(safe_name).suffix.lower() != ".zip":
             if len(entries) >= _SOURCE_MAX_ARCHIVE_ENTRIES:
@@ -1160,6 +1279,9 @@ def _expand_source_uploads(uploaded: list[tuple[str, bytes]]) -> tuple[list[tupl
                     inner = _safe_source_path(info.filename)
                     if not inner:
                         errors.append(f"{safe_name}: 跳过不安全路径 {info.filename}")
+                        error_details.append(_skip_detail(
+                            f"{safe_name}:{info.filename}", "unsafe",
+                            "ZIP 内路径含越界或非法字符，为安全起见未导入，游戏无法引用该文件"))
                         continue
                     expanded_bytes += info.file_size
                     if expanded_bytes > _settings.max_upload_bytes * 3:
@@ -1171,16 +1293,24 @@ def _expand_source_uploads(uploaded: list[tuple[str, bytes]]) -> tuple[list[tupl
                     entries.append((inner, zf.read(info)))
         except zipfile.BadZipFile:
             errors.append(f"{safe_name}: 无效的 ZIP 文件")
+            error_details.append(_skip_detail(
+                safe_name, "unsupported_type",
+                "ZIP 文件损坏无法解压，其中的内容完全没有导入"))
     if expanded_bytes > _settings.max_upload_bytes * 3:
         raise _SourceImportLimitError("源码项目展开后超过安全上限")
-    return entries, errors
+    return entries, errors, error_details
 
 
 def _build_source_reference(
     uploaded: list[tuple[str, bytes]],
-) -> tuple[list[dict], list[dict], dict, list[str]]:
-    """把源码项目整理为文本源码、可持久化二进制素材、摘要和跳过清单。"""
-    entries, errors = _expand_source_uploads(uploaded)
+) -> tuple[list[dict], list[dict], dict, list[str], list[dict]]:
+    """把源码项目整理为文本源码、可持久化二进制素材、摘要、跳过清单和跳过明细。
+
+    skipped 是给人看的单行文案；skipped_details 是结构化契约字段
+    （path/reason/hint，reason ∈ third_party_lib/unsupported_type/too_large/unsafe），
+    归类沿用本函数既有的跳过判定，不新造规则。
+    """
+    entries, errors, skipped_details = _expand_source_uploads(uploaded)
     source_files: list[dict] = []
     asset_files: list[dict] = []
     path_statuses: dict[str, str] = {}
@@ -1191,6 +1321,9 @@ def _build_source_reference(
     for path, raw in entries:
         if path in seen:
             skipped.append(f"{path}: 重复路径")
+            skipped_details.append(_skip_detail(
+                path, "unsupported_type",
+                "同名路径重复出现，仅保留第一份，后续副本未导入"))
             continue
         seen.add(path)
         pure = PurePosixPath(path)
@@ -1200,16 +1333,23 @@ def _build_source_reference(
         if parts_lower & _SOURCE_IGNORED_DIRS:
             path_statuses[path] = "skipped_vendor"
             skipped.append(f"{path}: 第三方或构建目录")
+            skipped_details.append(_skip_detail(path, "third_party_lib", _SKIP_HINT_THIRD_PARTY))
             continue
         if suffix in _SOURCE_ASSET_EXTS:
             kind = _source_asset_kind(suffix)
             if not kind:
                 path_statuses[path] = "unsupported"
                 skipped.append(f"{path}: 该资源类型不允许浏览器回源")
+                skipped_details.append(_skip_detail(
+                    path, "unsupported_type",
+                    "该资源类型浏览器无法安全加载，最终游戏不能使用它"))
                 continue
             if len(asset_files) >= _SOURCE_MAX_ASSET_PATHS:
                 path_statuses[path] = "skipped"
                 skipped.append(f"{path}: 资源文件数超过 {_SOURCE_MAX_ASSET_PATHS} 个")
+                skipped_details.append(_skip_detail(
+                    path, "too_large",
+                    "资源数量超出上限未保存，游戏中会缺少这部分素材"))
                 continue
             path_statuses[path] = "asset"
             asset_files.append({
@@ -1222,29 +1362,45 @@ def _build_source_reference(
         if suffix not in _SOURCE_TEXT_EXTS:
             path_statuses[path] = "unsupported"
             skipped.append(f"{path}: 不支持的文件类型")
+            skipped_details.append(_skip_detail(
+                path, "unsupported_type",
+                "不支持的文件类型，AI 不会读取该文件内容"))
             continue
         if name_lower.endswith((".min.js", ".min.css")) or name_lower in {
             "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "uv.lock",
         }:
             path_statuses[path] = "skipped_vendor"
             skipped.append(f"{path}: 压缩库或锁文件")
+            skipped_details.append(_skip_detail(path, "third_party_lib", _SKIP_HINT_THIRD_PARTY))
             continue
         if len(source_files) >= _SOURCE_MAX_FILES:
             path_statuses[path] = "skipped"
             skipped.append(f"{path}: 源码文件数超过 {_SOURCE_MAX_FILES} 个")
+            skipped_details.append(_skip_detail(
+                path, "too_large",
+                "源码文件数超出上限，该文件未导入，AI 无法参考其内容"))
             continue
         if len(raw) > _SOURCE_MAX_FILE_BYTES:
             path_statuses[path] = "skipped"
             skipped.append(f"{path}: 单文件超过 {_SOURCE_MAX_FILE_BYTES // (1024 * 1024)}MB")
+            skipped_details.append(_skip_detail(
+                path, "too_large",
+                "单文件超过大小上限未导入，AI 无法参考其内容"))
             continue
         if total_text_bytes + len(raw) > _SOURCE_MAX_TEXT_BYTES:
             path_statuses[path] = "skipped"
             skipped.append(f"{path}: 源码总量超过 {_SOURCE_MAX_TEXT_BYTES // (1024 * 1024)}MB")
+            skipped_details.append(_skip_detail(
+                path, "too_large",
+                "源码总量超出上限，该文件未导入，AI 无法参考其内容"))
             continue
         text = _decode_source_text(raw)
         if text is None:
             path_statuses[path] = "skipped"
             skipped.append(f"{path}: 不是可读文本")
+            skipped_details.append(_skip_detail(
+                path, "unsupported_type",
+                "文件不是可读文本，AI 无法参考其内容"))
             continue
         source_files.append({
             "path": path,
@@ -1284,7 +1440,7 @@ def _build_source_reference(
         ),
         "web_bundle": web_bundle,
     }
-    return source_files, asset_files, summary, skipped
+    return source_files, asset_files, summary, skipped, skipped_details
 
 
 async def _read_source_uploads(files: list[UploadFile]) -> list[tuple[str, bytes]]:
@@ -1472,7 +1628,7 @@ async def _save_source_skill(
 
     uploaded = await _read_source_uploads(files)
     try:
-        source_files, asset_files, summary, skipped = await asyncio.to_thread(
+        source_files, asset_files, summary, skipped, skipped_details = await asyncio.to_thread(
             _build_source_reference, uploaded
         )
     except _SourceImportLimitError as exc:
@@ -1528,6 +1684,8 @@ async def _save_source_skill(
         "name": clean_name,
         **summary,
         "skipped": skipped[:50],
+        # 结构化跳过明细（与 skipped 同源同序，截断上限保持一致）
+        "skipped_details": skipped_details[:50],
     }
 
 
@@ -1585,20 +1743,29 @@ async def get_skill(skill_name: str):
     raise HTTPException(404, f"技能 '{skill_name}' 不存在")
 
 
-def _parse_skills_zip(content: bytes) -> tuple[list[dict], list[str]]:
+def _parse_skills_zip(content: bytes) -> tuple[list[dict], list[str], dict[str, int]]:
     """解压 + 解码 + 解析 ZIP 里的技能（CPU/内存密集，在线程池里调用）。
 
-    返回 (parsed, errors)：单个坏 JSON 不让整个导入失败——逐文件捕获、收集错误信息。
+    返回 (parsed, errors, stats)：单个坏 JSON 不让整个导入失败——逐文件捕获、收集错误信息。
+    stats 按扩展名统计 md/json/html/js/css 文件数，供导入端点识别"误传源码项目"场景。
     整体损坏时抛 zipfile.BadZipFile，由调用方转成 400。
     """
     parsed: list[dict] = []
     errors: list[str] = []
+    stats = {"md": 0, "json": 0, "html": 0, "js": 0, "css": 0}
+    # .htm 与 .html 同义；.mjs/.cjs 也是脚本文件，一并计入 js（识别更稳）
+    _stat_key = {"md": "md", "json": "json", "html": "html", "htm": "html",
+                 "js": "js", "mjs": "js", "cjs": "js", "css": "css"}
     with zipfile.ZipFile(io.BytesIO(content)) as zf:
         for name in zf.namelist():
             # 跳过目录和隐藏文件
             if name.endswith('/') or '/__MACOSX' in name or name.startswith('.'):
                 continue
             ext = name.rsplit('.', 1)[-1].lower()
+            if ext in _stat_key:
+                stats[_stat_key[ext]] += 1
+            if ext not in ('md', 'json'):
+                continue  # 只有技能文档才需要解压解析，源码文件仅计数
             raw = zf.read(name).decode('utf-8', errors='ignore')
 
             if ext == 'md':
@@ -1629,7 +1796,7 @@ def _parse_skills_zip(content: bytes) -> tuple[list[dict], list[str]]:
                         "description": s.get("description", s["name"]),
                         "content": s["content"],
                     })
-    return parsed, errors
+    return parsed, errors, stats
 
 
 @router.post("/api/skills/import")
@@ -1646,9 +1813,23 @@ async def import_skills_zip(file: UploadFile = File(...)):
         raise HTTPException(413, f"文件超过 {_settings.max_upload_bytes // (1024 * 1024)}MB 上限")
     try:
         # 解压/解码/JSON 解析是 CPU 密集操作，放线程别卡事件循环
-        parsed, errors = await asyncio.to_thread(_parse_skills_zip, content)
+        parsed, errors, stats = await asyncio.to_thread(_parse_skills_zip, content)
     except zipfile.BadZipFile as e:
         raise HTTPException(400, "无效的 ZIP 文件") from e
+
+    # 防呆：纯源码项目特征（有 HTML + JS/CSS、没有任何可导入技能文档）→ 明确拒绝，
+    # 引导走「源码 ZIP」入口，而不是导入 0 条技能让用户误以为成功
+    has_source_files = stats["html"] >= 1 and (stats["js"] + stats["css"]) >= 1
+    if has_source_files and stats["md"] + stats["json"] == 0:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "SOURCE_PROJECT_DETECTED",
+                "message": "检测到这是一个源码项目 ZIP（含 HTML/JS/CSS，无 .md/.json 技能文档）。"
+                           "技能包入口只导入技能文档；要把游戏源码作为参考，请使用「源码 ZIP」导入入口。",
+                "stats": {"html": stats["html"], "js": stats["js"], "css": stats["css"]},
+            },
+        )
 
     async with _skills_mutation_lock:
         existing_names = {s["name"] for s in SKILLS}
@@ -1667,7 +1848,11 @@ async def import_skills_zip(file: UploadFile = File(...)):
                     SKILLS.remove(record)
             raise
         added = len(added_records)
-    return {"ok": True, "added": added, "errors": errors}
+    result: dict = {"ok": True, "added": added, "errors": errors}
+    # 混合包（技能文档 + 源码文件同在）：照旧导入文档，但把"源码被忽略"讲明白
+    if (stats["md"] + stats["json"]) and (stats["html"] + stats["js"] + stats["css"]):
+        result["warnings"] = ["检测到源码文件已忽略，如需源码参考请用 源码 ZIP 入口"]
+    return result
 
 
 class SkillScanRequest(BaseModel):

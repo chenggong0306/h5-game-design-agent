@@ -10,7 +10,8 @@
 2. [素材管理](#2-素材管理)
 3. [项目管理](#3-项目管理)
 4. [技能管理](#4-技能管理)
-5. [通用说明](#5-通用说明)
+5. [真机预览](#5-真机预览)
+6. [通用说明](#6-通用说明)
 
 ---
 
@@ -50,13 +51,20 @@ POST /api/chat
   "session_id": "uuid-string",
   "reply": "AI 的回复文本",
   "code": "<!DOCTYPE html>... 或 null",
-  "action": "generate" | "edit" | "chat"
+  "action": "generate" | "edit" | "chat",
+  "reference_summary": {
+    "skills": [
+      { "name": "卡牌塔防", "web_bundle": true, "source_reads": 3, "assets": 1 }
+    ]
+  }
 }
 ```
 
 - `action` = `"generate"`：新建了游戏代码
 - `action` = `"edit"`：修改了已有代码
 - `action` = `"chat"`：纯聊天，未改代码
+- `reference_summary`：本回合参考摘要。`web_bundle` 是否加载过组合视图，`source_reads`
+  源码读取/搜索次数，`assets` 素材查询次数；本回合未用任何技能工具时为 `null`
 
 ---
 
@@ -81,7 +89,7 @@ POST /api/chat/stream
 | `code_update` | 代码有更新（去抖 ~1s） | `code`, `source` |
 | `context_usage` | 上下文使用率变化 | `used_tokens`, `max_tokens`, `percent`, `compacted` |
 | `self_check` | 自检反馈 | `status` (`"passed"` / `"repairing"` / `"issues_remain"`), `issues` |
-| `done` | 本轮对话结束 | `code` (可能为 null), `action` |
+| `done` | 本轮对话结束 | `code` (可能为 null), `action`, `reference_summary` (同 1.1，未用技能工具时为 null) |
 | `error` | 出错 | `content`, `error_code` |
 
 **结束标记**：最后一行 `data: [DONE]`。
@@ -140,13 +148,46 @@ GET /api/chat/{session_id}/history
 }
 ```
 
-**清除会话**（同时清空对话历史 + LangGraph checkpoint + 编辑器代码）：
+**清除会话**（同时清空对话历史 + LangGraph checkpoint + 编辑器代码 + 版本历史）：
 
 ```
 DELETE /api/chat/{session_id}
 ```
 
 响应：`{"ok": true}`
+
+---
+
+### 1.4 代码版本历史
+
+每次代码被覆盖前，旧版本自动归档（内容相同不产生新版本），每会话最多保留 10 个最新版本。
+
+**列出版本**（新→旧）：
+
+```
+GET /api/chat/{session_id}/versions
+```
+
+响应（无版本返回空数组）：
+
+```json
+{
+  "versions": [
+    { "id": "v-20260716T083000-000042", "time": "2026-07-16T08:30:00+00:00", "size": 18234, "lines": 412 }
+  ]
+}
+```
+
+**恢复到指定版本**：
+
+```
+POST /api/chat/{session_id}/versions/{version_id}/restore
+```
+
+响应：`200 {"code": "<恢复后的完整HTML>"}`；版本不存在（或 `version_id` 非法）→ `404`。
+
+- 恢复前会先把当前代码归档为新版本，恢复操作本身可回退
+- 服务端会话内存代码同步更新，下一轮对话基于恢复后的代码
 
 ---
 
@@ -463,9 +504,52 @@ ZIP 内支持：
 {
   "ok": true,
   "added": 5,
-  "errors": ["bad.json: JSON 解析失败"]
+  "errors": ["bad.json: JSON 解析失败"],
+  "warnings": ["检测到源码文件已忽略，如需源码参考请用 源码 ZIP 入口"]
 }
 ```
+
+- `warnings`：仅当 ZIP 同时含技能文档和源码文件（html/js/css）时出现
+
+**误传源码项目的防呆**：ZIP 含 ≥1 个 `.html` 且 ≥1 个 `.js`/`.css`、且没有任何
+`.md`/`.json` 技能文档时，返回 `422`：
+
+```json
+{
+  "detail": {
+    "code": "SOURCE_PROJECT_DETECTED",
+    "message": "检测到这是一个源码项目 ZIP……请使用「源码 ZIP」导入入口。",
+    "stats": { "html": 1, "js": 3, "css": 2 }
+  }
+}
+```
+
+---
+
+### 4.6 源码参考技能导入
+
+```
+POST /api/skills/source          # 新建（multipart：name/description/content + files）
+PUT  /api/skills/{name}/source   # 替换现有技能的源码参考
+```
+
+成功响应除原有摘要字段（`source_file_count`、`skipped` 等）外，新增结构化跳过明细：
+
+```json
+{
+  "skipped_details": [
+    {
+      "path": "js/three.min.js",
+      "reason": "third_party_lib",
+      "hint": "AI 无法直接使用该库，只能用原生 Canvas 重实现相关效果，还原度会打折"
+    }
+  ]
+}
+```
+
+`reason` 取值：`third_party_lib`（第三方库/压缩库/锁文件）、`unsupported_type`（不支持
+的类型/不可读文本）、`too_large`（超出数量或大小上限）、`unsafe`（不安全路径）。
+`hint` 是一句话中文后果说明。
 
 ---
 
@@ -496,13 +580,42 @@ POST /api/skills/scan
 
 ---
 
-## 5. 通用说明
+## 5. 真机预览
+
+**会话代码直出**（手机扫码用）：
+
+```
+GET /play/{session_id}
+```
+
+直接以 `text/html` 返回该会话最新的磁盘代码。`session_id` 经安全正则校验（防路径
+穿越），会话不存在返回 `404`。与 `/assets/*` 同理豁免鉴权（裸浏览器 GET 无法携带
+自定义头；session_id 为不可猜的 UUID）。
+
+**服务器信息**（生成局域网扫码地址用）：
+
+```
+GET /api/server-info
+```
+
+响应：
+
+```json
+{ "lan_ip": "192.168.1.23", "port": 8010 }
+```
+
+`lan_ip` 通过 UDP connect 技巧探测（不真正发包），探测失败为 `null`。
+
+---
+
+## 6. 通用说明
 
 ### 鉴权
 
 可选，`.env` 中配置 `API_TOKEN` 后，所有 `/api/*` 写操作需带 `X-API-Token` 头。
 
-素材文件读取（`/assets/*`、`/api/assets/file/*`）豁免鉴权，供 `null-origin` iframe 预览加载。
+素材文件读取（`/assets/*`、`/api/assets/file/*`）与真机预览（`/play/*`）豁免鉴权，
+供 `null-origin` iframe 预览与手机裸浏览器加载。
 
 ### 限流
 

@@ -135,6 +135,10 @@ async def require_token(request: Request, x_api_token: str | None = Header(defau
     # 缓解：文件名使用 UUID（不可猜）；settings.assets_dir 默认不可公开列举。
     if path.startswith("/assets/") or path.startswith("/api/assets/file/"):
         return  # 只读媒体放行（已做路径校验），供 null-origin 预览 iframe 加载
+    # 真机预览放行：手机扫码是裸浏览器 GET，无法带自定义头；session_id 为不可猜 UUID
+    # 且路由内已做安全正则校验（同 /assets 的免 token 理由，见 routes.play_session）
+    if path.startswith("/play/"):
+        return
     if x_api_token != settings.api_token:
         raise HTTPException(status_code=401, detail="缺少或无效的 API 令牌")
 

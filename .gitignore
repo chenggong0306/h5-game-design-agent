@@ -51,3 +51,4 @@ Thumbs.db
 # uv
 .python-version
 .tmp_video_analysis/
+data/skills/custom_skills.backup-*.json
