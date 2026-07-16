@@ -1042,3 +1042,389 @@ body {
         font-size: 16px;
     }
 }
+
+
+/* ============ Toast 通知（右上角堆叠，替代原生 alert） ============ */
+.toast-container {
+    position: fixed;
+    top: 12px;
+    right: 12px;
+    z-index: 1300; /* 压过 .modal(1000) 与 .app-dialog-overlay(1200)：批量删除等场景 toast 要浮在弹窗上 */
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-sm);
+    width: min(360px, calc(100vw - 24px));
+    pointer-events: none; /* 容器不挡点击，单个 toast 自己恢复 */
+}
+.toast {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--space-sm);
+    padding: 10px 12px;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-primary);
+    border-left: 3px solid var(--info);
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow-lg);
+    color: var(--text-primary);
+    font-size: 13px;
+    line-height: 1.5;
+    opacity: 0;
+    transform: translateX(16px);
+    transition: opacity var(--transition-normal), transform var(--transition-normal);
+    pointer-events: auto;
+}
+.toast.show { opacity: 1; transform: translateX(0); }
+.toast-success { border-left-color: var(--success); }
+.toast-error { border-left-color: var(--error); }
+.toast-icon { flex-shrink: 0; }
+.toast-msg { flex: 1; min-width: 0; word-break: break-word; white-space: pre-line; }
+.toast-close {
+    flex-shrink: 0;
+    border: none;
+    background: none;
+    color: var(--text-secondary);
+    font-size: 16px;
+    line-height: 1;
+    padding: 0 2px;
+    cursor: pointer;
+}
+.toast-close:hover { color: var(--text-primary); }
+
+
+/* ============ 样式化对话框（confirm / prompt / 导入报告，替代原生 confirm/prompt） ============ */
+.app-dialog-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 1200; /* 高于 .modal(1000)：技能弹窗里触发的确认框要盖在弹窗上 */
+    background: rgba(0, 0, 0, 0.7);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+.app-dialog {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-md);
+    width: min(420px, calc(100vw - 24px));
+    max-height: 80vh;
+    padding: var(--space-lg);
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-primary);
+    border-radius: var(--radius-xl);
+    box-shadow: var(--shadow-lg);
+}
+.app-dialog-wide { width: min(640px, calc(100vw - 24px)); }
+.app-dialog-message {
+    font-size: 14px;
+    line-height: 1.6;
+    color: var(--text-primary);
+    word-break: break-word;
+}
+.app-dialog-input {
+    padding: 8px 12px;
+    font-size: 13px;
+    font-family: inherit;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    border: 1px solid var(--border-primary);
+    border-radius: var(--radius-md);
+}
+.app-dialog-input:focus {
+    outline: none;
+    border-color: var(--accent-primary);
+    box-shadow: var(--shadow-focus);
+}
+.app-dialog-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: var(--space-sm);
+}
+.app-dialog-actions button {
+    padding: 7px 16px;
+    font-size: 13px;
+    font-weight: 600;
+    border-radius: var(--radius-md);
+    border: 1px solid var(--border-primary);
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+    cursor: pointer;
+    transition: all var(--transition-fast);
+}
+.app-dialog-cancel:hover { background: var(--bg-elevated); }
+.app-dialog-ok {
+    background: var(--accent-primary);
+    border-color: var(--accent-primary);
+    color: var(--bg-primary);
+}
+.app-dialog-ok:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
+.app-dialog-ok.danger {
+    background: var(--error);
+    border-color: var(--error);
+    color: var(--text-primary);
+}
+
+/* 源码导入跳过项报告（C2 skipped_details） */
+.import-report-list {
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-sm);
+}
+.import-report-item {
+    padding: var(--space-sm) 12px;
+    border: 1px solid var(--border-primary);
+    border-radius: var(--radius-md);
+    background: var(--bg-primary);
+}
+.import-report-path {
+    font-size: 12px;
+    color: var(--text-primary);
+    word-break: break-all;
+}
+.import-report-reason {
+    margin-left: 6px;
+    padding: 1px 8px;
+    border-radius: var(--radius-full);
+    font-size: 11px;
+    background: var(--warning-subtle);
+    color: var(--warning);
+    white-space: nowrap;
+}
+.import-report-hint {
+    margin-top: 4px;
+    font-size: 12px;
+    color: var(--text-secondary);
+    line-height: 1.5;
+}
+
+
+/* ============ 参考摘要（C4）：AI 消息底部一行低调说明 ============ */
+.reference-summary {
+    margin-top: var(--space-sm);
+    padding-top: var(--space-sm);
+    border-top: 1px dashed var(--border-primary);
+    font-size: 11px;
+    color: var(--text-tertiary);
+    line-height: 1.5;
+}
+
+
+/* ============ 生成进度状态栏（输入框上方细条） ============ */
+.stream-status {
+    padding: 6px var(--space-md);
+    border-top: 1px solid var(--border-primary);
+    background: var(--bg-secondary);
+    color: var(--text-secondary);
+    font-size: 12px;
+    line-height: 1.4;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.stream-status.hidden { display: none; }
+
+
+/* ============ 版本历史（C3） ============ */
+.editor-actions, .preview-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.versions-hint {
+    margin: 0 0 var(--space-md);
+    font-size: 12px;
+    color: var(--text-secondary);
+    line-height: 1.5;
+}
+.versions-list {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-sm);
+}
+.version-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: var(--space-sm);
+    padding: 10px 14px;
+    background: var(--bg-primary);
+    border: 1px solid var(--border-primary);
+    border-radius: var(--radius-lg);
+}
+.version-info {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+}
+.version-time { font-size: 13px; font-weight: 600; color: var(--text-primary); }
+.version-meta { font-size: 11px; color: var(--text-secondary); }
+.version-item button {
+    flex-shrink: 0;
+    padding: 5px 14px;
+    font-size: 12px;
+    font-weight: 600;
+    border: 1px solid var(--accent-primary);
+    border-radius: var(--radius-md);
+    background: var(--accent-subtle);
+    color: var(--accent-primary);
+    cursor: pointer;
+    transition: all var(--transition-fast);
+}
+.version-item button:hover {
+    background: var(--accent-primary);
+    color: var(--bg-primary);
+}
+
+
+/* ============ 技能面板治理：搜索 + 批量管理 ============ */
+.skills-toolbar {
+    display: flex;
+    gap: var(--space-sm);
+    margin-bottom: var(--space-sm);
+}
+.skills-toolbar input {
+    flex: 1;
+    min-width: 0;
+    padding: 7px 12px;
+    font-size: 13px;
+    font-family: inherit;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    border: 1px solid var(--border-primary);
+    border-radius: var(--radius-md);
+}
+.skills-toolbar input:focus {
+    outline: none;
+    border-color: var(--accent-primary);
+    box-shadow: var(--shadow-focus);
+}
+.skills-toolbar button {
+    padding: 7px 12px;
+    font-size: 12px;
+    font-weight: 600;
+    white-space: nowrap;
+    border: 1px solid var(--border-primary);
+    border-radius: var(--radius-md);
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+    cursor: pointer;
+    transition: all var(--transition-fast);
+}
+.skills-toolbar button.active {
+    border-color: var(--accent-primary);
+    background: var(--accent-subtle);
+    color: var(--accent-primary);
+}
+.skills-batch-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-sm);
+    padding: 8px 12px;
+    margin-bottom: var(--space-sm);
+    border: 1px dashed var(--border-primary);
+    border-radius: var(--radius-md);
+    background: var(--bg-primary);
+    font-size: 12px;
+    color: var(--text-secondary);
+}
+.skills-batch-bar.hidden { display: none; }
+.skills-batch-bar label {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    cursor: pointer;
+}
+.skills-batch-bar button.danger {
+    padding: 5px 12px;
+    font-size: 12px;
+    font-weight: 600;
+    border: 1px solid var(--error);
+    border-radius: var(--radius-md);
+    background: var(--error-subtle);
+    color: var(--error);
+    cursor: pointer;
+    transition: all var(--transition-fast);
+}
+.skills-batch-bar button.danger:hover {
+    background: var(--error);
+    color: var(--bg-primary);
+}
+.skill-item .skill-select {
+    margin-right: var(--space-sm);
+    flex-shrink: 0;
+    accent-color: var(--accent-primary);
+}
+
+
+/* ============ 真机预览（C5）：手机框 + 扫码 ============ */
+/* 375×667 手机框居中，带外壳描边；纯 CSS 切换不重载 iframe */
+.preview-panel.phone-mode { background: var(--bg-app); }
+.preview-panel.phone-mode #game-preview {
+    flex: none;
+    width: 375px;
+    height: 667px;
+    max-width: calc(100% - var(--space-md));
+    max-height: calc(100vh - 120px);
+    margin: auto; /* flex 容器内水平垂直双向居中 */
+    border: 8px solid var(--bg-elevated);
+    outline: 1px solid var(--border-muted);
+    border-radius: 24px;
+    box-shadow: var(--shadow-lg);
+}
+
+.qrcode-modal { width: min(420px, calc(100vw - 24px)); }
+.qrcode-modal-body {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: var(--space-md);
+    text-align: center;
+}
+.qrcode-box {
+    display: grid;
+    place-items: center;
+    min-width: 200px;
+    min-height: 200px;
+    padding: var(--space-md);
+    /* 功能性白底（非主题色）：扫码器依赖深色码点 + 浅色底的对比度，暗色背景会导致识别失败 */
+    background: #fff;
+    border-radius: var(--radius-lg);
+}
+.qrcode-box img, .qrcode-box svg {
+    display: block;
+    max-width: 100%;
+    height: auto;
+}
+.qrcode-url {
+    font-size: 12px;
+    color: var(--accent-primary);
+    word-break: break-all;
+}
+.qrcode-note {
+    margin: 0;
+    font-size: 12px;
+    color: var(--text-secondary);
+    line-height: 1.5;
+}
+
+
+/* ============ 新增 UI 的窄屏适配（与上方 860px 断点一致） ============ */
+@media (max-width: 860px) {
+    .toast-container {
+        top: 8px;
+        right: 8px;
+        left: 8px;
+        width: auto;
+    }
+    .skills-toolbar { flex-wrap: wrap; }
+    .skills-batch-bar { flex-wrap: wrap; }
+    .version-item { flex-wrap: wrap; }
+    /* 窄屏下手机框按视口高度收缩，避免 667px 撑破纵向堆叠布局 */
+    .preview-panel.phone-mode #game-preview {
+        max-height: 60vh;
+        min-height: 0;
+    }
+}

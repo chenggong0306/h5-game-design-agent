@@ -5,8 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>🎮 AI 游戏设计工坊</title>
     <link rel="stylesheet" href="/static/css/style.css?v={{ v }}">
-    <!-- Monaco Editor CDN -->
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/monaco-editor@0.45.0/min/vs/editor/editor.main.css">
+    <!-- Monaco Editor 样式：本地优先；app.js 回退 CDN 时会同步把此 href 换成 CDN 地址 -->
+    <link rel="stylesheet" id="monaco-style" href="/static/vendor/monaco/vs/editor/editor.main.css">
 </head>
 <body>
     <header class="app-header">
@@ -48,6 +48,7 @@
                     </div>
                 </div>
             </div>
+            <div id="stream-status" class="stream-status hidden"></div>
             <div class="chat-input-area">
                 <div class="chat-input-main">
                     <div id="image-attachments" class="image-attachments hidden"></div>
@@ -70,7 +71,10 @@
         <section class="panel editor-panel">
             <div class="panel-header">
                 <h2><span>Monaco</span> 代码编辑器</h2>
-                <button id="btn-run" title="运行游戏">▶️ 运行</button>
+                <div class="editor-actions">
+                    <button id="btn-versions" title="查看并恢复历史版本">🕘 版本</button>
+                    <button id="btn-run" title="运行游戏">▶️ 运行</button>
+                </div>
             </div>
             <div id="editor-container"></div>
         </section>
@@ -81,6 +85,8 @@
                 <h2><span>Live</span> 游戏预览</h2>
                 <div class="preview-actions">
                     <button id="preview-error-badge" class="preview-error-badge hidden" type="button" title="查看运行错误">⚠ 运行错误</button>
+                    <button id="btn-device" title="自适应填充 ↔ 375×667 手机框">📱 手机框</button>
+                    <button id="btn-qrcode" title="扫码在手机上试玩">🔗 扫码</button>
                     <button id="btn-fullscreen" title="全屏">⛶</button>
                 </div>
             </div>
@@ -219,12 +225,50 @@
                         <button id="btn-scan-skills">📂 扫描 SKILL.md</button>
                     </div>
                 </div>
+                <div class="skills-toolbar">
+                    <input type="text" id="skill-search" placeholder="🔍 按名称或描述搜索技能...">
+                    <button type="button" id="btn-skill-batch">☑️ 批量管理</button>
+                </div>
+                <div id="skills-batch-bar" class="skills-batch-bar hidden">
+                    <label><input type="checkbox" id="skill-select-all"> 全选</label>
+                    <button type="button" id="btn-delete-selected-skills" class="danger">🗑️ 删除所选</button>
+                </div>
                 <div id="skills-list" class="skills-list"></div>
             </div>
         </div>
     </div>
 
-    <script src="https://cdn.jsdelivr.net/npm/monaco-editor@0.45.0/min/vs/loader.js"></script>
+    <!-- 版本历史弹窗 -->
+    <div id="modal-versions" class="modal hidden">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>🕘 版本历史</h2>
+                <button class="modal-close" onclick="closeModal('modal-versions')">✕</button>
+            </div>
+            <div class="modal-body">
+                <p class="versions-hint">AI 每次写入代码都会自动存一份版本；恢复前会先把当前代码也存为新版本，恢复操作本身可回退。</p>
+                <div id="versions-list" class="versions-list"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 扫码真机预览弹窗 -->
+    <div id="modal-qrcode" class="modal hidden">
+        <div class="modal-content qrcode-modal">
+            <div class="modal-header">
+                <h2>🔗 扫码真机预览</h2>
+                <button class="modal-close" onclick="closeModal('modal-qrcode')">✕</button>
+            </div>
+            <div class="modal-body qrcode-modal-body">
+                <div id="qrcode-box" class="qrcode-box"></div>
+                <div id="qrcode-url" class="qrcode-url"></div>
+                <p id="qrcode-note" class="qrcode-note">手机需与电脑连接同一局域网。</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Monaco loader：本地优先；404 时置失败标记，app.js 检测后注入 CDN loader 回退 -->
+    <script src="/static/vendor/monaco/vs/loader.js" onerror="window.__monacoLocalLoaderFailed = true"></script>
     <script src="/static/js/app.js?v={{ v }}"></script>
 </body>
 </html>

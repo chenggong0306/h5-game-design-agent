@@ -108,6 +108,138 @@ class ErrorHandler {
 
 const errorHandler = new ErrorHandler();
 
+// ============ 通知系统（toast / confirm / prompt，替代原生 alert/confirm/prompt） ============
+function ensureToastContainer() {
+    let container = document.getElementById('toast-container');
+    if (!container) {
+        container = document.createElement('div');
+        container.id = 'toast-container';
+        container.className = 'toast-container';
+        document.body.appendChild(container);
+    }
+    return container;
+}
+
+/**
+ * 右上角堆叠 toast。返回 toast 元素（批量操作可拿引用更新进度文案）。
+ * @param {string} msg
+ * @param {'info'|'success'|'error'} type
+ * @param {number} duration 毫秒，默认 4000
+ */
+function showToast(msg, type = 'info', duration = 4000) {
+    const container = ensureToastContainer();
+    const toast = document.createElement('div');
+    toast.className = `toast toast-${type}`;
+    const icons = { info: 'ℹ️', success: '✅', error: '❌' };
+    toast.innerHTML = `
+        <span class="toast-icon">${icons[type] || icons.info}</span>
+        <div class="toast-msg">${escapeHtml(msg).replace(/\n/g, '<br>')}</div>
+        <button type="button" class="toast-close" title="关闭">×</button>`;
+    toast.querySelector('.toast-close').addEventListener('click', () => removeToast(toast));
+    container.appendChild(toast);
+    // 下一帧再加 show 类，触发进入过渡动画
+    requestAnimationFrame(() => toast.classList.add('show'));
+    toast._timer = setTimeout(() => removeToast(toast), duration);
+    return toast;
+}
+
+function removeToast(toast) {
+    if (!toast || toast._removing) return;
+    toast._removing = true;
+    clearTimeout(toast._timer);
+    toast.classList.remove('show');
+    // 过渡结束后移除；transitionend 偶发不触发（元素被隐藏等），加定时兜底
+    toast.addEventListener('transitionend', () => toast.remove(), { once: true });
+    setTimeout(() => toast.remove(), 400);
+}
+
+/**
+ * 通用对话框（confirm / prompt 共用骨架）。
+ * showInput=false 时 resolve(true/false)；showInput=true 时 resolve(输入值/null)。
+ */
+function _showDialog({ message, danger = false, showInput = false, defaultValue = '', okText = '确定', cancelText = '取消' }) {
+    return new Promise((resolve) => {
+        const overlay = document.createElement('div');
+        overlay.className = 'app-dialog-overlay';
+        overlay.innerHTML = `
+            <div class="app-dialog" role="dialog" aria-modal="true">
+                <div class="app-dialog-message">${escapeHtml(message).replace(/\n/g, '<br>')}</div>
+                ${showInput ? '<input type="text" class="app-dialog-input">' : ''}
+                <div class="app-dialog-actions">
+                    <button type="button" class="app-dialog-cancel">${escapeHtml(cancelText)}</button>
+                    <button type="button" class="app-dialog-ok${danger ? ' danger' : ''}">${escapeHtml(okText)}</button>
+                </div>
+            </div>`;
+        const input = overlay.querySelector('.app-dialog-input');
+        if (input) input.value = defaultValue == null ? '' : String(defaultValue);
+        const done = (result) => {
+            document.removeEventListener('keydown', onKey, true);
+            overlay.remove();
+            resolve(result);
+        };
+        const onOk = () => done(showInput ? input.value : true);
+        const onCancel = () => done(showInput ? null : false);
+        const onKey = (e) => {
+            if (e.key === 'Escape') { e.preventDefault(); onCancel(); }
+            // prompt 模式下 Enter 只在输入框里生效，避免误触其它控件
+            else if (e.key === 'Enter' && (!showInput || e.target === input)) { e.preventDefault(); onOk(); }
+        };
+        overlay.querySelector('.app-dialog-ok').addEventListener('click', onOk);
+        overlay.querySelector('.app-dialog-cancel').addEventListener('click', onCancel);
+        overlay.addEventListener('click', (e) => { if (e.target === overlay) onCancel(); });
+        document.addEventListener('keydown', onKey, true);
+        document.body.appendChild(overlay);
+        (input || overlay.querySelector('.app-dialog-ok')).focus();
+        if (input) input.select();
+    });
+}
+
+/** 样式化确认框。@returns {Promise<boolean>} */
+function showConfirm(message, options = {}) {
+    return _showDialog({ message, danger: !!options.danger });
+}
+
+/** 样式化输入框。取消返回 null。@returns {Promise<string|null>} */
+function showPrompt(message, defaultValue = '') {
+    return _showDialog({ message, showInput: true, defaultValue });
+}
+
+/**
+ * 非阻塞结果面板：源码导入后逐条列出被跳过的文件与后果说明（C2 skipped_details）
+ * @param {string} title
+ * @param {{path:string, reason:string, hint:string}[]} items
+ */
+function showImportReportPanel(title, items) {
+    const reasonLabels = {
+        third_party_lib: '第三方库',
+        unsupported_type: '不支持的类型',
+        too_large: '文件过大',
+        unsafe: '不安全内容',
+    };
+    const overlay = document.createElement('div');
+    overlay.className = 'app-dialog-overlay';
+    overlay.innerHTML = `
+        <div class="app-dialog app-dialog-wide" role="dialog" aria-modal="true">
+            <div class="app-dialog-message">${escapeHtml(title)}</div>
+            <div class="import-report-list">
+                ${items.map(it => `
+                    <div class="import-report-item">
+                        <div class="import-report-path">${escapeHtml(it.path || '')}
+                            <span class="import-report-reason">${escapeHtml(reasonLabels[it.reason] || it.reason || '')}</span>
+                        </div>
+                        <div class="import-report-hint">${escapeHtml(it.hint || '')}</div>
+                    </div>`).join('')}
+            </div>
+            <div class="app-dialog-actions">
+                <button type="button" class="app-dialog-ok">知道了</button>
+            </div>
+        </div>`;
+    const close = () => overlay.remove();
+    overlay.querySelector('.app-dialog-ok').addEventListener('click', close);
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+    document.body.appendChild(overlay);
+}
+
 /**
  * 校验 fetch 响应状态：非 2xx 时抛出带后端 detail 的错误。
  * 修复"错误响应被当成功 JSON 解析、误报成功/列表错乱"的问题。
@@ -141,9 +273,12 @@ function applyEditorCode(code) {
 }
 
 
-// ============ 初始化 Monaco Editor ============
-require.config({ paths: { vs: 'https://cdn.jsdelivr.net/npm/monaco-editor@0.45.0/min/vs' } });
-require(['vs/editor/editor.main'], function () {
+// ============ 初始化 Monaco Editor（本地优先，失败/超时回退 CDN） ============
+const MONACO_LOCAL_BASE = '/static/vendor/monaco/vs';
+const MONACO_CDN_BASE = 'https://cdn.jsdelivr.net/npm/monaco-editor@0.45.0/min/vs';
+
+function createMonacoEditor() {
+    if (editor) return; // 竞态兜底：本地与 CDN 回退路径都成功时只创建一次
     editor = monaco.editor.create(document.getElementById('editor-container'), {
         value: '<!-- 在左侧对话框中描述你想要的游戏，AI 将在此生成代码 -->\n',
         language: 'html',
@@ -164,7 +299,70 @@ require(['vs/editor/editor.main'], function () {
         restoreEditorCode(pendingLatestCode);
         pendingLatestCode = null;
     }
-});
+}
+
+// Monaco 样式与脚本同源加载：回退 CDN 时把 index.html 里的本地样式链接一并换掉，
+// 否则脚本走 CDN、样式还指着缺失的本地文件，编辑器会渲染成一坨没有样式的文本
+function ensureMonacoCss(base) {
+    let link = document.getElementById('monaco-style');
+    if (!link) {
+        link = document.createElement('link');
+        link.id = 'monaco-style';
+        link.rel = 'stylesheet';
+        document.head.appendChild(link);
+    }
+    const href = `${base}/editor/editor.main.css`;
+    if (link.getAttribute('href') !== href) link.href = href;
+}
+
+// 从指定 base 加载 editor.main；错误回调或 5s 超时都算失败（本地文件缺失时 404 很快，
+// 但慢盘/半残缺文件可能挂住，超时兜底保证一定会走 onFail）
+function loadMonacoFrom(base, onFail) {
+    ensureMonacoCss(base);
+    require.config({ paths: { vs: base } });
+    let settled = false;
+    const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        onFail();
+    }, 5000);
+    require(['vs/editor/editor.main'], function () {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        createMonacoEditor();
+    }, function () {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        onFail();
+    });
+}
+
+// 本地 loader.js 都不存在时（index.html 的 onerror 置位），注入 CDN loader 再走 CDN 流程
+function bootMonacoFromCdnLoader() {
+    showToast('本地编辑器资源缺失，已回退 CDN', 'info');
+    const script = document.createElement('script');
+    script.src = `${MONACO_CDN_BASE}/loader.js`;
+    script.onload = () => loadMonacoFrom(MONACO_CDN_BASE, () => {
+        showToast('编辑器加载失败：本地与 CDN 均不可用，请检查网络', 'error', 8000);
+    });
+    script.onerror = () => showToast('编辑器加载失败：本地与 CDN 均不可用，请检查网络', 'error', 8000);
+    document.head.appendChild(script);
+}
+
+(function initMonaco() {
+    if (window.__monacoLocalLoaderFailed || typeof require === 'undefined') {
+        bootMonacoFromCdnLoader();
+        return;
+    }
+    loadMonacoFrom(MONACO_LOCAL_BASE, () => {
+        showToast('本地编辑器资源缺失，已回退 CDN', 'info');
+        loadMonacoFrom(MONACO_CDN_BASE, () => {
+            showToast('编辑器加载失败：本地与 CDN 均不可用，请检查网络', 'error', 8000);
+        });
+    });
+})();
 
 
 // ============ 对话功能 ============
@@ -247,15 +445,15 @@ window.removeSelectedImage = function(index) {
 async function addSelectedImageFiles(files) {
     for (const file of files) {
         if (!file.type.startsWith('image/')) {
-            alert(`❌ ${file.name} 不是图片文件`);
+            showToast(`${file.name} 不是图片文件`, 'error');
             continue;
         }
         if (file.size > MAX_CHAT_IMAGE_BYTES) {
-            alert(`❌ ${file.name} 超过 10MB 限制`);
+            showToast(`${file.name} 超过 10MB 限制`, 'error');
             continue;
         }
         if (selectedImages.length >= 4) {
-            alert('❌ 一次最多发送 4 张图片');
+            showToast('一次最多发送 4 张图片', 'error');
             break;
         }
         selectedImages.push(await readImageFile(file));
@@ -431,6 +629,19 @@ function ensureTextBlock(state) {
     return block;
 }
 
+// C4 参考摘要：把 done 事件里的 reference_summary 渲染成一行低调说明；无数据返回空串
+function buildReferenceSummaryHtml(summary) {
+    if (!summary || !Array.isArray(summary.skills) || !summary.skills.length) return '';
+    const parts = summary.skills.map(s => {
+        const detail = [];
+        if (s.web_bundle) detail.push('组合视图×1');
+        if (Number(s.source_reads)) detail.push(`源码片段×${Number(s.source_reads)}`);
+        if (Number(s.assets)) detail.push(`素材×${Number(s.assets)}`);
+        return `${escapeHtml(s.name || '')}（${detail.join(' · ') || '仅文档'}）`;
+    });
+    return `<div class="reference-summary">📚 本次参考：${parts.join('，')}</div>`;
+}
+
 function renderStreamMessage(state, showCursor = true) {
     if (!state) return;
     const html = state.blocks.map(block => {
@@ -443,7 +654,9 @@ function renderStreamMessage(state, showCursor = true) {
         const textHtml = renderMarkdown(block.content || '');
         return textHtml ? `<div class="assistant-text">${textHtml}</div>` : '';
     }).join('');
-    state.bubble.innerHTML = html + (showCursor ? '<span class="stream-cursor">▊</span>' : '');
+    // 参考摘要放进渲染管线而非事后 append：折叠工具卡等后续重渲染不会把它抹掉
+    const refHtml = buildReferenceSummaryHtml(state.referenceSummary);
+    state.bubble.innerHTML = html + refHtml + (showCursor ? '<span class="stream-cursor">▊</span>' : '');
     chatMessages.scrollTop = chatMessages.scrollHeight;
 }
 
@@ -558,7 +771,7 @@ async function openChatSession(id) {
 }
 
 async function deleteChatSession(id) {
-    if (!confirm('确定删除这条历史对话？对应的 AI 上下文也会删除。')) return;
+    if (!await showConfirm('确定删除这条历史对话？对应的 AI 上下文也会删除。', { danger: true })) return;
     try {
         const res = await fetch(`/api/chat/${id}`, { method: 'DELETE' });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -570,7 +783,7 @@ async function deleteChatSession(id) {
         }
         await openHistoryModal();
     } catch (err) {
-        alert('❌ 删除失败: ' + err.message);
+        showToast('删除失败: ' + err.message, 'error');
     }
 }
 
@@ -591,6 +804,43 @@ function setStreamingUI(streaming) {
 function stopCurrentStream() {
     if (!isStreaming || !currentStreamController) return;
     currentStreamController.abort();
+}
+
+// ============ 生成进度状态栏（流式期间显示在输入框上方，done/error/中断时消失） ============
+const streamStatusEl = document.getElementById('stream-status');
+const streamStatusState = { timer: null, startTs: 0, steps: 0, lastTool: '' };
+
+function renderStreamStatusText() {
+    if (!streamStatusEl) return;
+    const elapsed = Math.max(0, Math.floor((Date.now() - streamStatusState.startTs) / 1000));
+    const m = Math.floor(elapsed / 60);
+    const s = String(elapsed % 60).padStart(2, '0');
+    const toolPart = streamStatusState.lastTool ? ` —— ${streamStatusState.lastTool}` : '';
+    streamStatusEl.textContent = `⚙️ 生成中 · 第 ${streamStatusState.steps} 步 · 已用 ${m}:${s}${toolPart}`;
+}
+
+function startStreamStatus() {
+    if (!streamStatusEl) return;
+    streamStatusState.startTs = Date.now();
+    streamStatusState.steps = 0;
+    streamStatusState.lastTool = '';
+    renderStreamStatusText();
+    streamStatusEl.classList.remove('hidden');
+    clearInterval(streamStatusState.timer);
+    streamStatusState.timer = setInterval(renderStreamStatusText, 1000);
+}
+
+// N = 收到的 tool_call 事件数；工具中文名沿用工具卡片的 getToolMeta 映射
+function noteStreamStatusTool(tool) {
+    streamStatusState.steps += 1;
+    streamStatusState.lastTool = getToolMeta(tool)[1];
+    renderStreamStatusText();
+}
+
+function stopStreamStatus() {
+    clearInterval(streamStatusState.timer);
+    streamStatusState.timer = null;
+    if (streamStatusEl) streamStatusEl.classList.add('hidden');
 }
 
 window.deleteChatSession = deleteChatSession;
@@ -620,6 +870,7 @@ async function sendMessage(messageOverride = null, options = {}) {
     }
     currentStreamController = new AbortController();
     setStreamingUI(true);
+    startStreamStatus();
 
     // 创建流式消息气泡
     const bubble = createStreamBubble();
@@ -692,6 +943,7 @@ async function sendMessage(messageOverride = null, options = {}) {
                         activeStreamState.toolEvents.push(item);
                         activeStreamState.blocks.push({ type: 'tool', item });
 
+                        noteStreamStatusTool(event.tool);
                         scheduleStreamRender(activeStreamState);
                     } else if (event.type === 'tool_result') {
                         const target = event.id
@@ -767,6 +1019,9 @@ async function sendMessage(messageOverride = null, options = {}) {
 
                     } else if (event.type === 'done') {
                         activeStreamState.done = true;
+                        // C4：本回合用到的技能参考摘要（未用技能工具时为 null，不渲染）
+                        activeStreamState.referenceSummary = event.reference_summary || null;
+                        stopStreamStatus();
                         flushStreamRender(activeStreamState);
 
                         if (event.code && !activeStreamState.codeUpdated) {
@@ -788,6 +1043,7 @@ async function sendMessage(messageOverride = null, options = {}) {
                         }
                     } else if (event.type === 'error') {
                         activeStreamState.done = true;
+                        stopStreamStatus();
                         // 带结构化错误码时走统一错误处理（限流/超时等有更友好的提示）
                         if (event.error_code) {
                             errorHandler.show({ code: event.error_code, message: event.content, isError: true });
@@ -818,6 +1074,7 @@ async function sendMessage(messageOverride = null, options = {}) {
     } finally {
         currentStreamController = null;
         setStreamingUI(false);
+        stopStreamStatus();  // 兜底：中断/网络错误/流意外结束时状态栏也要消失
     }
 }
 
@@ -882,14 +1139,10 @@ chatPanel.addEventListener('drop', (e) => {
     if (imageFiles.length) addSelectedImageFiles(imageFiles);
 });
 
+// 新建项目不再销毁旧会话：只重置本地状态开新会话，旧对话和代码留在「📜 历史」里可随时找回
 async function resetCurrentWorkspace(message = '👋 已创建新项目。告诉我你想做什么游戏吧！') {
     if (isStreaming) {
         stopCurrentStream();
-    }
-    if (sessionId) {
-        try {
-            await fetch(`/api/chat/${sessionId}`, { method: 'DELETE' });
-        } catch (_) {}
     }
     setSessionId('');
     currentProjectId = '';
@@ -1129,7 +1382,7 @@ function fixPreviewRuntimeError() {
     const prompt = buildRuntimeErrorFixPrompt();
     if (!prompt) return;
     if (isStreaming) {
-        alert('AI 正在生成中，请先停止或等待完成后再修复。');
+        showToast('AI 正在生成中，请先停止或等待完成后再修复。', 'info');
         return;
     }
     closeModal('modal-runtime-error');
@@ -1147,15 +1400,75 @@ document.getElementById('btn-ai-fix-runtime-error')?.addEventListener('click', f
 document.getElementById('btn-ignore-runtime-error')?.addEventListener('click', ignorePreviewRuntimeError);
 
 
+// ============ 版本历史（C3）：查看 AI 每次写入的代码快照并可恢复 ============
+async function openVersionsModal() {
+    if (!sessionId) {
+        showToast('当前还没有会话，先让 AI 生成一次代码吧', 'info');
+        return;
+    }
+    const list = document.getElementById('versions-list');
+    list.innerHTML = '<p style="color:#aaa;text-align:center">加载中...</p>';
+    openModal('modal-versions');
+    try {
+        const res = await fetch(`/api/chat/${sessionId}/versions`);
+        await ensureOk(res);
+        const data = await res.json();
+        const versions = Array.isArray(data.versions) ? data.versions : [];
+        if (!versions.length) {
+            list.innerHTML = '<p style="color:#aaa;text-align:center">暂无版本记录：AI 每次写入代码时会自动保存一个版本</p>';
+            return;
+        }
+        list.innerHTML = versions.map(v => {
+            const t = v.time ? new Date(v.time).toLocaleString() : '未知时间';
+            return `
+            <div class="version-item">
+                <div class="version-info">
+                    <div class="version-time">🕘 ${escapeHtml(t)}</div>
+                    <div class="version-meta">${Number(v.lines) || 0} 行 · ${escapeHtml(formatBytes(v.size))}</div>
+                </div>
+                <button type="button" onclick="restoreVersion('${jsStr(v.id)}', '${jsStr(t)}')">恢复</button>
+            </div>`;
+        }).join('');
+    } catch (err) {
+        list.innerHTML = `<p style="color:#e74c3c">加载失败: ${escapeHtml(err.message)}</p>`;
+    }
+}
+
+async function restoreVersion(versionId, timeText) {
+    if (!await showConfirm(`确定恢复到 ${timeText} 的版本？\n当前代码会先自动存为新版本，恢复操作本身可回退。`)) return;
+    try {
+        const res = await fetch(
+            `/api/chat/${sessionId}/versions/${encodeURIComponent(versionId)}/restore`,
+            { method: 'POST' },
+        );
+        await ensureOk(res);
+        const data = await res.json();
+        applyEditorCode(data.code || '');
+        runGame();
+        closeModal('modal-versions');
+        showToast(`已恢复到 ${timeText} 版本`, 'success');
+    } catch (err) {
+        showToast('恢复失败: ' + err.message, 'error');
+    }
+}
+
+window.restoreVersion = restoreVersion;
+document.getElementById('btn-versions').addEventListener('click', openVersionsModal);
+
+
 // ============ 项目管理 ============
 document.getElementById('btn-new').addEventListener('click', async () => {
-    if (confirm('创建新项目？当前未保存的代码和当前对话上下文都会清空。')) {
+    if (await showConfirm('当前对话和代码会保留在 📜 历史 中，可随时找回。开始新项目？')) {
         await resetCurrentWorkspace();
     }
 });
 
 document.getElementById('btn-save').addEventListener('click', async () => {
-    const name = prompt('项目名称:', '我的游戏');
+    if (!editor) {
+        showToast('编辑器尚未就绪，请稍候再试', 'info');
+        return;
+    }
+    const name = await showPrompt('项目名称:', '我的游戏');
     if (!name) return;
     const code = editor.getValue();
     try {
@@ -1167,9 +1480,9 @@ document.getElementById('btn-save').addEventListener('click', async () => {
         await ensureOk(res);
         const data = await res.json();
         currentProjectId = data.project_id;
-        alert('✅ 保存成功！');
+        showToast('保存成功！', 'success');
     } catch (err) {
-        alert('❌ 保存失败: ' + err.message);
+        showToast('保存失败: ' + err.message, 'error');
     }
 });
 
@@ -1212,17 +1525,17 @@ async function loadProject(id) {
         closeModal('modal-projects');
         runGame();
     } catch (err) {
-        alert('❌ 加载失败: ' + err.message);
+        showToast('加载失败: ' + err.message, 'error');
     }
 }
 
 async function deleteProject(id) {
-    if (!confirm('确定删除此项目？')) return;
+    if (!await showConfirm('确定删除此项目？', { danger: true })) return;
     try {
         await ensureOk(await fetch(`/api/projects/${id}`, { method: 'DELETE' }));
         await loadProjects();
     } catch (err) {
-        alert('❌ 删除失败: ' + err.message);
+        showToast('删除失败: ' + err.message, 'error');
     }
 }
 
@@ -1245,7 +1558,7 @@ document.getElementById('btn-upload').addEventListener('click', async () => {
     const fileInput = document.getElementById('file-input');
     const btn = document.getElementById('btn-upload');
     const files = Array.from(fileInput.files);
-    if (!files.length) { alert('请选择文件'); return; }
+    if (!files.length) { showToast('请选择文件', 'info'); return; }
 
     const fallbackType = document.getElementById('asset-type').value;
     const description = document.getElementById('asset-desc').value;
@@ -1277,9 +1590,11 @@ document.getElementById('btn-upload').addEventListener('click', async () => {
     await loadAssets();
     const ok = files.length - failed.length;
     // 别再无条件报成功：有失败就如实告知
-    alert(failed.length
-        ? `✅ 成功 ${ok}/${files.length}，❌ 失败 ${failed.length}：\n` + failed.join('\n')
-        : `✅ 全部上传成功！共 ${ok} 个文件`);
+    if (failed.length) {
+        showToast(`成功 ${ok}/${files.length}，失败 ${failed.length}：\n` + failed.join('\n'), 'error', 8000);
+    } else {
+        showToast(`全部上传成功！共 ${ok} 个文件`, 'success');
+    }
 });
 
 // ============ CSV 标注批量导入 ============
@@ -1291,8 +1606,8 @@ document.getElementById('btn-batch-import').addEventListener('click', async () =
 
     const csvFile = csvInput.files[0];
     const audioFiles = Array.from(fileInput.files);
-    if (!csvFile) { alert('请先选择 CSV 标注文件'); return; }
-    if (!audioFiles.length) { alert('请先在上方选择要导入的音频文件'); return; }
+    if (!csvFile) { showToast('请先选择 CSV 标注文件', 'info'); return; }
+    if (!audioFiles.length) { showToast('请先在上方选择要导入的音频文件', 'info'); return; }
 
     const label = btn.textContent;
     btn.disabled = true;
@@ -1391,12 +1706,12 @@ function getTypeIcon(type) {
 }
 
 async function deleteAsset(id) {
-    if (!confirm('确定删除此素材？')) return;
+    if (!await showConfirm('确定删除此素材？', { danger: true })) return;
     try {
         await ensureOk(await fetch(`/api/assets/${id}`, { method: 'DELETE' }));
         await loadAssets();
     } catch (err) {
-        alert('❌ 删除失败: ' + err.message);
+        showToast('删除失败: ' + err.message, 'error');
     }
 }
 
@@ -1483,34 +1798,110 @@ function resetSkillEditor() {
     clearSelectedSkillSource();
 }
 
+// 技能面板治理：列表数据缓存在前端，搜索/批量勾选只做本地重渲染，不反复打接口
+let allSkills = [];
+let skillBatchMode = false;
+
 async function loadSkills() {
     const list = document.getElementById('skills-list');
     list.innerHTML = '<p style="color:#888;text-align:center">加载中...</p>';
     try {
         const res = await fetch('/api/skills');
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const skills = await res.json();
-        if (!skills.length) {
-            list.innerHTML = '<p style="color:#888;text-align:center">暂无技能</p>';
-            return;
-        }
-        list.innerHTML = skills.map(s => `
-            <div class="skill-item">
-                <div class="skill-info">
-                    <strong>${escapeHtml(s.name || '')}</strong>
-                    <span>${escapeHtml(s.description || '')}${s.source_file_count ? ` · 📦 ${s.source_file_count} 个源码文件 · 🖼️ ${s.usable_asset_count || 0} 个可用素材 · 🧩 ${s.web_dependency_count || 0} 个网页依赖` : ''}</span>
-                </div>
-                <div class="skill-actions">
-                    <button onclick="viewSkill('${jsStr(s.name)}')" title="查看">👁</button>
-                    <button onclick="deleteSkill('${jsStr(s.name)}')" title="删除">🗑️</button>
-                </div>
-            </div>
-        `).join('');
+        allSkills = await res.json();
+        renderSkillsList();
     } catch (err) {
-        list.innerHTML = `<p style="color:#f66;text-align:center">加载失败: ${err.message}</p>`;
+        list.innerHTML = `<p style="color:#f66;text-align:center">加载失败: ${escapeHtml(err.message)}</p>`;
         console.error('加载技能失败:', err);
     }
 }
+
+function renderSkillsList() {
+    const list = document.getElementById('skills-list');
+    if (!allSkills.length) {
+        list.innerHTML = '<p style="color:#888;text-align:center">暂无技能</p>';
+        return;
+    }
+    const term = (document.getElementById('skill-search')?.value || '').trim().toLowerCase();
+    const filtered = term
+        ? allSkills.filter(s =>
+            String(s.name || '').toLowerCase().includes(term)
+            || String(s.description || '').toLowerCase().includes(term))
+        : allSkills;
+    if (!filtered.length) {
+        list.innerHTML = '<p style="color:#888;text-align:center">没有匹配的技能，换个关键词试试</p>';
+        return;
+    }
+    list.innerHTML = filtered.map(s => `
+        <div class="skill-item">
+            ${skillBatchMode ? `<input type="checkbox" class="skill-select" value="${escapeHtml(s.name || '')}" onchange="syncSkillSelectAll()">` : ''}
+            <div class="skill-info">
+                <strong>${escapeHtml(s.name || '')}</strong>
+                <span>${escapeHtml(s.description || '')}${s.source_file_count ? ` · 📦 ${s.source_file_count} 个源码文件 · 🖼️ ${s.usable_asset_count || 0} 个可用素材 · 🧩 ${s.web_dependency_count || 0} 个网页依赖` : ''}</span>
+            </div>
+            <div class="skill-actions">
+                <button onclick="viewSkill('${jsStr(s.name)}')" title="查看">👁</button>
+                <button onclick="deleteSkill('${jsStr(s.name)}')" title="删除">🗑️</button>
+            </div>
+        </div>
+    `).join('');
+    syncSkillSelectAll();
+}
+
+// 全选框与逐项勾选双向同步：逐项全勾上时全选框亮起，取消任意一项立即熄灭
+function syncSkillSelectAll() {
+    const selectAll = document.getElementById('skill-select-all');
+    if (!selectAll) return;
+    const boxes = [...document.querySelectorAll('#skills-list .skill-select')];
+    selectAll.checked = boxes.length > 0 && boxes.every(cb => cb.checked);
+}
+window.syncSkillSelectAll = syncSkillSelectAll;
+
+document.getElementById('skill-search').addEventListener('input', renderSkillsList);
+
+document.getElementById('btn-skill-batch').addEventListener('click', () => {
+    skillBatchMode = !skillBatchMode;
+    const bar = document.getElementById('skills-batch-bar');
+    bar.classList.toggle('hidden', !skillBatchMode);
+    document.getElementById('btn-skill-batch').classList.toggle('active', skillBatchMode);
+    const selectAll = document.getElementById('skill-select-all');
+    if (selectAll) selectAll.checked = false;
+    renderSkillsList();
+});
+
+document.getElementById('skill-select-all').addEventListener('change', (e) => {
+    document.querySelectorAll('#skills-list .skill-select').forEach(cb => { cb.checked = e.target.checked; });
+});
+
+document.getElementById('btn-delete-selected-skills').addEventListener('click', async () => {
+    const names = [...document.querySelectorAll('#skills-list .skill-select:checked')].map(cb => cb.value);
+    if (!names.length) {
+        showToast('请先勾选要删除的技能', 'info');
+        return;
+    }
+    if (!await showConfirm(`确定删除所选 ${names.length} 个技能？删除后不可恢复。`, { danger: true })) return;
+    // 进度 toast：拿住引用逐个更新文案，结束后手动移除再报汇总
+    const progress = showToast(`正在删除 0/${names.length}...`, 'info', 10 * 60 * 1000);
+    const progressMsg = progress.querySelector('.toast-msg');
+    let ok = 0;
+    const failed = [];
+    for (const name of names) {
+        try {
+            await ensureOk(await fetch(`/api/skills/${encodeURIComponent(name)}`, { method: 'DELETE' }));
+            ok++;
+        } catch (err) {
+            failed.push(`${name}: ${err.message}`);
+        }
+        if (progressMsg) progressMsg.textContent = `正在删除 ${ok + failed.length}/${names.length}...`;
+    }
+    removeToast(progress);
+    if (failed.length) {
+        showToast(`删除完成：成功 ${ok} 个，失败 ${failed.length} 个：\n${failed.join('\n')}`, 'error', 8000);
+    } else {
+        showToast(`已删除 ${ok} 个技能`, 'success');
+    }
+    await loadSkills();
+});
 
 async function viewSkill(name) {
     try {
@@ -1531,17 +1922,17 @@ async function viewSkill(name) {
         document.getElementById('btn-add-skill').textContent = '✏️ 更新技能';
         document.getElementById('btn-add-skill').dataset.mode = 'edit';
     } catch (err) {
-        alert('加载失败: ' + err.message);
+        showToast('加载失败: ' + err.message, 'error');
     }
 }
 
 async function deleteSkill(name) {
-    if (!confirm(`确定删除技能 "${name}"？`)) return;
+    if (!await showConfirm(`确定删除技能 "${name}"？`, { danger: true })) return;
     try {
         await ensureOk(await fetch(`/api/skills/${encodeURIComponent(name)}`, { method: 'DELETE' }));
         await loadSkills();
     } catch (err) {
-        alert('删除失败: ' + err.message);
+        showToast('删除失败: ' + err.message, 'error');
     }
 }
 
@@ -1553,8 +1944,8 @@ document.getElementById('btn-add-skill').addEventListener('click', async () => {
     const content = document.getElementById('skill-content').value.trim();
     const hasSource = selectedSkillSourceFiles.length > 0;
     const isEdit = btn.dataset.mode === 'edit';
-    if (!name || !desc) { alert('请填写技能名称和描述'); return; }
-    if (!content && !hasSource && !isEdit) { alert('请填写技能说明，或选择一个源码文件夹/ZIP'); return; }
+    if (!name || !desc) { showToast('请填写技能名称和描述', 'info'); return; }
+    if (!content && !hasSource && !isEdit) { showToast('请填写技能说明，或选择一个源码文件夹/ZIP', 'info'); return; }
     btn.disabled = true;
     try {
         let res;
@@ -1588,12 +1979,19 @@ document.getElementById('btn-add-skill').addEventListener('click', async () => {
         await ensureOk(res);
         const result = await res.json();
         if (hasSource) {
-            alert(`✅ 已保存技能“${name}”：导入 ${result.source_file_count} 个源码文件、${result.usable_asset_count || 0} 个可加载素材，识别 ${result.web_dependency_count || 0} 个 HTML→CSS/JS 依赖，跳过 ${result.skipped_count} 项。`);
+            showToast(`已保存技能“${name}”：导入 ${result.source_file_count} 个源码文件、${result.usable_asset_count || 0} 个可加载素材，识别 ${result.web_dependency_count || 0} 个 HTML→CSS/JS 依赖，跳过 ${result.skipped_count} 项。`, 'success', 6000);
+            // C2：跳过项透明化——逐条展示被跳过文件的路径和后果说明，让用户知道还原度会受什么影响
+            if (Array.isArray(result.skipped_details) && result.skipped_details.length) {
+                showImportReportPanel(`以下 ${result.skipped_details.length} 个文件被跳过：`, result.skipped_details);
+            }
+            (result.warnings || []).forEach(w => showToast(String(w), 'info', 6000));
+        } else {
+            showToast(isEdit ? `已更新技能“${name}”` : `已添加技能“${name}”`, 'success');
         }
         resetSkillEditor();
         await loadSkills();
     } catch (err) {
-        alert('操作失败: ' + err.message);
+        showToast('操作失败: ' + err.message, 'error');
     } finally {
         btn.disabled = false;
     }
@@ -1643,24 +2041,49 @@ document.getElementById('skill-import-file').addEventListener('change', async (e
             const formData = new FormData();
             formData.append('file', file);
             const res = await fetch('/api/skills/import', { method: 'POST', body: formData });
-            if (!res.ok) { const d = await res.json(); throw new Error(d.detail); }
+            if (!res.ok) {
+                let d = null;
+                try { d = await res.json(); } catch (_) {}
+                // C1 导入防呆：后端识别出这是游戏源码项目（一堆 html/js/css、没有技能文档），
+                // 引导转到「源码参考」入口，而不是让用户困惑为什么导入了 0 个技能
+                if (res.status === 422 && d && d.detail && d.detail.code === 'SOURCE_PROJECT_DETECTED') {
+                    const stats = d.detail.stats || {};
+                    const total = (stats.html || 0) + (stats.js || 0) + (stats.css || 0);
+                    const toSource = await showConfirm(
+                        `检测到这是一个游戏源码项目（${total} 个 html/js/css）。技能包入口只导入文档；是否转为【源码参考】导入？`
+                    );
+                    if (toSource) {
+                        // 复用现有源码选中状态：把这个 ZIP 塞进已选文件，状态文案照常刷新
+                        skillSourceFolderInput.value = '';
+                        skillSourceZipInput.value = '';
+                        selectSkillSource([file], '源码 ZIP');
+                        document.getElementById('skill-name').focus();
+                    }
+                    e.target.value = '';
+                    return;
+                }
+                const detailMsg = d && d.detail
+                    ? (typeof d.detail === 'string' ? d.detail : (d.detail.message || JSON.stringify(d.detail)))
+                    : `HTTP ${res.status}`;
+                throw new Error(detailMsg);
+            }
             const result = await res.json();
             added = result.added || 0;
             if (result.errors && result.errors.length) {
-                alert(`✅ 导入 ${added} 个技能，${result.errors.length} 个文件失败：\n` + result.errors.join('\n'));
+                showToast(`导入 ${added} 个技能，${result.errors.length} 个文件失败：\n` + result.errors.join('\n'), 'error', 8000);
                 await loadSkills();
                 e.target.value = '';
                 return;
             }
         } else {
-            alert('不支持的文件格式，请使用 .json / .md / .zip');
+            showToast('不支持的文件格式，请使用 .json / .md / .zip', 'error');
             e.target.value = '';
             return;
         }
-        alert(`✅ 成功导入 ${added} 个技能`);
+        showToast(`成功导入 ${added} 个技能`, 'success');
         await loadSkills();
     } catch (err) {
-        alert('导入失败: ' + err.message);
+        showToast('导入失败: ' + err.message, 'error');
     }
     e.target.value = '';
 });
@@ -1669,7 +2092,7 @@ document.getElementById('skill-import-file').addEventListener('change', async (e
 // 扫描本地文件夹导入
 document.getElementById('btn-scan-skills').addEventListener('click', async () => {
     const scanPath = document.getElementById('skill-scan-path').value.trim();
-    if (!scanPath) { alert('请输入文件夹路径'); return; }
+    if (!scanPath) { showToast('请输入文件夹路径', 'info'); return; }
     try {
         const res = await fetch('/api/skills/scan', {
             method: 'POST',
@@ -1678,13 +2101,88 @@ document.getElementById('btn-scan-skills').addEventListener('click', async () =>
         });
         const data = await res.json();
         if (!res.ok) throw new Error(data.detail);
-        let msg = `✅ 扫描完成！找到 ${data.total_found} 个技能，成功导入 ${data.added} 个`;
+        let msg = `扫描完成！找到 ${data.total_found} 个技能，成功导入 ${data.added} 个`;
         if (data.skipped && data.skipped.length) {
             msg += `\n跳过（已存在）: ${data.skipped.join(', ')}`;
         }
-        alert(msg);
+        showToast(msg, 'success', 6000);
         await loadSkills();
     } catch (err) {
-        alert('扫描失败: ' + err.message);
+        showToast('扫描失败: ' + err.message, 'error');
+    }
+});
+
+
+// ============ 真机预览（C5）：设备切换 + 扫码用手机试玩 ============
+// 📱 自适应填充 ↔ 375×667 手机框（纯 CSS 切换，不重载 iframe，游戏状态不丢）
+document.getElementById('btn-device').addEventListener('click', () => {
+    const panel = document.querySelector('.preview-panel');
+    const phone = panel.classList.toggle('phone-mode');
+    document.getElementById('btn-device').textContent = phone ? '🖥️ 自适应' : '📱 手机框';
+});
+
+// 二维码库懒加载：只有点了扫码才拉 /static/vendor/qrcode.js，失败时报错并允许下次重试
+let qrLibPromise = null;
+function loadQrLib() {
+    if (typeof qrcode !== 'undefined') return Promise.resolve();
+    if (!qrLibPromise) {
+        qrLibPromise = new Promise((resolve, reject) => {
+            const script = document.createElement('script');
+            script.src = '/static/vendor/qrcode.js';
+            script.onload = () => {
+                if (typeof qrcode !== 'undefined') resolve();
+                else { qrLibPromise = null; reject(new Error('二维码库加载异常（qrcode 未定义）')); }
+            };
+            script.onerror = () => {
+                qrLibPromise = null;
+                reject(new Error('二维码库缺失（/static/vendor/qrcode.js）'));
+            };
+            document.head.appendChild(script);
+        });
+    }
+    return qrLibPromise;
+}
+
+document.getElementById('btn-qrcode').addEventListener('click', async () => {
+    // 还没会话或编辑器里只有占位注释 = 这个会话没生成过代码，磁盘上没有可供 /play 的文件
+    const currentCode = editor ? editor.getValue().trim() : '';
+    const onlyComment = !currentCode || /^<!--[\s\S]*?-->$/.test(currentCode);
+    if (!sessionId || onlyComment) {
+        showToast('当前会话还没有生成过代码，先让 AI 生成一个游戏吧', 'info');
+        return;
+    }
+    const box = document.getElementById('qrcode-box');
+    const urlEl = document.getElementById('qrcode-url');
+    const noteEl = document.getElementById('qrcode-note');
+    box.innerHTML = '<p style="color:#888">生成中...</p>';
+    urlEl.textContent = '';
+    noteEl.textContent = '手机需与电脑连接同一局域网。';
+    openModal('modal-qrcode');
+    try {
+        await loadQrLib();
+        let info = { lan_ip: null, port: null };
+        try {
+            const res = await fetch('/api/server-info');
+            if (res.ok) info = await res.json();
+        } catch (_) { /* 拿不到局域网信息时走 location 回退 */ }
+        let playUrl;
+        let warn = '';
+        if (info.lan_ip) {
+            playUrl = `http://${info.lan_ip}:${info.port}/play/${sessionId}`;
+        } else {
+            playUrl = `${location.origin}/play/${sessionId}`;
+            warn = '未能获取局域网 IP，已改用当前地址，手机可能无法访问。';
+        }
+        const qr = qrcode(0, 'M');
+        qr.addData(playUrl);
+        qr.make();
+        // 库生成的 SVG/IMG 是可信内容；优先 SVG（矢量清晰），旧版库没有 createSvgTag 时退 img
+        box.innerHTML = typeof qr.createSvgTag === 'function'
+            ? qr.createSvgTag(5, 8)
+            : qr.createImgTag(5, 8);
+        urlEl.textContent = playUrl;
+        noteEl.textContent = '手机需与电脑连接同一局域网。' + warn;
+    } catch (err) {
+        box.innerHTML = `<p style="color:#e74c3c">${escapeHtml(err.message)}</p>`;
     }
 });
