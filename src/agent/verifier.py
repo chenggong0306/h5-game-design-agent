@@ -1029,6 +1029,99 @@ def _analyze_animation_loop_probe(probe_state) -> list[dict]:
     }]
 
 
+# "全屏遮罩拦截输入"探针：在 canvas 中心 + 四个四分位点做 elementFromPoint。
+# 实测漏报案例：3D 魔方的 #title-screen 全屏且 pointer-events:auto（父级 #ui 为
+# none 但子层重新开启），canvas 上的双击监听永远收不到事件，真实玩家进不了游戏。
+# 采集时机在模拟输入之后：把开始逻辑绑定在覆盖层自身的合法模式会在点击后隐藏遮罩，
+# 探针此时命中 canvas，不会误报。
+_INPUT_REACHABILITY_PROBE_JS = """
+() => {
+  const canvases = Array.from(document.querySelectorAll('canvas'));
+  if (!canvases.length) return null;
+  let canvas = canvases[0], bestArea = -1;
+  for (const c of canvases) {
+    const r = c.getBoundingClientRect();
+    const area = Math.max(0, r.width) * Math.max(0, r.height);
+    if (area > bestArea) { bestArea = area; canvas = c; }
+  }
+  const rect = canvas.getBoundingClientRect();
+  const vw = window.innerWidth, vh = window.innerHeight;
+  if (rect.width <= 0 || rect.height <= 0 || vw <= 0 || vh <= 0) return null;
+  const points = [[0.5, 0.5], [0.25, 0.25], [0.75, 0.25], [0.25, 0.75], [0.75, 0.75]]
+    .map(([fx, fy]) => [
+      Math.min(Math.max(rect.left + rect.width * fx, 0), vw - 1),
+      Math.min(Math.max(rect.top + rect.height * fy, 0), vh - 1)
+    ]);
+  const interactive = 'button,a,[onclick],[role="button"],input,select,textarea';
+  let blocked = 0;
+  let blocker = null;
+  for (const [x, y] of points) {
+    const hit = document.elementFromPoint(x, y);
+    if (!hit || hit === canvas || canvas.contains(hit)) continue;
+    blocked += 1;
+    if (blocker) continue;
+    // 命中的可能是遮罩里的标题文字等小元素：沿祖先链向上找真正的大面积覆盖层。
+    // 不越过包含 canvas 的祖先——那是布局容器，不是压在 canvas 上方的遮罩。
+    let node = hit;
+    while (node && node !== document.body && node !== document.documentElement
+           && !node.contains(canvas)) {
+      const r = node.getBoundingClientRect();
+      const w = Math.min(r.right, vw) - Math.max(r.left, 0);
+      const h = Math.min(r.bottom, vh) - Math.max(r.top, 0);
+      const coverage = Math.max(0, w) * Math.max(0, h) / (vw * vh);
+      // hit-testing 按每个元素自己的 computed pointer-events 判定：祖先为 none
+      // 而子层重新开启 auto 时，子层照样拦截事件（elementFromPoint 能命中它即为
+      // 证明），因此只需确认覆盖层自身的 computed 值不为 none。
+      if (coverage >= 0.85 && getComputedStyle(node).pointerEvents !== 'none') {
+        blocker = {
+          selector: (node.tagName || '').toLowerCase()
+            + (node.id ? '#' + node.id : ''),
+          coverage: coverage,
+          has_interactive: !!(node.matches(interactive) || node.querySelector(interactive))
+        };
+        break;
+      }
+      node = node.parentElement;
+    }
+  }
+  return { total_points: points.length, blocked_points: blocked, blocker: blocker };
+}
+"""
+
+
+def _analyze_input_reachability_probe(probe) -> list[dict]:
+    """把"全屏遮罩拦截输入"探针结果转成一条可行动的 issue。
+
+    只有同时满足以下条件才报，避免误报：五个探测点全部命中非 canvas；覆盖元素
+    computed pointer-events 不为 none（elementFromPoint 命中即已保证）；覆盖面积
+    ≥85% 视口；覆盖层子树内没有任何可交互元素——开始界面用 DOM 按钮（遮罩里有
+    button）是合法模式，绝不能报。
+    """
+    if not isinstance(probe, dict):
+        return []
+    total = int(_as_finite_number(probe.get("total_points")) or 0)
+    blocked = int(_as_finite_number(probe.get("blocked_points")) or 0)
+    blocker = probe.get("blocker")
+    if total <= 0 or blocked < total or not isinstance(blocker, dict):
+        return []
+    coverage = _as_finite_number(blocker.get("coverage")) or 0.0
+    if coverage < 0.85 or blocker.get("has_interactive"):
+        return []
+    label = str(blocker.get("selector") or "").strip() or "覆盖层"
+    return [{
+        "id": "fullscreen_overlay_blocks_input",
+        "severity": "high",
+        "msg": (
+            f"全屏覆盖层 `{label}`（约覆盖 {coverage:.0%} 视口）拦截了所有指针事件，"
+            "玩家无法点击/双击 canvas 开始游戏"
+        ),
+        "fix": (
+            "给覆盖层加 pointer-events:none（把需要点击的按钮单独设回 auto），"
+            "或把开始逻辑绑定在覆盖层自身"
+        ),
+    }]
+
+
 def _analyze_asset_load_failures(failures) -> list[dict]:
     """Report failed requests only for the local asset endpoints allowed by policy."""
     if not isinstance(failures, list):
@@ -1993,7 +2086,7 @@ async def _run_headless_impl(
         return None
     atlas_assets = _normalise_source_atlases(source_assets)
 
-    async def _run() -> tuple[list[str], bool, bytes, list[dict], dict, list[dict]]:
+    async def _run() -> tuple[list[str], bool, bytes, list[dict], dict, dict, list[dict]]:
         # --no-sandbox：root 容器/AutoDL 等环境下 Chromium 启动的必要条件。
         # 去掉沙箱降低进程隔离，威胁模型里的缓解措施：
         #   1. 仅跑不可信 HTML 且拦截外部网络请求（只额外放行本服务只读 /assets/）
@@ -2061,6 +2154,18 @@ async def _run_headless_impl(
                 for ratio in _HEADLESS_START_CLICK_RATIOS:
                     await page.mouse.click(195, round(740 * ratio))
                     await page.wait_for_timeout(100)
+                # 双击开始是 3D 魔方等生成游戏的常见手势，单击/按键探不出来。补两种：
+                # (a) 原生 dblclick 事件（clickCount=2，触发 canvas 的 dblclick 监听）；
+                # (b) 同一位置 250ms 内两次独立 click——兼容游戏自写 lastTap 时间差
+                # 判定（原生 dblclick 的合成点击不一定走它的 click 计时逻辑）。
+                for ratio in _HEADLESS_START_CLICK_RATIOS:
+                    y = round(740 * ratio)
+                    await page.mouse.dblclick(195, y)
+                    await page.wait_for_timeout(100)
+                    await page.mouse.click(195, y)
+                    await page.wait_for_timeout(80)  # 80ms < 250ms，落在双击判定窗口内
+                    await page.mouse.click(195, y)
+                    await page.wait_for_timeout(100)
             except Exception:
                 pass
             # 总观察时间超过 3 秒，覆盖常见的“加载完成先启动、3 秒超时又启动”缺陷。
@@ -2086,12 +2191,20 @@ async def _run_headless_impl(
                     runtime_probe = {}
             except Exception as e:
                 logger.warning("runtime_probe_failed", error=str(e) or repr(e))
+            input_probe: dict = {}
+            try:
+                raw_input_probe = await page.evaluate(_INPUT_REACHABILITY_PROBE_JS)
+                if isinstance(raw_input_probe, dict):
+                    input_probe = raw_input_probe
+            except Exception as e:
+                logger.warning("input_reachability_probe_failed", error=str(e) or repr(e))
             return (
                 errs,
                 _is_blank_png(shot),
                 shot,
                 draw_records,
                 runtime_probe,
+                input_probe,
                 asset_failures,
             )
         finally:
@@ -2106,6 +2219,7 @@ async def _run_headless_impl(
                 shot,
                 draw_records,
                 runtime_probe,
+                input_probe,
                 asset_failures,
             ) = await asyncio.wait_for(_run(), timeout=timeout_s)
 
@@ -2137,6 +2251,7 @@ async def _run_headless_impl(
             issues.extend(_analyze_atlas_frame_records(draw_records))
             issues.extend(_analyze_placeholder_draw_records(draw_records))
             issues.extend(_analyze_animation_loop_probe(runtime_probe))
+            issues.extend(_analyze_input_reachability_probe(input_probe))
             issues.extend(_analyze_asset_load_failures(asset_failures))
         except (NameError, AttributeError, TypeError, UnboundLocalError) as e:
             # 自身编程错误（而非环境性失败）：必须高调记录，否则无头检测会静默退化成"从不报告问题"
