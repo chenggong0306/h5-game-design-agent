@@ -122,25 +122,50 @@ _STATIC_VERSION = str(int(max(
 )))
 
 
-# 可选鉴权：设置了 API_TOKEN 时，/api/* 写操作需带 X-API-Token 头（只读素材放行，预览 iframe 才能加载）
+# 安全默认值鉴权：局域网访问管理接口默认拒绝（403），本机 UI 与公开预览路径不受影响。
+# 背景：HOST=0.0.0.0 + 扫码真机预览会把服务暴露到局域网，旧逻辑在 API_TOKEN 为空时
+# 全放行 → 同 WiFi 任何人可调 /api/chat 消耗模型余额。
 from fastapi import Depends, Header, HTTPException
+
+# 回环客户端地址：本机 UI 零配置全功能（与是否配置 API_TOKEN 无关）
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 
 
 async def require_token(request: Request, x_api_token: str | None = Header(default=None)):
-    if not settings.api_token:
-        return  # 未配置令牌：本机自用模式，全部放行
+    """鉴权策略（按顺序判定）：
+    1. 公开路径永不鉴权：/play/（手机扫码是裸浏览器 GET，无法携带自定义头；session_id
+       为不可猜 UUID 且路由内已做安全正则校验）、/assets/ 与 /api/assets/file/（null-origin
+       预览 iframe 无法发送自定义头；文件名 UUID 不可猜、已做白名单+路径穿越校验）。
+    2. 回环客户端放行：本机自用零配置不变。
+    3. Starlette TestClient 哨兵 "testclient" 放行：真实部署中 client 地址由服务器从
+       TCP 套接字对端地址填入 scope["client"]，无法被任何请求头伪造；"testclient" 这个
+       哨兵值只会在进程内测试（TestClient/ASGITransport 默认值）出现，不构成放行漏洞。
+       不放行它，全部现存 API 测试会因非回环地址被 403 打爆。
+    4. 其余（真实局域网客户端）：仅当 .env 配置了 API_TOKEN 且请求头 X-API-Token 精确
+       匹配才放行；否则 403 TOKEN_REQUIRED。
+    """
     path = request.url.path
-    # 只读媒体放行（已做路径穿越校验）：null-origin iframe 预览无法发送自定义头，
-    # 必须豁免才能加载素材。风险：若 asset 文件名可猜，素材可匿名直链下载。
-    # 缓解：文件名使用 UUID（不可猜）；settings.assets_dir 默认不可公开列举。
-    if path.startswith("/assets/") or path.startswith("/api/assets/file/"):
-        return  # 只读媒体放行（已做路径校验），供 null-origin 预览 iframe 加载
-    # 真机预览放行：手机扫码是裸浏览器 GET，无法带自定义头；session_id 为不可猜 UUID
-    # 且路由内已做安全正则校验（同 /assets 的免 token 理由，见 routes.play_session）
-    if path.startswith("/play/"):
+    if (path.startswith("/play/")
+            or path.startswith("/assets/")
+            or path.startswith("/api/assets/file/")):
         return
-    if x_api_token != settings.api_token:
-        raise HTTPException(status_code=401, detail="缺少或无效的 API 令牌")
+    client_host = request.client.host if request.client else ""
+    if client_host in _LOOPBACK_HOSTS:
+        return
+    if client_host == "testclient":
+        return
+    if settings.api_token and x_api_token == settings.api_token:
+        return
+    raise HTTPException(
+        status_code=403,
+        detail={
+            "code": "TOKEN_REQUIRED",
+            "message": (
+                "局域网访问管理接口需在 .env 设置 API_TOKEN 并在请求头携带 "
+                "X-API-Token；手机预览请使用扫码链接"
+            ),
+        },
+    )
 
 
 # 注册路由

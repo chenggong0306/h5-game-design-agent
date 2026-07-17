@@ -267,6 +267,23 @@ data: [DONE]                                      ← 结束
 | GET | `/api/knowledge/stats` | 知识库统计 |
 | GET | `/api/knowledge/search?q=xxx` | 搜索知识库 |
 
+## 🔐 安全与鉴权
+
+管理接口采用**安全默认值**：局域网写接口默认拒绝，本机使用零配置。
+
+| 访问来源 | 默认权限 | 说明 |
+| -------- | -------- | ---- |
+| 本机（回环 127.0.0.1 / ::1） | 全功能 | 零配置，无需任何 token |
+| 局域网（同 WiFi） | 只读预览 | 仅 `/play/{session_id}`、`/assets/*`、`/api/assets/file/*`（手机扫码真机预览所需）；其余 `/api/*` 一律 `403`（`detail.code=TOKEN_REQUIRED`） |
+| 局域网 + `API_TOKEN` | 全功能 | `.env` 设置 `API_TOKEN` 后，请求头携带 `X-API-Token: <token>` 即可从局域网管理 |
+
+背景：`HOST=0.0.0.0` + 扫码真机预览会把服务暴露到局域网。若无此默认拒绝，同一
+WiFi 下任何人都能调用 `/api/chat` 消耗模型 API 余额。公开路径的安全兜底：素材
+文件名与会话 ID 均为不可猜 UUID，且路由内做了白名单与路径穿越校验。
+
+前端 Web UI 从浏览器 `localStorage` 键 `api_token` 读取令牌，仅对同源 `/api/`
+请求自动附带 `X-API-Token` 头。
+
 ## 🛠️ 技术栈
 
 | 层 | 技术 | 用途 |

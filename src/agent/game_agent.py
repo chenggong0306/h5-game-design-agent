@@ -66,6 +66,11 @@ CODE_SESSION_TIMEOUT = 3600  # 1小时未访问的会话代码将被清理
 # 避免 O(编辑次数×代码体积) 的冗余 SSE 流量与前端 Monaco 反复全量重载
 CODE_UPDATE_DEBOUNCE_SECONDS = 1.0
 
+# 暂存区 partial code_update 节流参数：write_game/append_game 分段写入期间，把暂存区
+# 全量内容以 {"partial": true, "source": "staging"} 推给前端，消灭长生成时编辑器全程空白。
+STAGING_PUSH_MIN_INTERVAL_SECONDS = 0.6  # 同会话两次 partial 推送最小间隔
+STAGING_PUSH_MIN_GROWTH_CHARS = 200      # 暂存长度较上次推送至少增长多少字符才再推
+
 # -------- 企业级配置：资源限制 --------
 MAX_CODE_SIZE = 5 * 1024 * 1024  # 单个代码文件最大 5MB
 MAX_OLD_STR_SIZE = 100 * 1024  # str_replace 的 old_str 最大 100KB
@@ -2274,6 +2279,39 @@ def _autocommit_staging(session_id: str) -> None:
         logger.info("staging_kept_for_continuation", session_id=session_id, size=len(staged))
 
 
+def _staging_partial_event(ss: dict, staged: str, now: float | None = None) -> dict | None:
+    """暂存区实时回显：把分段写入中的暂存内容映射成 partial code_update 事件（带节流）。
+
+    复用 chat_stream 现有的"ToolMessage 到达时轮询代码变化"架构：每个 write_game/
+    append_game 段落地后由 _chunk_to_events 调用本函数，判定是否值得推一帧。
+
+    节流规则（服务端）：距上次 partial 推送 ≥ STAGING_PUSH_MIN_INTERVAL_SECONDS 且
+    暂存长度较上次推送增长 ≥ STAGING_PUSH_MIN_GROWTH_CHARS 才推；staged 为空
+    （提交成功后 _commit_staging 已 pop 暂存区，或本回合无分段写入）时复位节流状态。
+
+    推送内容是**完整暂存**（非增量），前端整段替换即可；partial 帧不参与
+    last_code_sent/code_pushed 的正式提交去重状态，正式 code_update 的形状与时序不变。
+
+    Args:
+        ss: chat_stream 的流状态 dict（节流状态记在 staging_push_ts/staging_push_len）
+        staged: 当前会话暂存区全量内容（空串表示无暂存）
+        now: 注入时钟（测试用），缺省取 time.time()
+    """
+    if not staged:
+        ss["staging_push_ts"] = 0.0
+        ss["staging_push_len"] = 0
+        return None
+    if now is None:
+        now = time.time()
+    if now - ss.get("staging_push_ts", 0.0) < STAGING_PUSH_MIN_INTERVAL_SECONDS:
+        return None
+    if len(staged) - ss.get("staging_push_len", 0) < STAGING_PUSH_MIN_GROWTH_CHARS:
+        return None
+    ss["staging_push_ts"] = now
+    ss["staging_push_len"] = len(staged)
+    return {"type": "code_update", "code": staged, "partial": True, "source": "staging"}
+
+
 # ============ gemma / harmony 控制标记清洗 ============
 # 某些本地模型（gemma4 / harmony 风格）会把"通道"控制标记泄漏进正文，例如
 #   <|channel|>  <|channel>  <channel|>  <|message|>  <|end|>  <start_of_turn> …
@@ -3072,6 +3110,13 @@ class GameDesignAgent:
                                 evs.append({"type": "code_update", "code": edited, "source": name})
                             # else: 距上次推送太近，跳过中间版本（不更新 last_code_sent，
                             # 回合结束/自修后的兜底推送会补发最终代码，正确性不受影响）
+                        # 暂存区实时回显：write_game/append_game 分段落地后推 partial 帧
+                        # （完整暂存内容 + 节流）。提交成功时暂存已被 pop，此处只复位节流状态，
+                        # 正式提交的 code_update（上面分支/回合末兜底）形状与时序完全不变。
+                        pev = _staging_partial_event(
+                            ss, _staging_by_session.get(ss["session_id"], ""))
+                        if pev:
+                            evs.append(pev)
         return evs
 
     async def _run_agent_stream(self, user_content, config, ss):
@@ -3217,9 +3262,10 @@ class GameDesignAgent:
             base_code = _get_current_code()  # 协调后的基准代码
             # 流状态：full_reply 累积文本、last_code_sent/last_code_emit_ts 去重+去抖 code_update、
             # code_pushed 标记本回合是否真的推送过 code_update（done 事件据此省掉重复全量代码）、
-            # ctx_key 去重 context_usage
+            # ctx_key 去重 context_usage、staging_push_ts/staging_push_len 节流暂存区 partial 推送
             ss = {"session_id": session_id, "full_reply": "", "last_code_sent": base_code,
-                  "last_code_emit_ts": 0.0, "code_pushed": False, "ctx_key": None}
+                  "last_code_emit_ts": 0.0, "code_pushed": False, "ctx_key": None,
+                  "staging_push_ts": 0.0, "staging_push_len": 0}
 
             async with asyncio.timeout(settings.turn_deadline_seconds):  # 单回合墙钟上限（含自修），防失控长跑
                 # 主回合：模型生成

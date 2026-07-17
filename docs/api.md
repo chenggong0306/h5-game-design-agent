@@ -86,7 +86,7 @@ POST /api/chat/stream
 | `token` | AI 逐字输出的文本片段 | `content` |
 | `tool_call` | AI 调用工具 | `id`, `tool`, `args` |
 | `tool_result` | 工具返回结果 | `id`, `tool`, `result` |
-| `code_update` | 代码有更新（去抖 ~1s） | `code`, `source` |
+| `code_update` | 代码有更新（去抖 ~1s） | `code`, `source`；分段写入期间会先收到若干带 `partial: true`、`source: "staging"` 的暂存帧（`code` 为完整暂存内容，节流 ≥600ms 且增长 ≥200 字符），正式提交/自修帧无 `partial` 字段 |
 | `context_usage` | 上下文使用率变化 | `used_tokens`, `max_tokens`, `percent`, `compacted` |
 | `self_check` | 自检反馈 | `status` (`"passed"` / `"repairing"` / `"issues_remain"`), `issues` |
 | `done` | 本轮对话结束 | `code` (可能为 null), `action`, `reference_summary` (同 1.1，未用技能工具时为 null) |
@@ -100,6 +100,7 @@ POST /api/chat/stream
 data: {"type":"session","session_id":"abc-123"}
 data: {"type":"token","content":"好的"}
 data: {"type":"token","content":"，我来"}
+data: {"type":"code_update","code":"<!DOCTYPE html>...<style>...","partial":true,"source":"staging"}
 data: {"type":"code_update","code":"<!DOCTYPE html>...","source":"write_game"}
 data: {"type":"context_usage","used_tokens":12345,"max_tokens":114000,"percent":11}
 data: {"type":"done","code":null,"action":"generate"}
@@ -612,10 +613,28 @@ GET /api/server-info
 
 ### 鉴权
 
-可选，`.env` 中配置 `API_TOKEN` 后，所有 `/api/*` 写操作需带 `X-API-Token` 头。
+安全默认值：**本机全功能、局域网只读预览、设 token 后局域网可管理**。
 
-素材文件读取（`/assets/*`、`/api/assets/file/*`）与真机预览（`/play/*`）豁免鉴权，
-供 `null-origin` iframe 预览与手机裸浏览器加载。
+- **本机（回环 127.0.0.1 / ::1）**：零配置全功能，任何接口都无需 token（即使配置了
+  `API_TOKEN`，回环客户端也不需要携带）。
+- **局域网客户端（默认）**：只有公开路径可访问——真机预览 `/play/{session_id}`、素材
+  文件 `/assets/*` 与 `/api/assets/file/*`（手机扫码 / `null-origin` iframe 均是裸
+  GET 无法携带自定义头；路由内有 UUID 不可猜 + 白名单 + 路径穿越校验兜底）。其余
+  `/api/*` 管理接口一律返回 `403`。
+- **局域网管理**：在 `.env` 设置 `API_TOKEN` 后，请求头携带 `X-API-Token: <token>`
+  （精确匹配）即可从局域网访问全部接口。前端 Web UI 从 `localStorage` 键 `api_token`
+  读取该值，仅对同源 `/api/` 请求附带。
+
+未通过鉴权的 `403` 响应体：
+
+```json
+{
+  "detail": {
+    "code": "TOKEN_REQUIRED",
+    "message": "局域网访问管理接口需在 .env 设置 API_TOKEN 并在请求头携带 X-API-Token；手机预览请使用扫码链接"
+  }
+}
+```
 
 ### 限流
 
@@ -628,7 +647,7 @@ HTTP 层：
 | 状态码 | 说明 |
 |--------|------|
 | 400 | 参数无效 |
-| 401 | API Token 缺失或无效 |
+| 403 | 局域网访问管理接口未携带有效 X-API-Token（`detail.code` = `TOKEN_REQUIRED`） |
 | 404 | 资源不存在 |
 | 413 | 文件过大 |
 | 429 | 请求过于频繁 |
