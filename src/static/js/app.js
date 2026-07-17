@@ -2,6 +2,46 @@
  * AI 游戏设计工坊 - 前端主逻辑
  */
 
+// ============ API Token 支持：同源 /api/ 请求自动附带 X-API-Token 请求头 ============
+// 局域网访问管理接口时后端要求 .env 中配置的 API_TOKEN（403 TOKEN_REQUIRED），
+// 前端把 localStorage['api_token'] 附到每个同源 /api/ 请求上。
+// 项目内所有调用均为「字符串 URL + options」形态，仅需覆盖该形态。
+const _origFetch = window.fetch;
+window.fetch = function (input, init) {
+    try {
+        if (typeof input === 'string' && input.startsWith('/api/')) {
+            const token = localStorage.getItem('api_token');
+            if (token) {
+                init = Object.assign({}, init);
+                const headers = new Headers(init.headers || {});
+                headers.set('X-API-Token', token);
+                init.headers = headers;
+            }
+        }
+    } catch (_) { /* 包装出错不阻断请求，按原样发出 */ }
+    return _origFetch.call(window, input, init);
+};
+
+// 403 TOKEN_REQUIRED 时引导用户录入 Token；防止并发 403 弹出多个输入框
+let _tokenPromptOpen = false;
+async function promptForApiToken() {
+    if (_tokenPromptOpen) return;
+    _tokenPromptOpen = true;
+    try {
+        const token = await showPrompt('检测到从局域网访问管理接口，需要 .env 中配置的 API_TOKEN');
+        if (token === null) {
+            showToast('已取消：未设置 API Token，相关操作仍会被拒绝', 'info');
+        } else if (token.trim()) {
+            localStorage.setItem('api_token', token.trim());
+            showToast('已保存，请重试刚才的操作', 'success');
+        } else {
+            showToast('未输入 Token，未保存', 'info');
+        }
+    } finally {
+        _tokenPromptOpen = false;
+    }
+}
+
 // ============ 企业级错误处理模块 ============
 class ErrorHandler {
     constructor() {
@@ -247,10 +287,23 @@ function showImportReportPanel(title, items) {
 async function ensureOk(res) {
     if (!res.ok) {
         let detail = `HTTP ${res.status}`;
+        let detailObj = null;
         try {
             const d = await res.json();
-            if (d && d.detail) detail = Array.isArray(d.detail) ? JSON.stringify(d.detail) : d.detail;
+            if (d && d.detail) {
+                detailObj = d.detail;
+                detail = Array.isArray(d.detail) ? JSON.stringify(d.detail) : d.detail;
+            }
         } catch (_) { /* 非 JSON 错误体，沿用状态码 */ }
+        // 鉴权契约：403 + detail.code === 'TOKEN_REQUIRED' → 引导用户录入 API Token（不自动重放请求）
+        if (res.status === 403 && detailObj && typeof detailObj === 'object' && detailObj.code === 'TOKEN_REQUIRED') {
+            promptForApiToken();
+            throw new Error(detailObj.message || '需要 API Token');
+        }
+        // detail 为结构化对象时取 message，避免 Error 里出现 [object Object]
+        if (detail && typeof detail === 'object' && !Array.isArray(detail)) {
+            detail = detail.message || JSON.stringify(detail);
+        }
         throw new Error(detail);
     }
     return res;
@@ -808,7 +861,7 @@ function stopCurrentStream() {
 
 // ============ 生成进度状态栏（流式期间显示在输入框上方，done/error/中断时消失） ============
 const streamStatusEl = document.getElementById('stream-status');
-const streamStatusState = { timer: null, startTs: 0, steps: 0, lastTool: '' };
+const streamStatusState = { timer: null, startTs: 0, steps: 0, lastTool: '', stagingLines: 0 };
 
 function renderStreamStatusText() {
     if (!streamStatusEl) return;
@@ -816,7 +869,8 @@ function renderStreamStatusText() {
     const m = Math.floor(elapsed / 60);
     const s = String(elapsed % 60).padStart(2, '0');
     const toolPart = streamStatusState.lastTool ? ` —— ${streamStatusState.lastTool}` : '';
-    streamStatusEl.textContent = `⚙️ 生成中 · 第 ${streamStatusState.steps} 步 · 已用 ${m}:${s}${toolPart}`;
+    const stagingPart = streamStatusState.stagingLines > 0 ? ` · 已写入约 ${streamStatusState.stagingLines} 行` : '';
+    streamStatusEl.textContent = `⚙️ 生成中 · 第 ${streamStatusState.steps} 步 · 已用 ${m}:${s}${toolPart}${stagingPart}`;
 }
 
 function startStreamStatus() {
@@ -824,6 +878,7 @@ function startStreamStatus() {
     streamStatusState.startTs = Date.now();
     streamStatusState.steps = 0;
     streamStatusState.lastTool = '';
+    streamStatusState.stagingLines = 0;
     renderStreamStatusText();
     streamStatusEl.classList.remove('hidden');
     clearInterval(streamStatusState.timer);
@@ -834,6 +889,12 @@ function startStreamStatus() {
 function noteStreamStatusTool(tool) {
     streamStatusState.steps += 1;
     streamStatusState.lastTool = getToolMeta(tool)[1];
+    renderStreamStatusText();
+}
+
+// 暂存流式写入进度（partial code_update）：N = 暂存全量内容按换行计的行数
+function noteStreamStatusStaging(code) {
+    streamStatusState.stagingLines = code ? String(code).split('\n').length : 0;
     renderStreamStatusText();
 }
 
@@ -1007,7 +1068,20 @@ async function sendMessage(messageOverride = null, options = {}) {
                         scheduleStreamRender(activeStreamState);
 
                     } else if (event.type === 'code_update') {
-                        if (event.code) {
+                        if (event.partial === true) {
+                            // 暂存内容实时流入（契约：{type:'code_update', code:全量暂存, partial:true, source:'staging'}）：
+                            // 仅当用户未手改（!codeDirty）时同步进编辑器，绝不覆盖用户手改；
+                            // 不触发预览重载/runGame，不置 codeUpdated（done 收尾逻辑保持原样）
+                            if (typeof event.code === 'string' && event.code && !codeDirty) {
+                                applyEditorCode(event.code);
+                                // 滚动到末尾，让用户看到"正在往下写"
+                                if (editor) {
+                                    const model = editor.getModel();
+                                    if (model) editor.revealLine(model.getLineCount());
+                                }
+                            }
+                            noteStreamStatusStaging(event.code || '');
+                        } else if (event.code) {
                             // 流式期间只更新编辑器文本，不在此刷新预览（避免多段编辑反复重载/闪屏），
                             // 统一在 done 时跑一次。Monaco 未就绪时 applyEditorCode 会缓存到
                             // pendingLatestCode，初始化回调里恢复并 runGame——这里不能因 editor
@@ -1454,6 +1528,42 @@ async function restoreVersion(versionId, timeText) {
 
 window.restoreVersion = restoreVersion;
 document.getElementById('btn-versions').addEventListener('click', openVersionsModal);
+
+
+// ============ 导出 HTML：把编辑器里的游戏代码下载成单文件 ============
+// 文件名取代码 <title>（去首尾空白、Windows 非法字符 \/:*?"<>| 换成 -、超 40 字符截断），
+// 空标题用 'game'，拼 -YYYYMMDD.html
+function buildExportFilename(code) {
+    const m = String(code || '').match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+    let title = m ? m[1].trim() : '';
+    title = title.replace(/[\\/:*?"<>|]/g, '-');
+    if (title.length > 40) title = title.slice(0, 40);
+    if (!title) title = 'game';
+    const now = new Date();
+    const ymd = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}`;
+    return `${title}-${ymd}.html`;
+}
+
+document.getElementById('btn-export').addEventListener('click', () => {
+    const code = editor ? editor.getValue() : '';
+    const trimmed = code.trim();
+    // 为空，或仍是初始占位注释（以 <!-- 开头且整份代码不含 <html）→ 没东西可导
+    if (!trimmed || (trimmed.startsWith('<!--') && !/<html/i.test(code))) {
+        showToast('还没有可导出的游戏代码', 'info');
+        return;
+    }
+    const filename = buildExportFilename(code);
+    const blob = new Blob([code], { type: 'text/html' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    showToast(`已导出 ${filename}`, 'success');
+});
 
 
 // ============ 项目管理 ============
