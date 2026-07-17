@@ -282,7 +282,7 @@ GET /api/assets/search?q=音效&asset_type=audio&top_k=5
 | `asset_type` | 否 | 按类型过滤 |
 | `top_k` | 否 | 返回条数，默认 5 |
 
-**响应**：同 [2.2 列出素材](#22-列出素材)，每条多一个 `score`（相似度 0-1）。
+**响应**：同 [2.2 列出素材](#22-列出素材)，每条多一个 `score`（相似度 = `1/(1+L2距离)`，值域 `(0,1]`，越大越相似）。
 
 ---
 
@@ -293,6 +293,42 @@ DELETE /api/assets/{asset_id}
 ```
 
 响应：`{"ok": true}` 或 404。
+
+---
+
+### 2.4.1 更新素材标注
+
+```
+PATCH /api/assets/{asset_id}
+```
+
+**请求**（JSON，两个字段均可省略，省略的字段不改动）：
+
+```json
+{ "description": "红色小球，适合弹球类游戏", "tags": ["小球", "红色"] }
+```
+
+**响应**：200 返回更新后的素材对象（同 2.2 的条目，含 `url`）；素材不存在 404。
+描述与标签会同步写进 ChromaDB 的检索文本，中文语义搜索立即生效。
+
+---
+
+### 2.4.2 AI 生成素材描述
+
+```
+POST /api/assets/{asset_id}/describe
+```
+
+同步调用视觉模型为图片素材生成中文描述并入库（供旧素材手动补描述）。
+
+**响应**：
+
+- 200：`{"description": "……"}`
+- 502：`{"detail": {"code": "DESCRIBE_FAILED", "message": "……"}}`（模型不支持视觉/超时/调用失败）
+- 404：素材不存在
+
+> 图片素材上传（2.1）后会自动在后台线程尝试生成描述，不阻塞上传响应；
+> 后台失败静默降级，可用本接口手动重试。
 
 ---
 
@@ -424,6 +460,9 @@ GET    /api/projects              # 列出所有项目
 GET    /api/projects/{project_id} # 获取单个项目详情
 DELETE /api/projects/{project_id} # 删除项目
 ```
+
+`GET /api/projects` 每项包含 `created_at`（UTC ISO8601 字符串；旧项目无时间戳为 `null`）
+与 `line_count`（代码行数 int；旧项目为 `null`），其余字段不变。
 
 ---
 

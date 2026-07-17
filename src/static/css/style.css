@@ -735,6 +735,22 @@ body {
     word-break: break-all;
 }
 
+/* 图片素材无描述时的 AI 补全入口 */
+.asset-describe-btn {
+    align-self: flex-start;
+    padding: 2px 8px;
+    font-size: 11px;
+    color: var(--text-secondary);
+    background: none;
+    border: 1px dashed var(--border-primary);
+    border-radius: 6px;
+    cursor: pointer;
+}
+.asset-describe-btn:hover {
+    color: var(--accent-primary);
+    border-color: var(--accent-primary);
+}
+
 /* 素材列表 */
 .assets-list, .projects-list { display: flex; flex-direction: column; gap: 8px; }
 .asset-item, .project-item {
@@ -747,6 +763,19 @@ body {
     font-size: 13px;
 }
 .asset-item .name, .project-item .name { flex: 1; }
+/* 项目条目：名称 + 创建时间/行数次级信息竖排 */
+.project-item .project-info {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+.project-item .project-info .name { flex: none; }
+.project-item .project-meta {
+    font-size: 11px;
+    color: var(--text-secondary);
+}
 /* 行内 URL 可断行，防止 min-content 撑破窄屏弹窗、把删除按钮挤出屏外 */
 .asset-item code { word-break: break-all; min-width: 0; }
 .asset-item .actions, .project-item .actions { display: flex; gap: 6px; }

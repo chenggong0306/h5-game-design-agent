@@ -1,9 +1,11 @@
 """知识库管理 - ChromaDB 向量存储 + 素材管理"""
 
 import os
+import re
 import uuid
 import json
 import shutil
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -124,14 +126,11 @@ class KnowledgeBase:
             "file_path": str(save_path),
             "extension": ext,
             "tags": json.dumps(tags or [], ensure_ascii=False),
+            "description": description or "",
         }
 
         # 构建搜索文本
-        search_text = f"[{asset_type}] {file_name}"
-        if description:
-            search_text += f" - {description}"
-        if tags:
-            search_text += f" | 标签: {', '.join(tags)}"
+        search_text = self._compose_asset_document(asset_type, file_name, description, tags or [])
 
         self.assets_collection.add(
             ids=[asset_id],
@@ -181,21 +180,100 @@ class KnowledgeBase:
         except Exception:
             return False
 
+    def get_asset(self, asset_id: str) -> dict | None:
+        """按 ID 获取单个素材（含 document 搜索文本与全部 metadata），不存在返回 None。"""
+        try:
+            result = self.assets_collection.get(ids=[asset_id])
+        except Exception:
+            return None
+        if not result or not result["ids"]:
+            return None
+        meta = result["metadatas"][0] if result.get("metadatas") else {}
+        doc = result["documents"][0] if result.get("documents") else ""
+        return {"id": result["ids"][0], "document": doc or "", **(meta or {})}
+
+    # document 格式: "[audio] click2.ogg - 描述文本 | 标签: a, b"（与 CSV 补标注一致）
+    _DOC_DESC_RE = re.compile(r"\]\s+.+?\s+-\s+(.+?)(?:\s*\|\s*标签:.*)?$")
+
+    @staticmethod
+    def _compose_asset_document(asset_type: str, file_name: str,
+                                description: str, tags: list[str]) -> str:
+        """统一构建素材的 ChromaDB 搜索文本（上传/补标注/自动描述共用一种格式）。"""
+        doc = f"[{asset_type}] {file_name}"
+        if description:
+            doc += f" - {description}"
+        if tags:
+            doc += f" | 标签: {', '.join(tags)}"
+        return doc
+
+    def update_asset_annotation(
+        self,
+        asset_id: str,
+        description: str | None = None,
+        tags: list[str] | None = None,
+    ) -> dict | None:
+        """更新素材的描述/标签（None 表示该字段不改动）。
+
+        同时重建 document 搜索文本并更新 metadata（参考 CSV 补标注的实现），
+        保证中文语义搜索能命中新描述。素材不存在返回 None。
+        """
+        asset = self.get_asset(asset_id)
+        if asset is None:
+            return None
+
+        # 现有描述：优先 metadata.description；旧数据只有 document，从中解析
+        old_desc = asset.get("description") or ""
+        if not old_desc and asset.get("document"):
+            m = self._DOC_DESC_RE.search(asset["document"])
+            old_desc = m.group(1).strip() if m else ""
+        try:
+            old_tags = json.loads(asset.get("tags") or "[]")
+            if not isinstance(old_tags, list):
+                old_tags = []
+        except (ValueError, TypeError):
+            old_tags = []
+
+        new_desc = old_desc if description is None else str(description).strip()
+        new_tags = old_tags if tags is None else [str(t).strip() for t in tags if str(t).strip()]
+
+        meta = {k: v for k, v in asset.items() if k not in ("id", "document")}
+        meta["tags"] = json.dumps(new_tags, ensure_ascii=False)
+        meta["description"] = new_desc
+        doc = self._compose_asset_document(
+            meta.get("asset_type", "image"), meta.get("file_name", ""), new_desc, new_tags,
+        )
+        try:
+            self.assets_collection.update(ids=[asset_id], documents=[doc], metadatas=[meta])
+        except Exception:
+            return None
+        return {"id": asset_id, "document": doc, **meta}
+
+    def update_asset_description(self, asset_id: str, description: str) -> bool:
+        """更新素材描述（供上传后台自动描述 / describe 端点回填），成功返回 True。"""
+        return self.update_asset_annotation(asset_id, description=description) is not None
+
     # ============ 项目管理 ============
 
     def save_project(self, project_id: str, name: str, code: str, config: dict | None = None) -> str:
-        """保存用户项目"""
+        """保存用户项目（metadata 记录 created_at UTC ISO8601 与 line_count 代码行数）"""
         if not project_id:
             project_id = str(uuid.uuid4())
         metadata = {
             "name": name,
             "config": json.dumps(config or {}, ensure_ascii=False),
+            "line_count": len(code.splitlines()),
         }
         # upsert: 先检查是否存在
         existing = self.projects_collection.get(ids=[project_id])
         if existing and existing["ids"]:
+            # 更新：保留原 created_at（创建时间不随保存改变）；
+            # 旧项目本来没有 created_at 就保持缺失（列表返回 null），不伪造创建时间
+            old_meta = existing["metadatas"][0] if existing.get("metadatas") else {}
+            if old_meta and old_meta.get("created_at"):
+                metadata["created_at"] = old_meta["created_at"]
             self.projects_collection.update(ids=[project_id], documents=[code], metadatas=[metadata])
         else:
+            metadata["created_at"] = datetime.now(timezone.utc).isoformat()
             self.projects_collection.add(ids=[project_id], documents=[code], metadatas=[metadata])
         return project_id
 
@@ -222,13 +300,23 @@ class KnowledgeBase:
         return None
 
     def list_projects(self) -> list[dict]:
-        """列出所有项目"""
+        """列出所有项目（created_at / line_count 旧数据无字段时补 null）"""
         results = self.projects_collection.get()
         items = []
         if results and results["ids"]:
             for i, pid in enumerate(results["ids"]):
-                meta = results["metadatas"][i] if results["metadatas"] else {}
-                items.append({"project_id": pid, **meta})
+                meta = dict(results["metadatas"][i] or {}) if results["metadatas"] else {}
+                line_count = meta.get("line_count")
+                if isinstance(line_count, float):
+                    line_count = int(line_count)
+                elif not isinstance(line_count, int) or isinstance(line_count, bool):
+                    line_count = None
+                items.append({
+                    "project_id": pid,
+                    **meta,
+                    "created_at": meta.get("created_at") or None,
+                    "line_count": line_count,
+                })
         return items
 
     def delete_project(self, project_id: str) -> bool:
@@ -254,7 +342,9 @@ class KnowledgeBase:
             if results.get("metadatas") and results["metadatas"][0]:
                 item.update(results["metadatas"][0][i])
             if results.get("distances") and results["distances"][0]:
-                item["score"] = 1 - results["distances"][0][i]
+                # 1/(1+L2距离)：值域 (0,1]，距离 0 → 1.0，越远越接近 0。
+                # 旧算法 1-distance 在 L2 距离 >1 时出负分，前端/模型都难解读。
+                item["score"] = 1 / (1 + results["distances"][0][i])
             items.append(item)
         return items
 

@@ -2146,6 +2146,55 @@ def _strip_persisted_code_blocks(messages: list) -> tuple[list, bool]:
     return cleaned, changed
 
 
+# 结构大纲行数上限：50 行封顶，避免大纲本身吃掉太多 CJK token 预算
+_OUTLINE_MAX_LINES = 50
+_OUTLINE_FUNC_RE = re.compile(r"^\s*(?:async\s+)?function\s+([A-Za-z_$][\w$]*)")
+_OUTLINE_ARROW_RE = re.compile(
+    r"^\s*(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*"
+    r"(?:async\s+)?(?:function\b|\([^)]*\)\s*=>|[A-Za-z_$][\w$]*\s*=>)"
+)
+_OUTLINE_CLASS_RE = re.compile(r"^\s*class\s+([A-Za-z_$][\w$]*)")
+
+
+def _build_code_outline(code: str, max_lines: int = _OUTLINE_MAX_LINES) -> str:
+    """轻量结构大纲：<style>/<script> 区块行号范围 + function/class 定义行号。
+
+    帮模型在整份注入代码里直接定位编辑点，替代加载旧项目后连刷 view_code 分页。
+    纯正则单遍扫描，上限 max_lines 行，控制注入体积。
+    """
+    entries: list[tuple[int, str]] = []  # (起始行, 文本)，最后按起始行排序输出
+    style_start: int | None = None
+    script_start: int | None = None
+    for i, line in enumerate(code.split("\n"), 1):
+        low = line.lower()
+        # <style>/<script> 区块范围（同一行开又闭的单行标签，如外链 script，不值一条大纲）
+        if style_start is None and "<style" in low:
+            if "</style>" not in low:
+                style_start = i
+        elif style_start is not None and "</style>" in low:
+            entries.append((style_start, f"- 第 {style_start}-{i} 行: <style> 样式区块"))
+            style_start = None
+        if script_start is None and "<script" in low:
+            if "</script>" not in low:
+                script_start = i
+        elif script_start is not None and "</script>" in low:
+            entries.append((script_start, f"- 第 {script_start}-{i} 行: <script> 脚本区块"))
+            script_start = None
+        # 函数 / 类定义
+        m = _OUTLINE_CLASS_RE.match(line)
+        if m:
+            entries.append((i, f"- 第 {i} 行: class {m.group(1)}"))
+            continue
+        m = _OUTLINE_FUNC_RE.match(line) or _OUTLINE_ARROW_RE.match(line)
+        if m:
+            entries.append((i, f"- 第 {i} 行: function {m.group(1)}"))
+    entries.sort(key=lambda e: e[0])
+    lines_out = [text for _, text in entries]
+    if len(lines_out) > max_lines:
+        lines_out = lines_out[:max_lines - 1] + ["-（大纲超长，其余条目省略）"]
+    return "\n".join(lines_out)
+
+
 def _inject_code_into_request(request: ModelRequest) -> ModelRequest:
     """把当前会话的实时代码临时注入到 system message，仅本次模型调用可见。
 
@@ -2164,8 +2213,18 @@ def _inject_code_into_request(request: ModelRequest) -> ModelRequest:
         return req
 
     from langchain_core.messages import SystemMessage
+    total_lines = code.count("\n") + 1
+    outline = _build_code_outline(code)
+    outline_block = (
+        f"\n### 代码结构大纲（行号可直接用于 replace_code/insert_code/delete_code 定位）\n{outline}\n"
+        if outline else ""
+    )
     code_addendum = (
-        f"\n\n{_CODE_INJECT_HEADER}\n```html\n{code}\n```\n"
+        f"\n\n{_CODE_INJECT_HEADER}\n"
+        f"以下是当前完整代码（共 {total_lines} 行），已全部提供，"
+        "请直接基于它规划编辑，不要用 view_code 重新分页阅读。\n"
+        f"```html\n{code}\n```\n"
+        f"{outline_block}"
         "（以上为编辑器实时代码，仅本次回答可见、不计入对话历史。"
         "修改时直接基于它定位，用 replace_code/insert_code/delete_code 写回；不要把它复述到聊天正文。）"
     )

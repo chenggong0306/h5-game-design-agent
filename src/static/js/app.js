@@ -575,7 +575,15 @@ function parseAssetTags(tags) {
 
 // 在 HTML 属性内的 JS 字符串字面量中安全使用（先 JS 转义反斜杠/单引号，再 HTML 转义）
 function jsStr(value) {
-    return escapeHtml(String(value ?? '').replace(/\\/g, '\\\\').replace(/'/g, "\\'"));
+    // 换行必须转义：内联 onclick 里的 JS 字符串字面量不能跨行，
+    // 否则含换行的值（如 AI 生成的多行素材描述）会让点击时抛 SyntaxError
+    return escapeHtml(
+        String(value ?? '')
+            .replace(/\\/g, '\\\\')
+            .replace(/'/g, "\\'")
+            .replace(/\r/g, '\\r')
+            .replace(/\n/g, '\\n')
+    );
 }
 
 function getToolMeta(tool) {
@@ -922,6 +930,11 @@ async function sendMessage(messageOverride = null, options = {}) {
     const msg = hasOverride ? messageOverride.trim() : chatInput.value.trim();
     const imagesToSend = hasOverride ? [] : [...selectedImages];
     if (!msg && !imagesToSend.length) return;
+
+    // 手改仲裁提示：让用户知道服务端会以他手改后的版本为基础继续（每回合发送时至多一次）
+    if (codeDirty === true) {
+        showToast('检测到你手改过代码，本轮将在你的版本基础上继续', 'info');
+    }
 
     addUserMessage(options.displayText || msg, imagesToSend);
     if (!hasOverride) {
@@ -1544,7 +1557,39 @@ function buildExportFilename(code) {
     return `${title}-${ymd}.html`;
 }
 
-document.getElementById('btn-export').addEventListener('click', () => {
+// 把导出副本中引用的 /assets/ 服务器路径内联成 base64 data URI，
+// 否则 HTML 文件发给别人后素材全部 404。编辑器原文不动，只改导出副本。
+async function inlineAssetPaths(code) {
+    const re = /['"`](\/assets\/[^'"`\s]+)['"`]/g;
+    const found = new Set();
+    let m;
+    while ((m = re.exec(code)) !== null) found.add(m[1]);
+    // 长路径优先替换，避免短路径是长路径前缀时截断替换
+    const paths = [...found].sort((a, b) => b.length - a.length);
+    let result = code;
+    let inlined = 0;
+    let failed = 0;
+    for (const path of paths) {
+        try {
+            const res = await fetch(path);
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const blob = await res.blob();
+            const dataUri = await new Promise((resolve, reject) => {
+                const fr = new FileReader();
+                fr.onload = () => resolve(fr.result);
+                fr.onerror = () => reject(fr.error || new Error('读取失败'));
+                fr.readAsDataURL(blob);
+            });
+            result = result.split(path).join(dataUri);
+            inlined++;
+        } catch (_) {
+            failed++;  // 该项跳过，保留原路径
+        }
+    }
+    return { code: result, total: paths.length, inlined, failed };
+}
+
+document.getElementById('btn-export').addEventListener('click', async () => {
     const code = editor ? editor.getValue() : '';
     const trimmed = code.trim();
     // 为空，或仍是初始占位注释（以 <!-- 开头且整份代码不含 <html）→ 没东西可导
@@ -1553,7 +1598,25 @@ document.getElementById('btn-export').addEventListener('click', () => {
         return;
     }
     const filename = buildExportFilename(code);
-    const blob = new Blob([code], { type: 'text/html' });
+
+    let exportCode = code;
+    let inlineInfo = null;
+    if (/['"`]\/assets\//.test(code)) {
+        const loading = showToast('正在内联素材，请稍候...', 'info', 10 * 60 * 1000);
+        try {
+            inlineInfo = await inlineAssetPaths(code);
+            exportCode = inlineInfo.code;
+        } finally {
+            removeToast(loading);
+        }
+        const totalBytes = new Blob([exportCode]).size;
+        if (totalBytes > 10 * 1024 * 1024) {
+            const mb = (totalBytes / (1024 * 1024)).toFixed(1);
+            if (!await showConfirm(`内联素材后文件约 ${mb} MB，继续导出？`)) return;
+        }
+    }
+
+    const blob = new Blob([exportCode], { type: 'text/html' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
@@ -1562,7 +1625,13 @@ document.getElementById('btn-export').addEventListener('click', () => {
     a.click();
     a.remove();
     URL.revokeObjectURL(url);
-    showToast(`已导出 ${filename}`, 'success');
+    if (inlineInfo && inlineInfo.total) {
+        const failNote = inlineInfo.failed ? `，${inlineInfo.failed} 个失败保留原路径` : '';
+        showToast(`已导出 ${filename}（内联 ${inlineInfo.inlined} 个素材文件${failNote}）`,
+            inlineInfo.failed ? 'info' : 'success', inlineInfo.failed ? 6000 : 4000);
+    } else {
+        showToast(`已导出 ${filename}`, 'success');
+    }
 });
 
 
@@ -1573,14 +1642,26 @@ document.getElementById('btn-new').addEventListener('click', async () => {
     }
 });
 
+// 保存对话框的默认项目名：代码 <title>（提取逻辑同 buildExportFilename）+ MM-DD HH:mm；
+// 无 title 用「未命名游戏」兜底，方便项目列表里一眼区分多次保存
+function buildDefaultProjectName(code) {
+    const m = String(code || '').match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+    let title = m ? m[1].trim() : '';
+    if (title.length > 40) title = title.slice(0, 40);
+    if (!title) title = '未命名游戏';
+    const now = new Date();
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${title} ${pad(now.getMonth() + 1)}-${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}`;
+}
+
 document.getElementById('btn-save').addEventListener('click', async () => {
     if (!editor) {
         showToast('编辑器尚未就绪，请稍候再试', 'info');
         return;
     }
-    const name = await showPrompt('项目名称:', '我的游戏');
-    if (!name) return;
     const code = editor.getValue();
+    const name = await showPrompt('项目名称:', buildDefaultProjectName(code));
+    if (!name) return;
     try {
         const res = await fetch('/api/projects', {
             method: 'POST',
@@ -1601,6 +1682,15 @@ document.getElementById('btn-load').addEventListener('click', async () => {
     openModal('modal-projects');
 });
 
+// created_at（ISO8601 或 null）→ 本地化 YYYY/M/D HH:mm；旧数据无时间戳显示「较早」
+function formatProjectCreatedAt(iso) {
+    if (!iso) return '较早';
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return '较早';
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
 async function loadProjects() {
     try {
         const res = await fetch('/api/projects');
@@ -1611,15 +1701,21 @@ async function loadProjects() {
             list.innerHTML = '<p style="color:#aaa;text-align:center">暂无项目</p>';
             return;
         }
-        list.innerHTML = projects.map(p => `
+        list.innerHTML = projects.map(p => {
+            const metaParts = [formatProjectCreatedAt(p.created_at)];
+            if (p.line_count != null) metaParts.push(`${Number(p.line_count)} 行`);
+            return `
             <div class="project-item">
-                <span class="name">📁 ${escapeHtml(p.name || '未命名项目')}</span>
+                <div class="project-info">
+                    <span class="name">📁 ${escapeHtml(p.name || '未命名项目')}</span>
+                    <span class="project-meta">${escapeHtml(metaParts.join(' · '))}</span>
+                </div>
                 <div class="actions">
                     <button onclick="loadProject('${p.project_id}')" title="加载">📂</button>
                     <button onclick="deleteProject('${p.project_id}')" title="删除">🗑️</button>
                 </div>
-            </div>
-        `).join('');
+            </div>`;
+        }).join('');
     } catch (err) {
         console.error('加载项目失败:', err);
     }
@@ -1699,11 +1795,14 @@ document.getElementById('btn-upload').addEventListener('click', async () => {
     document.getElementById('asset-tags').value = '';
     await loadAssets();
     const ok = files.length - failed.length;
+    // 图片素材会在服务端后台线程生成 AI 描述，提示用户稍后刷新（仅本次含图片时）
+    const hasImage = files.some(f => pickAssetType(f, fallbackType) === 'image');
+    const describeNote = (ok > 0 && hasImage) ? '\n图片素材正在后台生成 AI 描述，稍后刷新可见' : '';
     // 别再无条件报成功：有失败就如实告知
     if (failed.length) {
-        showToast(`成功 ${ok}/${files.length}，失败 ${failed.length}：\n` + failed.join('\n'), 'error', 8000);
+        showToast(`成功 ${ok}/${files.length}，失败 ${failed.length}：\n` + failed.join('\n') + describeNote, 'error', 8000);
     } else {
-        showToast(`全部上传成功！共 ${ok} 个文件`, 'success');
+        showToast(`全部上传成功！共 ${ok} 个文件${describeNote}`, 'success');
     }
 });
 
@@ -1787,20 +1886,27 @@ async function loadAssets() {
             const tagBadges = tags.length
                 ? tags.map(t => `<span class="asset-tag">${escapeHtml(t)}</span>`).join('')
                 : '<span class="asset-tag none">无标注</span>';
-            // 从 document 中提取纯描述文本（去掉 [audio] 前缀和 | 标签: 后缀）
+            // 描述优先取结构化字段；旧素材没有该字段时才从 document 回解
+            // （[\s\S] 而非 . ：AI 生成的描述含换行，用 . 会整条匹配失败显示"无标注"）
             const docText = a.document || '';
-            const descMatch = docText.match(/\]\s+\S+\s*-\s*(.+?)(?:\s*\|\s*标签:.*)?$/);
-            const desc = descMatch ? descMatch[1] : '';
+            const descMatch = docText.match(/\]\s+\S+\s*-\s*([\s\S]+?)(?:\s*\|\s*标签:[\s\S]*)?$/);
+            const desc = (a.description || (descMatch ? descMatch[1] : '') || '').trim();
             const descHtml = desc ? `<span class="asset-desc">${escapeHtml(desc)}</span>` : '';
+            // 图片且无描述 → 提供 AI 生成描述入口；所有素材可手动编辑描述
+            const describeBtn = (a.asset_type === 'image' && !desc)
+                ? `<button class="asset-describe-btn" onclick="describeAsset('${jsStr(aid)}')" title="用 AI 生成描述">✨ 生成描述</button>`
+                : '';
             return `
             <div class="asset-item">
                 <div class="asset-info">
                     <span class="name">${getTypeIcon(a.asset_type)} ${escapeHtml(a.file_name || '')}</span>
                     <span class="asset-tags">${tagBadges}</span>
                     ${descHtml}
+                    ${describeBtn}
                 </div>
                 <code style="font-size:11px;color:#666;margin:0 8px;white-space:nowrap">${escapeHtml(url)}</code>
                 <div class="actions">
+                    <button onclick="editAssetDescription('${jsStr(aid)}', '${jsStr(desc)}')" title="编辑描述">✏️</button>
                     <button onclick="deleteAsset('${aid}')" title="删除">🗑️</button>
                 </div>
             </div>`;
@@ -1824,6 +1930,39 @@ async function deleteAsset(id) {
         showToast('删除失败: ' + err.message, 'error');
     }
 }
+
+// 同步调用视觉模型给图片素材补中文描述；502 时 ensureOk 会取出 detail.message
+async function describeAsset(id) {
+    const loading = showToast('正在调用视觉模型生成描述，请稍候...', 'info', 10 * 60 * 1000);
+    try {
+        await ensureOk(await fetch(`/api/assets/${encodeURIComponent(id)}/describe`, { method: 'POST' }));
+        await loadAssets();
+        showToast('已生成 AI 描述', 'success');
+    } catch (err) {
+        showToast('生成描述失败: ' + err.message, 'error', 6000);
+    } finally {
+        removeToast(loading);
+    }
+}
+window.describeAsset = describeAsset;
+
+// 手动编辑素材描述（PATCH /api/assets/{id}，只发 description 字段）
+async function editAssetDescription(id, currentDesc) {
+    const desc = await showPrompt('素材描述:', currentDesc || '');
+    if (desc === null) return;  // 取消；空字符串允许提交（清空描述）
+    try {
+        await ensureOk(await fetch(`/api/assets/${encodeURIComponent(id)}`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ description: desc }),
+        }));
+        await loadAssets();
+        showToast('描述已更新', 'success');
+    } catch (err) {
+        showToast('更新描述失败: ' + err.message, 'error');
+    }
+}
+window.editAssetDescription = editAssetDescription;
 
 // 拖拽上传
 const uploadZone = document.getElementById('upload-zone');

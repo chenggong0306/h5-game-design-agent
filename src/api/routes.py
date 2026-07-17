@@ -24,6 +24,7 @@ from starlette.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from src.knowledge.knowledge_base import KnowledgeBase
+from src.knowledge.asset_describer import describe_image
 from src.knowledge.source_asset_metadata import (
     SOURCE_ASSET_METADATA_KEYS,
     SOURCE_ASSET_METADATA_VERSION,
@@ -618,6 +619,28 @@ def _unlink_missing_ok(path: str) -> None:
         pass
 
 
+# 图片类素材上传后自动补中文描述（后台线程，不阻塞上传响应）
+_AUTO_DESCRIBE_ASSET_TYPES = {"image", "spritesheet"}
+
+
+def _auto_describe_asset(asset_id: str, file_path: str) -> None:
+    """后台线程体：视觉模型生成中文描述并回填 ChromaDB。失败只记日志，不影响已入库素材。"""
+    try:
+        desc = describe_image(file_path)
+        if desc:
+            kb.update_asset_description(asset_id, desc)
+            logger.info("素材自动描述完成 (asset=%s, chars=%d)", asset_id, len(desc))
+    except Exception as e:  # describe_image 自身不抛，这里兜底 ChromaDB 更新等意外
+        logger.warning("素材自动描述失败 (asset=%s): %s", asset_id, e)
+
+
+def _schedule_auto_describe(asset_id: str, file_path: str) -> None:
+    """调度后台描述线程（daemon：不阻塞进程退出）。"""
+    threading.Thread(
+        target=_auto_describe_asset, args=(asset_id, file_path), daemon=True,
+    ).start()
+
+
 @router.post("/api/assets/upload")
 async def upload_asset(
     file: UploadFile = File(...),
@@ -657,6 +680,9 @@ async def upload_asset(
         )
         # 添加可引用的 URL
         result["url"] = f"/assets/{asset_type}/{result['asset_id']}{result.get('extension', '')}"
+        # 图片素材且用户没手填描述 → 后台线程自动补中文描述（不阻塞响应，响应形状不变）
+        if asset_type in _AUTO_DESCRIBE_ASSET_TYPES and not description.strip():
+            _schedule_auto_describe(result["asset_id"], result["file_path"])
         return result
     finally:
         await asyncio.to_thread(_unlink_missing_ok, tmp_path)  # 删除也是磁盘 I/O，放线程
@@ -681,6 +707,51 @@ async def delete_asset(asset_id: str):
     if not ok:
         raise HTTPException(status_code=404, detail="素材不存在")
     return {"ok": True}
+
+
+class AssetPatchRequest(BaseModel):
+    description: str | None = None
+    tags: list[str] | None = None
+
+
+def _asset_with_url(asset: dict) -> dict:
+    """给素材对象补上可引用 URL（与上传响应同款字段）。"""
+    atype = asset.get("asset_type", "image")
+    aid = asset.get("asset_id") or asset.get("id", "")
+    asset["url"] = f"/assets/{atype}/{aid}{asset.get('extension', '')}"
+    return asset
+
+
+@router.patch("/api/assets/{asset_id}")
+async def patch_asset(asset_id: str, req: AssetPatchRequest):
+    """更新素材描述/标签（省略的字段不改动），返回更新后的素材对象。"""
+    updated = await asyncio.to_thread(
+        kb.update_asset_annotation, asset_id, req.description, req.tags,
+    )
+    if updated is None:
+        raise HTTPException(status_code=404, detail="素材不存在")
+    return _asset_with_url(updated)
+
+
+@router.post("/api/assets/{asset_id}/describe")
+async def describe_asset(asset_id: str):
+    """同步调用视觉模型为素材生成中文描述并入库（供旧素材手动补描述）。"""
+    asset = await asyncio.to_thread(kb.get_asset, asset_id)
+    if asset is None:
+        raise HTTPException(status_code=404, detail="素材不存在")
+    desc = await asyncio.to_thread(describe_image, asset.get("file_path", ""))
+    if not desc:
+        raise HTTPException(status_code=502, detail={
+            "code": "DESCRIBE_FAILED",
+            "message": "视觉模型生成描述失败：模型不支持图片输入、调用超时或出错，请检查模型配置后重试。",
+        })
+    ok = await asyncio.to_thread(kb.update_asset_description, asset_id, desc)
+    if not ok:
+        raise HTTPException(status_code=502, detail={
+            "code": "DESCRIBE_FAILED",
+            "message": "描述已生成但写入知识库失败，请重试。",
+        })
+    return {"description": desc}
 
 
 # ============ CSV 批量导入 ============
