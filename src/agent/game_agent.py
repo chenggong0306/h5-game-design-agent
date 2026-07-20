@@ -1019,6 +1019,11 @@ def _skill_source_statuses(skill: dict) -> dict[str, str]:
         if item.get("path")
     }
     statuses.update({str(path): "asset" for path in skill.get("asset_paths") or [] if path})
+    # 运行时库（kind=library）优先标 library：它可回源+可 <script src> 引入+导出内联，
+    # 属可运行依赖，必须盖过上面 asset_paths 给出的通用 "asset"（否则忠实移植会误判不可运行）。
+    for asset in skill.get("source_assets") or []:
+        if asset.get("kind") == "library" and asset.get("path"):
+            statuses[str(asset["path"])] = "library"
     stored_manifest = (skill.get("source_summary") or {}).get("web_bundle") or {}
     for dependency in stored_manifest.get("dependencies") or []:
         path = dependency.get("resolved_path")
@@ -1163,11 +1168,32 @@ def build_faithful_source_port(skill: dict, entrypoint: str = "", mode: str = ""
         parser.feed(original_html)
     except Exception:
         pass
+    # 运行时库路径 → 可回源 URL，用于把 <script src> 改指向已保存的库副本
+    library_urls = {
+        str(a.get("path") or ""): str(a.get("url") or "")
+        for a in (skill.get("source_assets") or [])
+        if a.get("kind") == "library" and a.get("path") and a.get("url")
+    }
     replacements: list[tuple[int, int, str]] = []
     dependencies = manifest.get("dependencies") or []
     for parsed, dependency in zip(parser.dependencies, dependencies):
         path = str(dependency.get("resolved_path") or "")
         source = source_map.get(path)
+        # 运行时库：不内联（内容未读），把标签 src 改指向服务 URL，浏览器 <script src> 加载。
+        if dependency.get("status") == "library" and path in library_urls:
+            raw_tag = str(parsed.get("raw_tag") or "")
+            new_ref = html_lib.escape(library_urls[path], quote=True)
+            attr = "href" if dependency.get("kind") == "stylesheet" else "src"
+            replacement = re.sub(
+                r'''(?is)\s+(?:src|href)\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)''',
+                f' {attr}="{new_ref}"',
+                raw_tag,
+                count=1,
+            )
+            start, end = parsed.get("start_offset"), parsed.get("end_offset")
+            if isinstance(start, int) and isinstance(end, int):
+                replacements.append((start, end, replacement))
+            continue
         if dependency.get("status") != "readable" or not source:
             raise ValueError(f"运行依赖不可用：{dependency.get('reference') or path}")
         content = _rewrite_source_asset_urls(
@@ -1642,7 +1668,23 @@ def load_skill(skill_name: str) -> str:
                     max_items=24,
                 ) if long_source_paths else ""
                 legacy_asset_paths = skill.get("asset_paths") or []
-                source_assets = skill.get("source_assets") or []
+                all_source_assets = skill.get("source_assets") or []
+                library_assets = [a for a in all_source_assets if a.get("kind") == "library"]
+                source_assets = [a for a in all_source_assets if a.get("kind") != "library"]
+                if library_assets:
+                    lib_lines = "\n".join(
+                        f"- `{a.get('file_name') or a.get('path', '')}` → `{a.get('url', '')}`"
+                        for a in library_assets[:20]
+                    )
+                    result += (
+                        "\n\n### 运行时库（直接引入，勿当源码阅读）\n"
+                        "本项目依赖以下第三方运行时库，已保存并可回源。"
+                        "要忠实还原（如 three.js 的 3D、jQuery 的 DOM），"
+                        "**在生成游戏的 `<head>` 里用 `<script src=\"上面的URL\"></script>` 引入**，"
+                        "然后按该库真实 API 写游戏逻辑——**不要**把这些压缩库当源码读取，"
+                        "也**不要**因为库很大就退回纯 Canvas 重造它的能力（那是质量倒退）。\n"
+                        + lib_lines
+                    )
                 result += (
                     "\n\n## 源码参考项目\n\n"
                     f"复用模式：`{source_mode}`（{mode_label(source_mode)}）；"
@@ -1716,7 +1758,11 @@ def load_skill_assets(
     allowed_kinds = {"image", "audio", "font", "tilemap"}
     if kind and kind not in allowed_kinds:
         return "asset_type 仅支持 image、audio、font、tilemap 或空字符串。"
-    selected = [asset for asset in assets if not kind or asset.get("kind") == kind]
+    # 运行时库（kind=library）由 load_skill 的「运行时库」区块单独引导，不在此按素材列出
+    selected = [
+        asset for asset in assets
+        if asset.get("kind") != "library" and (not kind or asset.get("kind") == kind)
+    ]
     raw_query = (query or "").strip().lower()
     wants_branding = any(
         marker in raw_query
@@ -3047,6 +3093,7 @@ SYSTEM_PROMPT = """你是一个专业的 H5 页面游戏设计 AI 助手，帮�
    - **阵营与动画序列**：源码同时提供 `-b/-r`、blue/red 或 walk/attack 变体时，敌我必须使用各自素材；不能只把同一套蓝方角色水平镜像。规则网格不代表可按 `0..N` 顺序播放，必须读取源码的 `sideWalk/sideAttack` 等方向序列，禁止让角色在上下左右帧之间跳变。
    - **玩法资源必须闭环**：无限刷新的敌军必须对应可循环抽取/回收的玩家卡组；多条线路上的多座塔必须有独立状态，不能两座视觉塔共用一条 HP。兵种说明只能写真实实现的能力，未实现冰冻/自爆/破甲就不要宣称已经实现。
    - **尊重参考布局**：如果源码已有 480×640 等设计坐标、上下/左右行军方向和背景图，按等比缩放/letterbox 复用该坐标系，不要擅自翻转对战方向；已加载的主背景必须实际绘制。
+   - **运行时库直接引入**：源码若依赖 three.js / jQuery 等运行时库，`load_skill` 的「运行时库」区块会给出可回源的 URL——在生成游戏 `<head>` 用 `<script src="该URL"></script>` 引入，按库真实 API 写逻辑（如 three.js 做真 3D）。**不要**把压缩库当源码读，也**不要**因为它大就退回纯 Canvas 重造该能力——那会把 3D 游戏做成劣化的 2D 模拟。
 4. 明确用户需求后再写 HTML，且必须满足下方【质量底线】
 5. **强烈建议**：先判断游戏品类，加载对应**品类模板**技能（含该品类经过验证的承重代码，直接 lift 改写远胜从零写）：
    - 横版动作/格斗 → `load_skill("genre_action")`

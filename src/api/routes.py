@@ -30,6 +30,11 @@ from src.knowledge.source_asset_metadata import (
     SOURCE_ASSET_METADATA_VERSION,
     enrich_source_asset_metadata,
 )
+from src.knowledge.source_modes import (
+    SOURCE_MODES,
+    normalise_source_mode,
+    web_bundle_readiness,
+)
 from src.agent.game_agent import (
     GameDesignAgent,
     SKILLS,
@@ -328,6 +333,7 @@ class ChatResponse(BaseModel):
     # 本回合参考摘要：{"skills": [{"name", "web_bundle", "source_reads", "assets"}]}；
     # 未用任何技能工具时为 null（与流式 done 事件的同名字段保持一致）
     reference_summary: dict | None = None
+    verification: dict | None = None
 
 
 class ProjectSaveRequest(BaseModel):
@@ -996,6 +1002,9 @@ _SOURCE_ASSET_MEDIA_TYPES = {
     ".aac": "audio/aac", ".opus": "audio/ogg", ".ttf": "font/ttf",
     ".otf": "font/otf", ".woff": "font/woff", ".woff2": "font/woff2",
     ".json": "application/json", ".tmx": "application/xml",
+    # 运行时库（three.js/jQuery 等）：作为可服务资产回源，供生成的游戏 <script src> 引入。
+    # 用显式 text/javascript + nosniff 头，浏览器按脚本执行、不做 HTML 嗅探。
+    ".js": "text/javascript", ".mjs": "text/javascript", ".css": "text/css",
 }
 _SOURCE_ASSET_MANIFEST = "manifest.json"
 
@@ -1113,6 +1122,7 @@ class SkillCreateRequest(BaseModel):
 class SkillUpdateRequest(BaseModel):
     description: str = Field(min_length=1, max_length=500)
     content: str = Field(max_length=100000)
+    source_mode: str | None = None
 
 
 _SOURCE_TEXT_EXTS = {
@@ -1136,7 +1146,26 @@ _SOURCE_MAX_UPLOAD_PARTS = 5000
 _SOURCE_MAX_FILE_BYTES = 2 * 1024 * 1024
 _SOURCE_MAX_TEXT_BYTES = 2 * 1024 * 1024
 _SOURCE_MAX_ASSET_PATHS = 2000
-_SOURCE_USABLE_ASSET_EXTS = set().union(*_ALLOWED_ASSET_EXTS.values())
+_SOURCE_USABLE_ASSET_EXTS = set().union(*_ALLOWED_ASSET_EXTS.values()) | {".js", ".mjs", ".css"}
+# 运行时库文件名判定：压缩库（*.min.js/.min.css）或常见引擎/框架库。
+# 命中者作为「可服务但不可读」的运行时资产回源，供生成游戏 <script src> 引入，
+# 既不塞进模型可读文本预算，也不让 AI 退回纯 Canvas 重造该库能力。
+_KNOWN_LIB_STEMS = (
+    "three", "jquery", "zepto", "phaser", "pixi", "createjs", "easeljs",
+    "tweenjs", "preloadjs", "soundjs", "matter", "matter-js", "howler",
+    "p5", "melonjs", "impact", "babylon", "cannon", "box2d", "planck",
+)
+
+
+def _is_runtime_library(name_lower: str, suffix: str) -> bool:
+    if suffix not in {".js", ".mjs", ".css"}:
+        return False
+    if name_lower.endswith((".min.js", ".min.css")):
+        return True
+    stem = name_lower.rsplit(".", 1)[0]
+    # three.js / jquery-3.6.0 / pixi.min 等：库名作为文件名主干或其连字/点分片段
+    tokens = _re.split(r"[.\-_]", stem)
+    return any(t in _KNOWN_LIB_STEMS for t in tokens)
 _SOURCE_ASSET_BUNDLE_RE = _re.compile(r"^[a-f0-9]{32}$")
 _SOURCE_ASSET_TEMP_RE = _re.compile(r"^\.tmp-[a-f0-9]{32}$")
 
@@ -1406,6 +1435,31 @@ def _build_source_reference(
             skipped.append(f"{path}: 第三方或构建目录")
             skipped_details.append(_skip_detail(path, "third_party_lib", _SKIP_HINT_THIRD_PARTY))
             continue
+        # 运行时库：不当可读源码（536KB 压缩 three.js 读进上下文是灾难），而是作为
+        # 「可服务但不可读」的资产回源，生成游戏用 <script src> 引入即可忠实还原。
+        if _is_runtime_library(name_lower, suffix):
+            if len(raw) > _SOURCE_MAX_FILE_BYTES:
+                path_statuses[path] = "skipped"
+                skipped.append(f"{path}: 运行时库超过 {_SOURCE_MAX_FILE_BYTES // (1024 * 1024)}MB")
+                skipped_details.append(_skip_detail(
+                    path, "too_large",
+                    "运行时库超过单文件大小上限，未保存，游戏无法引用它"))
+                continue
+            if len(asset_files) >= _SOURCE_MAX_ASSET_PATHS:
+                path_statuses[path] = "skipped"
+                skipped.append(f"{path}: 资源文件数超过 {_SOURCE_MAX_ASSET_PATHS} 个")
+                skipped_details.append(_skip_detail(
+                    path, "too_large",
+                    "资源数量超出上限未保存，游戏中会缺少这部分素材"))
+                continue
+            path_statuses[path] = "library"
+            asset_files.append({
+                "path": path,
+                "kind": "library",
+                "size": len(raw),
+                "content": raw,
+            })
+            continue
         if suffix in _SOURCE_ASSET_EXTS:
             kind = _source_asset_kind(suffix)
             if not kind:
@@ -1437,7 +1491,12 @@ def _build_source_reference(
                 path, "unsupported_type",
                 "不支持的文件类型，AI 不会读取该文件内容"))
             continue
-        if name_lower.endswith((".min.js", ".min.css")) or name_lower in {
+        # A local minified browser library is runtime code, not disposable reference
+        # material.  Dropping it made otherwise complete projects impossible to port
+        # faithfully (Fishjoy lost Quark and could only be rewritten from scratch).
+        # Keep it with a runtime_only marker so the mechanical port can inline it;
+        # model-facing source tools may still avoid treating it as useful reading.
+        if name_lower in {
             "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "uv.lock",
         }:
             path_statuses[path] = "skipped_vendor"
@@ -1479,6 +1538,7 @@ def _build_source_reference(
             "size": len(raw),
             "lines": text.count("\n") + 1,
             "content": text,
+            **({"runtime_only": True} if name_lower.endswith((".min.js", ".min.css")) else {}),
         })
         path_statuses[path] = "readable"
         total_text_bytes += len(raw)
@@ -1496,6 +1556,7 @@ def _build_source_reference(
     )
     web_bundle = build_source_web_manifest(source_files, entrypoint, path_statuses)
     web_dependencies = web_bundle.get("dependencies") or []
+    runnable, readiness_issues = web_bundle_readiness(web_bundle)
     summary = {
         "asset_metadata_version": SOURCE_ASSET_METADATA_VERSION,
         "source_file_count": len(source_files),
@@ -1510,6 +1571,8 @@ def _build_source_reference(
             1 for item in web_dependencies if item.get("status") == "readable"
         ),
         "web_bundle": web_bundle,
+        "runnable": runnable,
+        "readiness_issues": readiness_issues,
     }
     return source_files, asset_files, summary, skipped, skipped_details
 
@@ -1539,6 +1602,7 @@ def _source_skill_record(
     source_assets: list[dict],
     source_asset_bundle_id: str | None,
     summary: dict,
+    source_mode: str = "",
 ) -> dict:
     notes = content.strip() or (
         "这是一个完整游戏项目的源码参考。先查看源码清单，按需读取入口文件和核心逻辑；"
@@ -1553,6 +1617,7 @@ def _source_skill_record(
         "source_assets": source_assets,
         "source_asset_bundle_id": source_asset_bundle_id,
         "source_summary": summary,
+        "source_mode": normalise_source_mode(source_mode, summary.get("web_bundle")),
     }
 
 
@@ -1602,6 +1667,9 @@ def backfill_source_asset_metadata() -> int:
 def _public_skill(skill: dict, *, detail: bool = False) -> dict:
     _ensure_source_skill_asset_metadata(skill)
     source_summary = skill.get("source_summary") or {}
+    source_runnable, readiness_issues = web_bundle_readiness(
+        source_summary.get("web_bundle") or {}
+    )
     payload = {
         "name": skill["name"],
         "description": skill.get("description", ""),
@@ -1609,6 +1677,10 @@ def _public_skill(skill: dict, *, detail: bool = False) -> dict:
         "asset_file_count": len(skill.get("asset_paths") or []),
         "usable_asset_count": len(skill.get("source_assets") or []),
         "web_dependency_count": source_summary.get("web_dependency_count", 0),
+        "source_mode": normalise_source_mode(
+            skill.get("source_mode"), source_summary.get("web_bundle")
+        ) if skill.get("source_files") else None,
+        "source_runnable": source_runnable,
     }
     if detail:
         payload["content"] = skill.get("content", "")
@@ -1629,6 +1701,7 @@ def _public_skill(skill: dict, *, detail: bool = False) -> dict:
             for item in skill.get("source_assets") or []
         ]
         payload["source_summary"] = source_summary
+        payload["source_readiness_issues"] = readiness_issues
     return payload
 
 
@@ -1666,13 +1739,31 @@ async def update_skill(skill_name: str, req: SkillUpdateRequest):
             if s["name"] == skill_name:
                 old_description = s.get("description", "")
                 old_content = s.get("content", "")
+                old_source_mode = s.get("source_mode")
+                requested_mode = str(req.source_mode or "").strip().lower()
+                if requested_mode:
+                    if requested_mode not in SOURCE_MODES:
+                        raise HTTPException(400, "源码模式必须是 faithful_port、extend 或 inspired")
+                    if not s.get("source_files"):
+                        raise HTTPException(400, "普通说明技能没有源码复用模式")
+                    runnable, reasons = web_bundle_readiness(
+                        (s.get("source_summary") or {}).get("web_bundle") or {}
+                    )
+                    if requested_mode in {"faithful_port", "extend"} and not runnable:
+                        raise HTTPException(400, "源码运行依赖不完整：" + "；".join(reasons))
                 s["description"] = req.description
                 s["content"] = req.content
+                if requested_mode:
+                    s["source_mode"] = requested_mode
                 try:
                     await asyncio.to_thread(_sync_skills)
                 except Exception:
                     s["description"] = old_description
                     s["content"] = old_content
+                    if old_source_mode is None:
+                        s.pop("source_mode", None)
+                    else:
+                        s["source_mode"] = old_source_mode
                     raise
                 return {"ok": True, "name": skill_name}
     raise HTTPException(404, f"技能 '{skill_name}' 不存在")
@@ -1685,6 +1776,7 @@ async def _save_source_skill(
     content: str,
     files: list[UploadFile],
     replace: bool,
+    source_mode: str = "",
 ) -> dict:
     clean_name = name.strip()
     clean_description = description.strip()
@@ -1696,6 +1788,9 @@ async def _save_source_skill(
         raise HTTPException(400, "技能补充说明最多 100000 个字符")
     if not files:
         raise HTTPException(400, "请选择源码文件夹或源码 ZIP")
+    requested_mode = (source_mode or "").strip().lower()
+    if requested_mode and requested_mode not in SOURCE_MODES:
+        raise HTTPException(400, "源码模式必须是 faithful_port、extend 或 inspired")
 
     uploaded = await _read_source_uploads(files)
     try:
@@ -1718,7 +1813,12 @@ async def _save_source_skill(
         source_assets,
         bundle_id,
         summary,
+        requested_mode,
     )
+    if record["source_mode"] in {"faithful_port", "extend"} and not summary.get("runnable"):
+        detail = "；".join(summary.get("readiness_issues") or []) or "源码运行依赖不完整"
+        await asyncio.to_thread(_delete_unreferenced_source_asset_bundle, bundle_id)
+        raise HTTPException(400, f"当前源码不能使用 {record['source_mode']}：{detail}")
     committed = False
     try:
         async with _skills_mutation_lock:
@@ -1757,6 +1857,8 @@ async def _save_source_skill(
         "skipped": skipped[:50],
         # 结构化跳过明细（与 skipped 同源同序，截断上限保持一致）
         "skipped_details": skipped_details[:50],
+        "source_mode": record["source_mode"],
+        "source_runnable": bool(summary.get("runnable")),
     }
 
 
@@ -1765,11 +1867,13 @@ async def add_source_skill(
     name: str = Form(...),
     description: str = Form(...),
     content: str = Form(""),
+    source_mode: str = Form(""),
     files: list[UploadFile] = File(...),
 ):
     """把一个源码文件夹或 ZIP 作为一个游戏参考技能导入。"""
     return await _save_source_skill(
-        name=name, description=description, content=content, files=files, replace=False
+        name=name, description=description, content=content, files=files, replace=False,
+        source_mode=source_mode,
     )
 
 
@@ -1778,6 +1882,7 @@ async def replace_source_skill(
     skill_name: str,
     description: str = Form(...),
     content: str = Form(""),
+    source_mode: str = Form(""),
     files: list[UploadFile] = File(...),
 ):
     """替换现有技能的源码参考。"""
@@ -1787,6 +1892,7 @@ async def replace_source_skill(
         content=content,
         files=files,
         replace=True,
+        source_mode=source_mode,
     )
 
 @router.delete("/api/skills/{skill_name}")

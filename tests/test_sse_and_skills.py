@@ -20,6 +20,7 @@ from src.agent.game_agent import (
     load_skill_assets,
     load_skill_source,
     load_skill_web_bundle,
+    port_skill_source,
     search_skill_source,
 )
 
@@ -228,13 +229,14 @@ class SkillsApiTests(unittest.TestCase):
             )
         self.assertEqual(r.status_code, 200, r.text)
         body = r.json()
+        # jquery.min.js 不再是可读源码，改为可服务的运行时库资产。
         self.assertEqual(body["source_file_count"], 3)
-        self.assertEqual(body["asset_file_count"], 1)
-        self.assertEqual(body["usable_asset_count"], 1)
+        self.assertEqual(body["asset_file_count"], 2)   # player.png + jquery.min.js(library)
+        self.assertEqual(body["usable_asset_count"], 2)
         self.assertEqual(body["entrypoint"], "demo/index.html")
         self.assertEqual(body["web_dependency_count"], 3)
-        self.assertEqual(body["web_readable_dependency_count"], 2)
-        self.assertGreaterEqual(body["skipped_count"], 1)
+        self.assertEqual(body["skipped_count"], 0)
+        self.assertEqual(body["source_mode"], "faithful_port")
 
         detail = self.client.get("/api/skills/platform_demo").json()
         self.assertEqual(detail["source_file_count"], 3)
@@ -243,9 +245,16 @@ class SkillsApiTests(unittest.TestCase):
             ["demo/css/style.css", "demo/index.html", "demo/js/game.js"],
         )
         self.assertNotIn("content", detail["source_files"][0])
-        self.assertEqual(detail["usable_asset_count"], 1)
-        self.assertEqual(detail["source_assets"][0]["path"], "demo/images/player.png")
-        asset_url = detail["source_assets"][0]["url"]
+        # 运行时库以 kind=library 保存，带可回源 URL
+        lib = next(a for a in detail["source_assets"] if a["path"] == "demo/js/jquery.min.js")
+        self.assertEqual(lib["kind"], "library")
+        lib_response = self.client.get(lib["url"])
+        self.assertEqual(lib_response.status_code, 200)
+        self.assertEqual(lib_response.content, b"/*! vendor */")
+        self.assertTrue(lib_response.headers["content-type"].startswith("text/javascript"))
+        self.assertEqual(lib_response.headers["x-content-type-options"], "nosniff")
+        img = next(a for a in detail["source_assets"] if a["path"] == "demo/images/player.png")
+        asset_url = img["url"]
         self.assertTrue(asset_url.startswith("/assets/source/"))
         asset_response = self.client.get(asset_url)
         self.assertEqual(asset_response.status_code, 200)
@@ -259,7 +268,7 @@ class SkillsApiTests(unittest.TestCase):
             [(item["resolved_path"], item["status"]) for item in dependencies],
             [
                 ("demo/css/style.css", "readable"),
-                ("demo/js/jquery.min.js", "skipped_vendor"),
+                ("demo/js/jquery.min.js", "library"),  # 运行时库：可服务、可运行、不可读
                 ("demo/js/game.js", "readable"),
             ],
         )
@@ -269,7 +278,7 @@ class SkillsApiTests(unittest.TestCase):
         self.assertIn("load_skill_source", overview)
         self.assertIn("load_skill_web_bundle", overview)
         self.assertIn("load_skill_assets", overview)
-        self.assertIn("已跳过的第三方/压缩依赖", overview)
+        self.assertIn("port_skill_source", overview)
         bundle = load_skill_web_bundle.invoke({"skill_name": "platform_demo"})
         self.assertIn('style data-source="demo/css/style.css"', bundle)
         self.assertIn("canvas { display: block; }", bundle)
@@ -278,7 +287,8 @@ class SkillsApiTests(unittest.TestCase):
         self.assertIn(asset_url, bundle)
         self.assertNotIn('href="css/style.css"', bundle)
         self.assertNotIn('src="js/game.js"', bundle)
-        self.assertIn('src="js/jquery.min.js"', bundle)
+        # 运行时库不再作为可读内容内联进组合视图；改由 load_skill 引导 <script src> 引入。
+        self.assertNotIn("/*! vendor */", bundle)
         self.assertIn("platform_demo", game_agent._skills_prompt)
         assets = load_skill_assets.invoke({
             "skill_name": "platform_demo",
@@ -288,6 +298,7 @@ class SkillsApiTests(unittest.TestCase):
         self.assertIn("demo/images/player.png", assets)
         self.assertIn(asset_url, assets)
         self.assertIn(load_skill_assets, game_agent.SkillMiddleware.tools)
+        self.assertIn(port_skill_source, game_agent.SkillMiddleware.tools)
         self.assertIn(search_skill_source, game_agent.SkillMiddleware.tools)
         source = load_skill_source.invoke({
             "skill_name": "platform_demo",
@@ -297,6 +308,18 @@ class SkillsApiTests(unittest.TestCase):
         })
         self.assertIn("function startGame", source)
         self.assertIn(asset_url, source)
+
+        skill = next(item for item in routes.SKILLS if item["name"] == "platform_demo")
+        ported = game_agent.build_faithful_source_port(skill)
+        self.assertIn('name="source-port-mode" content="faithful_port"', ported)
+        # 运行时库不再内联其压缩内容，而是把 <script src> 改指向已保存的库副本 URL，
+        # 浏览器 <script src> 加载即可（导出时该 /assets/ 引用会被内联为独立文件）。
+        self.assertNotIn("/*! vendor */", ported)
+        lib_url = next(a["url"] for a in skill["source_assets"]
+                       if a["path"] == "demo/js/jquery.min.js")
+        self.assertIn(f'src="{lib_url}"', ported)
+        self.assertIn(asset_url, ported)
+        self.assertNotIn('src="js/jquery.min.js"', ported)
 
     def test_search_skill_source_is_stable_across_files_and_returns_numbered_context(self):
         skill = {

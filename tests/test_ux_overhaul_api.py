@@ -142,7 +142,7 @@ class SourceImportSkipDetailsTests(unittest.TestCase):
         game_agent._rebuild_skills_prompt()
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def test_third_party_lib_in_skipped_details(self):
+    def test_minified_runtime_lib_is_retained_but_unsupported_file_is_skipped(self):
         files = [
             ("files", ("demo/index.html", b"<!doctype html><script src='js/game.js'></script>", "text/html")),
             ("files", ("demo/js/game.js", b"function start(){return 1;}", "text/javascript")),
@@ -160,10 +160,18 @@ class SourceImportSkipDetailsTests(unittest.TestCase):
         self.assertIn("skipped_details", body)
         self.assertIn("skipped", body)  # 现有字段保留
         details = {item["path"]: item for item in body["skipped_details"]}
-        self.assertIn("demo/js/three.min.js", details)
-        three = details["demo/js/three.min.js"]
-        self.assertEqual(three["reason"], "third_party_lib")
-        self.assertIn("Canvas", three["hint"])  # hint 必须说明只能原生 Canvas 重实现
+        # 运行时库既不丢弃、也不当可读源码：改为「可服务但不可读」的库资产。
+        self.assertNotIn("demo/js/three.min.js", details)
+        # 只有 index.html 和 game.js 是可读源码；three.min.js 不再计入源码文件数。
+        self.assertEqual(body["source_file_count"], 2)
+        saved = next(s for s in _orig_skills if s["name"] == "skip_details_demo")
+        self.assertNotIn("demo/js/three.min.js",
+                         {f["path"] for f in saved["source_files"]})
+        # 库以 kind=library 的源码素材形式保存，带可回源 URL 供 <script src> 引入。
+        three = next(a for a in saved["source_assets"]
+                     if a["path"] == "demo/js/three.min.js")
+        self.assertEqual(three["kind"], "library")
+        self.assertTrue(str(three["url"]).startswith("/assets/source/"))
         # 不支持类型也有结构化明细
         self.assertIn("demo/notes.exe", details)
         self.assertEqual(details["demo/notes.exe"]["reason"], "unsupported_type")
