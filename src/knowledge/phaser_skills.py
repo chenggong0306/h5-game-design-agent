@@ -181,7 +181,11 @@ loadImages({ /* ... */ }, () => { state = 'start'; requestAnimationFrame(loop); 
         "title": "游戏视觉与手感打磨（polish）",
         "category": "polish",
         "tags": ["particles", "screenshake", "easing", "glow", "gradient", "juice"],
-        "content": """高质量游戏必须有视觉反馈和手感，以下是可直接复用的完整实现。
+        "content": """高质量游戏需要视觉反馈和手感，以下是可直接复用的完整实现。
+
+> 注意：下面的**色值（如 `#0a0a1a`/`#0ff`）只是霓虹/深色风格的示例**，不是默认值。
+> 先按游戏题材选美术方向（见 `visual` 技能 §0.5），再把这些色值替换成你选定方向的调色板——
+> 扁平/休闲游戏别照抄这里的深紫蓝渐变和青色发光。机制（粒子/缓动/震动）通用，配色随风格换。
 
 ## 粒子系统
 
@@ -286,7 +290,12 @@ displayScore += (score - displayScore) * Math.min(1, dt * 10);
         "title": "游戏设计规范（gamedesign）",
         "category": "gamedesign",
         "tags": ["difficulty", "feedback", "scoring", "ui", "ux", "progression"],
-        "content": """高质量游戏必须有清晰的设计规范，以下是必须实现的要素。
+        "content": """高质量游戏需要清晰的设计规范，以下是要实现的要素。
+
+> 注意：下面示例里的色值（`#0ff` 青色标题光、`#ff0` 黄色浮字、`#f44` 红色 GAME OVER）
+> 只是**深色霓虹风的示例**。start/over 界面**结构**（标题+说明+得分+最高分+重玩）与 HUD
+> 布局是通用的；**配色请按你选定的美术方向替换**（扁平/浅色风就别用青色发光和深色遮罩）。
+
 
 ## 难度曲线（必须实现）
 
@@ -401,6 +410,11 @@ function drawHUD() {
         "category": "3d-rendering",
         "tags": ["3d", "cube", "rubik", "透视投影", "深度排序", "背面剔除", "向量"],
         "content": """# Canvas 2D 模拟 3D 渲染的正确姿势
+
+> 注意：本技能价值在**数学与结构**（投影、深度排序、背面剔除、防漂移），这些与风格无关，照搬。
+> 但示例里的 `body{background:#1a1a2e}` 等**深紫蓝背景色只是示例**，不是默认——按题材换（魔方
+> 这类益智游戏用浅灰或纯色底往往更清爽）。魔方六面标准色 `#FFF/#FF0/#F80/#F00/#0A0/#00F`
+> 是**语义色必须保留**，别当成"纯三原色"去改。
 
 ## ⚠️ 最容易出错的点（反复踩坑总结）
 
