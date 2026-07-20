@@ -25,7 +25,6 @@ from langgraph.runtime import Runtime
 
 from src.config import settings
 from src.knowledge.knowledge_base import KnowledgeBase
-from src.knowledge.phaser_skills import H5_GAME_SKILLS
 from src.knowledge.source_reference_profile import (
     build_source_reference_profile,
     get_canonical_source_spec,
@@ -756,50 +755,42 @@ def _load_custom_skills() -> list[dict]:
     return []
 
 def _save_custom_skills() -> None:
-    """将自定义技能（非内置、非品类模板的）保存到磁盘"""
+    """将自定义技能（非内置的）保存到磁盘"""
     _CUSTOM_SKILLS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    builtin_names = {skill["category"] for skill in H5_GAME_SKILLS}
-    reserved = builtin_names | _GENRE_SKILL_NAMES  # 内置 + 品类模板都不算自定义
-    custom = [s for s in SKILLS if s["name"] not in reserved]
+    custom = [s for s in SKILLS if s["name"] not in _BUILTIN_SKILL_NAMES]  # 内置技能不算自定义
     # 源码参考技能可能较大，先完整写临时文件再原子替换，避免进程中断留下半截 JSON。
     tmp_file = _CUSTOM_SKILLS_FILE.with_suffix(_CUSTOM_SKILLS_FILE.suffix + ".tmp")
     tmp_file.write_text(_json.dumps(custom, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp_file.replace(_CUSTOM_SKILLS_FILE)
 
 
-# 随仓库分发的品类模板技能（动作/平台/射击/消除/跑酷/塔防），由 load_skill 按需加载
-_GENRE_SKILLS_FILE = Path(__file__).resolve().parent.parent / "knowledge" / "genre_skills.json"
+# 随仓库分发的内置技能——单一数据源、统一 schema {name, tier, description, content}。
+# tier ∈ base(底座:每次生成都可能用) / genre(品类:做对应品类时 load) / technique(专项:如 3D)。
+# 完整 content 只在 load_skill 时返还，system prompt 只列 name+tier+description。
+_BUILTIN_SKILLS_FILE = Path(__file__).resolve().parent.parent / "knowledge" / "builtin_skills.json"
 
 
-def _load_genre_skills() -> list[dict]:
-    if _GENRE_SKILLS_FILE.exists():
+def _load_builtin_skills() -> list[dict]:
+    if _BUILTIN_SKILLS_FILE.exists():
         try:
-            return _json.loads(_GENRE_SKILLS_FILE.read_text(encoding="utf-8"))
+            data = _json.loads(_BUILTIN_SKILLS_FILE.read_text(encoding="utf-8"))
+            return data if isinstance(data, list) else []
         except Exception:
             pass
     return []
 
 
-# 内置技能 + 品类模板 + 磁盘上的自定义技能
+_BUILTIN_SKILLS: list[dict] = _load_builtin_skills()
+_BUILTIN_SKILL_NAMES: set[str] = {s["name"] for s in _BUILTIN_SKILLS if s.get("name")}
+_SKILL_TIER: dict[str, str] = {
+    s["name"]: (s.get("tier") or "base") for s in _BUILTIN_SKILLS if s.get("name")
+}
+
+# 内置技能 + 磁盘上的自定义技能（源码参考等）
 SKILLS: list[dict] = [
-    {
-        "name": skill["category"],
-        "description": skill["title"],
-        "content": skill["content"],
-    }
-    for skill in H5_GAME_SKILLS
+    {"name": s["name"], "description": s.get("description", s["name"]), "content": s["content"]}
+    for s in _BUILTIN_SKILLS if s.get("name") and s.get("content")
 ]
-# 品类模板（聚焦各品类承重代码，模型做对应游戏时 load_skill 加载并 lift）
-_GENRE_SKILL_NAMES: set[str] = set()
-for _gs in _load_genre_skills():
-    if _gs.get("name") and _gs.get("content") and not any(s["name"] == _gs["name"] for s in SKILLS):
-        SKILLS.append({
-            "name": _gs["name"],
-            "description": _gs.get("description", _gs["name"]),
-            "content": _gs["content"],
-        })
-        _GENRE_SKILL_NAMES.add(_gs["name"])
-# 启动时恢复自定义技能
 for _cs in _load_custom_skills():
     if not any(s["name"] == _cs["name"] for s in SKILLS):
         SKILLS.append(_cs)
@@ -2415,9 +2406,9 @@ def search_skills(query: str) -> str:
     return _search_skills_impl(query)
 
 
-# 常用技能（内置 + 品类模板）始终列在 system；其余（如大量导入的自定义技能）改为按需 search_skills 检索，
+# 内置技能（底座/品类/专项三层）始终列在 system；用户导入的源码参考按需 search_skills 检索，
 # 避免每轮把上百条技能名注入 prompt（显著降低每次调用的固定开销）。
-_CURATED_SKILL_NAMES: set[str] = {s["category"] for s in H5_GAME_SKILLS} | _GENRE_SKILL_NAMES
+_CURATED_SKILL_NAMES: set[str] = set(_BUILTIN_SKILL_NAMES)
 
 
 def _skill_prompt_metadata(value: Any, limit: int) -> str:
@@ -2427,10 +2418,28 @@ def _skill_prompt_metadata(value: Any, limit: int) -> str:
 
 
 def _rebuild_skills_prompt() -> str:
-    """重建技能提示：常用技能 + 有限数量的用户源码参考 + 检索提示。"""
+    """重建技能提示：内置技能按 tier 分层列出 + 有限数量的用户源码参考 + 检索提示。"""
     global _skills_prompt
     curated = [s for s in SKILLS if s["name"] in _CURATED_SKILL_NAMES]
-    lines = "\n".join(f"- **{s['name']}**: {s['description']}" for s in curated)
+    # 分层呈现：底座（每次都可能用）/ 品类（做对应品类时 load）/ 专项（如 3D，冷门）
+    _TIER_HEADERS = [
+        ("base", "底座技能（结构/素材/手感/界面/美术方向——按需 load_skill）"),
+        ("genre", "品类模板（做对应品类的游戏时 load_skill，直接 lift 承重代码）"),
+        ("technique", "专项技能（特定题材才用，如 3D）"),
+    ]
+    tier_blocks = []
+    for tier, header in _TIER_HEADERS:
+        items = [s for s in curated if _SKILL_TIER.get(s["name"]) == tier]
+        if items:
+            tier_blocks.append(
+                f"**{header}**\n"
+                + "\n".join(f"- **{s['name']}**: {s['description']}" for s in items)
+            )
+    # 没有 tier 归属的内置技能（理论上不会有）兜底平铺
+    untiered = [s for s in curated if s["name"] not in _SKILL_TIER]
+    if untiered:
+        tier_blocks.append("\n".join(f"- **{s['name']}**: {s['description']}" for s in untiered))
+    lines = "\n\n".join(tier_blocks)
     source_skills = [
         s for s in SKILLS
         if s.get("source_files") and s["name"] not in _CURATED_SKILL_NAMES

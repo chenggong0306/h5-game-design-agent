@@ -52,9 +52,8 @@ async def lifespan(app: FastAPI):
         print(f"[Startup] Rebuilt {rebuilt} asset records from disk")
 
     # 2. 打印技能状态（内置 + 自定义已在 game_agent 模块加载时恢复）
-    from src.knowledge.phaser_skills import H5_GAME_SKILLS
-    builtin_names = {s["category"] for s in H5_GAME_SKILLS}
-    builtin = sum(1 for s in SKILLS if s["name"] in builtin_names)
+    from src.agent.game_agent import _BUILTIN_SKILL_NAMES
+    builtin = sum(1 for s in SKILLS if s["name"] in _BUILTIN_SKILL_NAMES)
     custom = len(SKILLS) - builtin
     print(f"[Startup] Skills: {builtin} builtin + {custom} custom = {len(SKILLS)} total")
     print(f"[Startup] KB stats: {kb.get_stats()}")
