@@ -226,18 +226,21 @@ function drawParticles() {
 ## 屏幕震动
 
 ```javascript
-let shakeTime = 0, shakeMag = 0;
-function screenShake(magnitude, duration) { shakeMag = magnitude; shakeTime = duration; }
+let shakeTime = 0, shakeMag = 0, shakeDur = 0, _shaking = false;
+function screenShake(magnitude, duration) { shakeMag = magnitude; shakeTime = duration; shakeDur = duration; }
 function applyShake(dt) {
-  if (shakeTime <= 0) return;
+  _shaking = shakeTime > 0;          // 记录本帧是否真的 save 过
+  if (!_shaking) return;
   shakeTime -= dt;
-  const s = shakeMag * (shakeTime / 0.3);
+  const s = shakeMag * (shakeTime / (shakeDur || 1)); // 按本次实际时长归一，别写死 0.3
   ctx.save();
   ctx.translate((Math.random() - 0.5) * s, (Math.random() - 0.5) * s);
 }
-function restoreShake() { if (shakeMag > 0) ctx.restore(); }
+// 只在本帧 applyShake 确实 save 过时才 restore；
+// 用 _shaking 标记而非 shakeMag（shakeMag 不清零，会 pop 空状态栈污染画布）
+function restoreShake() { if (_shaking) ctx.restore(); }
 // 用法：drawStart 里 applyShake(dt) ... 绘制所有内容 ... restoreShake()
-// 触发：screenShake(8, 0.3); // 击中时调用
+// 触发：screenShake(8, 0.3); // 击中时调用；强度按剩余时长自然衰减
 ```
 
 ## 缓动函数
@@ -264,11 +267,11 @@ ctx.shadowColor = '#0ff'; ctx.shadowBlur = 20;
 ctx.fillText('SCORE', x, y);
 ctx.shadowBlur = 0; // 画完记得重置
 
-// 渐变背景
-const grad = ctx.createLinearGradient(0, 0, 0, canvas.height);
+// 渐变背景（坐标用逻辑尺寸 W/H——已 setTransform(dpr)，用 canvas.height 只会铺到屏幕 1/dpr）
+const grad = ctx.createLinearGradient(0, 0, 0, H);
 grad.addColorStop(0, '#0a0a1a');
 grad.addColorStop(1, '#1a0a2e');
-ctx.fillStyle = grad; ctx.fillRect(0, 0, canvas.width, canvas.height);
+ctx.fillStyle = grad; ctx.fillRect(0, 0, W, H);
 
 // 径向渐变（爆炸/光晕）
 const radGrad = ctx.createRadialGradient(x, y, 0, x, y, r);
@@ -292,9 +295,11 @@ displayScore += (score - displayScore) * Math.min(1, dt * 10);
         "tags": ["difficulty", "feedback", "scoring", "ui", "ux", "progression"],
         "content": """高质量游戏需要清晰的设计规范，以下是要实现的要素。
 
-> 注意：下面示例里的色值（`#0ff` 青色标题光、`#ff0` 黄色浮字、`#f44` 红色 GAME OVER）
-> 只是**深色霓虹风的示例**。start/over 界面**结构**（标题+说明+得分+最高分+重玩）与 HUD
-> 布局是通用的；**配色请按你选定的美术方向替换**（扁平/浅色风就别用青色发光和深色遮罩）。
+> 注意 1（坐标）：下面全部用**逻辑尺寸 `W`/`H`**（来自 gameloop 的 resize：`W=innerWidth, H=innerHeight`）
+> 做定位与字号。已 `setTransform(dpr)`，**绝不能用 `canvas.width`/`canvas.height`**（那是物理像素=CSS×DPR，
+> 在高分屏上会让字号翻倍、居中跑出屏幕）。
+> 注意 2（配色）：色值（`#0ff` 青光、`#ff0` 黄字、`#f44` 红字）只是**深色霓虹风示例**。界面**结构**
+> （标题+说明+得分+最高分+重玩）与 HUD 布局通用；**配色按你选定的美术方向替换**（扁平/浅色风别用青光和深色遮罩）。
 
 
 ## 难度曲线（必须实现）
@@ -333,7 +338,7 @@ function drawFloatTexts() {
   floatTexts.forEach(t => {
     ctx.globalAlpha = t.life;
     ctx.fillStyle = t.color;
-    ctx.font = `bold ${canvas.width * 0.04}px Arial`;
+    ctx.font = `bold ${W * 0.04}px Arial`;
     ctx.textAlign = 'center';
     ctx.fillText(t.text, t.x, t.y);
   });
@@ -348,40 +353,40 @@ function drawFloatTexts() {
 ```javascript
 function drawStart() {
   // 1. 半透明背景
-  ctx.fillStyle = 'rgba(0,0,0,0.75)'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = 'rgba(0,0,0,0.75)'; ctx.fillRect(0, 0, W, H);
   // 2. 游戏标题（大字，有光效）
   ctx.shadowColor = '#0ff'; ctx.shadowBlur = 30;
   ctx.fillStyle = '#fff'; ctx.textAlign = 'center';
-  ctx.font = `bold ${canvas.width * 0.1}px Arial`;
-  ctx.fillText('游戏名称', canvas.width / 2, canvas.height * 0.35);
+  ctx.font = `bold ${W * 0.1}px Arial`;
+  ctx.fillText('游戏名称', W / 2, H * 0.35);
   ctx.shadowBlur = 0;
   // 3. 操作说明
-  ctx.font = `${canvas.width * 0.04}px Arial`; ctx.fillStyle = '#aaa';
-  ctx.fillText('← → 移动  空格跳跃', canvas.width / 2, canvas.height * 0.52);
+  ctx.font = `${W * 0.04}px Arial`; ctx.fillStyle = '#aaa';
+  ctx.fillText('← → 移动  空格跳跃', W / 2, H * 0.52);
   // 4. 开始提示（闪烁）
   if (Math.floor(Date.now() / 500) % 2) {
     ctx.fillStyle = '#ff0';
-    ctx.font = `${canvas.width * 0.05}px Arial`;
-    ctx.fillText('点击开始', canvas.width / 2, canvas.height * 0.68);
+    ctx.font = `${W * 0.05}px Arial`;
+    ctx.fillText('点击开始', W / 2, H * 0.68);
   }
 }
 
 function drawOver() {
-  ctx.fillStyle = 'rgba(0,0,0,0.8)'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = 'rgba(0,0,0,0.8)'; ctx.fillRect(0, 0, W, H);
   // 1. 结束标题
   ctx.fillStyle = '#f44'; ctx.textAlign = 'center';
-  ctx.font = `bold ${canvas.width * 0.1}px Arial`;
-  ctx.fillText('GAME OVER', canvas.width / 2, canvas.height * 0.32);
+  ctx.font = `bold ${W * 0.1}px Arial`;
+  ctx.fillText('GAME OVER', W / 2, H * 0.32);
   // 2. 本局得分
-  ctx.fillStyle = '#fff'; ctx.font = `${canvas.width * 0.06}px Arial`;
-  ctx.fillText(`得分  ${score}`, canvas.width / 2, canvas.height * 0.48);
+  ctx.fillStyle = '#fff'; ctx.font = `${W * 0.06}px Arial`;
+  ctx.fillText(`得分  ${score}`, W / 2, H * 0.48);
   // 3. 最高分（不同颜色区分）
   ctx.fillStyle = score >= hiScore ? '#ff0' : '#888';
-  ctx.font = `${canvas.width * 0.04}px Arial`;
-  ctx.fillText(`最高分  ${hiScore}`, canvas.width / 2, canvas.height * 0.60);
+  ctx.font = `${W * 0.04}px Arial`;
+  ctx.fillText(`最高分  ${hiScore}`, W / 2, H * 0.60);
   // 4. 重玩提示
-  ctx.fillStyle = '#aaa'; ctx.font = `${canvas.width * 0.04}px Arial`;
-  ctx.fillText('点击重玩', canvas.width / 2, canvas.height * 0.76);
+  ctx.fillStyle = '#aaa'; ctx.font = `${W * 0.04}px Arial`;
+  ctx.fillText('点击重玩', W / 2, H * 0.76);
 }
 ```
 
@@ -389,19 +394,19 @@ function drawOver() {
 
 ```javascript
 function drawHUD() {
-  // 分数左上角，字体相对画布宽度
+  // 分数左上角，字体相对逻辑画布宽度 W
   ctx.fillStyle = '#fff'; ctx.textAlign = 'left'; ctx.shadowBlur = 0;
-  ctx.font = `bold ${canvas.width * 0.05}px Arial`;
-  ctx.fillText(`${Math.round(displayScore)}`, canvas.width * 0.04, canvas.height * 0.07);
+  ctx.font = `bold ${W * 0.05}px Arial`;
+  ctx.fillText(`${Math.round(displayScore)}`, W * 0.04, H * 0.07);
   // 最高分右上角
   ctx.textAlign = 'right'; ctx.fillStyle = '#aaa';
-  ctx.font = `${canvas.width * 0.035}px Arial`;
-  ctx.fillText(`最高 ${hiScore}`, canvas.width * 0.96, canvas.height * 0.06);
+  ctx.font = `${W * 0.035}px Arial`;
+  ctx.fillText(`最高 ${hiScore}`, W * 0.96, H * 0.06);
   // 难度档位（可选）
   ctx.fillStyle = `hsl(${120 - getDifficulty() * 20}, 80%, 60%)`;
   ctx.textAlign = 'center';
-  ctx.font = `${canvas.width * 0.03}px Arial`;
-  ctx.fillText(`Lv.${getDifficulty()}`, canvas.width / 2, canvas.height * 0.05);
+  ctx.font = `${W * 0.03}px Arial`;
+  ctx.fillText(`Lv.${getDifficulty()}`, W / 2, H * 0.05);
 }
 ```"""
     },
