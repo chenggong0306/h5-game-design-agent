@@ -3442,8 +3442,9 @@ class GameDesignAgent:
         baseline = _source_baselines_by_session.get(session_id)
         baseline_result = await self._verify_source_baseline(session_id) if baseline else None
         if baseline_result is not None and not baseline_result["ok"]:
-            _rollback_to_source_baseline(session_id)
-            return reply, baseline_result, "baseline_failed"
+            # 基线因依赖被排除的版权/占位素材而跑不通：保留用户当前代码，不回滚（回滚到同样
+            # 跑不通的基线只会抹掉用户定制）。与流式路径 _self_check_and_repair 行为一致。
+            return reply, baseline_result, "baseline_unverified"
 
         result = None
         for _ in range(max(0, settings.self_check_max_rounds)):
@@ -3704,16 +3705,17 @@ class GameDesignAgent:
         baseline = _source_baselines_by_session.get(session_id)
         baseline_result = await self._verify_source_baseline(session_id) if baseline else None
         if baseline_result is not None and not baseline_result["ok"]:
-            restored = _rollback_to_source_baseline(session_id)
-            if restored and restored != ss["last_code_sent"]:
-                ss["last_code_sent"] = restored
-                ss["code_pushed"] = True
-                yield {"type": "code_update", "code": restored, "source": "baseline_rollback"}
+            # 基线本身跑不通——几乎总是因为原项目依赖被平台故意排除的版权/占位素材
+            # （背景图 background.jpg、品牌 logo 等），非用户改动之过。回滚到一个同样跑不通的
+            # 基线只会把用户刚做的定制（关音乐、换素材、改配色）静默抹掉，毫无收益。
+            # 改为：保留当前代码，把基线问题降级为提示，也不再自动修复（避免自修去改动这份
+            # 忠实移植）。只有「基线真正验证通过」才值得在退化时回滚保护（见下方 for 循环）。
             yield {
                 "type": "self_check",
-                "status": "baseline_failed",
-                "issues": [item["msg"] for item in baseline_result["blocking"]],
-                "warnings": [item["msg"] for item in baseline_result.get("warnings", [])],
+                "status": "baseline_unverified",
+                "issues": [],
+                "warnings": [item["msg"] for item in baseline_result["blocking"]]
+                            + [item["msg"] for item in baseline_result.get("warnings", [])],
             }
             return
         for _ in range(max(0, settings.self_check_max_rounds)):

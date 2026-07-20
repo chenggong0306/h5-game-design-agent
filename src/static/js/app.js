@@ -1071,11 +1071,19 @@ async function sendMessage(messageOverride = null, options = {}) {
                         // 自检+自修闭环状态：在对话里展示一条系统提示（content 为原始文本，渲染时统一走 renderMarkdown 转义）
                         let txt;
                         if (event.status === 'repairing') {
-                            txt = '🔧 基础运行检查发现问题，正在自动修复：\n' + (event.issues || []).map(s => '· ' + s).join('\n');
+                            txt = '🔧 阻断级运行检查发现问题，正在自动修复：\n' + (event.issues || []).map(s => '· ' + s).join('\n');
                         } else if (event.status === 'passed') {
-                            txt = '✅ 基础运行检查通过（不代表玩法与素材语义已完全验证）';
+                            txt = '✅ 运行与核心玩法检查通过';
+                        } else if (event.status === 'passed_with_warnings') {
+                            txt = '✅ 核心检查通过；以下建议不会触发自动改写：\n' + (event.warnings || []).map(s => '· ' + s).join('\n');
+                        } else if (event.status === 'rolled_back') {
+                            txt = '↩️ 增强版未通过原版同等验收，已自动回滚到可运行基线：\n' + (event.issues || []).map(s => '· ' + s).join('\n');
+                        } else if (event.status === 'baseline_failed') {
+                            txt = '⛔ 原版基线本身未跑通，已停止增强；请补齐源码运行依赖：\n' + (event.issues || []).map(s => '· ' + s).join('\n');
+                        } else if (event.status === 'baseline_unverified') {
+                            txt = '⚠️ 原版基线依赖被排除的版权/占位素材（如背景图、品牌图），无法在本环境完整跑通——这不是你改动的问题。已保留你的修改，未回滚：\n' + (event.warnings || []).map(s => '· ' + s).join('\n');
                         } else {
-                            txt = '⚠️ 基础运行检查仍有问题（已尽力修复）：\n' + (event.issues || []).map(s => '· ' + s).join('\n');
+                            txt = '⛔ 阻断级检查仍有问题：\n' + (event.issues || []).map(s => '· ' + s).join('\n');
                         }
                         activeStreamState.blocks.push({ type: 'text', content: '\n' + txt + '\n' });
                         scheduleStreamRender(activeStreamState);
@@ -2042,6 +2050,7 @@ function resetSkillEditor() {
     nameInput.disabled = false;
     document.getElementById('skill-desc').value = '';
     document.getElementById('skill-content').value = '';
+    document.getElementById('skill-source-mode').value = '';
     btn.textContent = '➕ 添加技能';
     btn.dataset.mode = 'add';
     clearSelectedSkillSource();
@@ -2086,7 +2095,7 @@ function renderSkillsList() {
             ${skillBatchMode ? `<input type="checkbox" class="skill-select" value="${escapeHtml(s.name || '')}" onchange="syncSkillSelectAll()">` : ''}
             <div class="skill-info">
                 <strong>${escapeHtml(s.name || '')}</strong>
-                <span>${escapeHtml(s.description || '')}${s.source_file_count ? ` · 📦 ${s.source_file_count} 个源码文件 · 🖼️ ${s.usable_asset_count || 0} 个可用素材 · 🧩 ${s.web_dependency_count || 0} 个网页依赖` : ''}</span>
+                <span>${escapeHtml(s.description || '')}${s.source_file_count ? ` · 📦 ${s.source_file_count} 个源码文件 · 🖼️ ${s.usable_asset_count || 0} 个可用素材 · 🧩 ${s.web_dependency_count || 0} 个网页依赖 · ${escapeHtml(s.source_mode || 'inspired')}` : ''}</span>
             </div>
             <div class="skill-actions">
                 <button onclick="viewSkill('${jsStr(s.name)}')" title="查看">👁</button>
@@ -2161,9 +2170,10 @@ async function viewSkill(name) {
         document.getElementById('skill-name').disabled = true;  // 查看时禁止改名
         document.getElementById('skill-desc').value = skill.description;
         document.getElementById('skill-content').value = skill.content;
+        document.getElementById('skill-source-mode').value = skill.source_mode || '';
         clearSelectedSkillSource(
             skill.source_file_count
-                ? `已保存 ${skill.source_file_count} 个源码文件、${skill.usable_asset_count || 0} 个可加载素材；已识别 ${skill.web_dependency_count || 0} 个 HTML→CSS/JS 依赖。生成时会提供组合参考和素材 URL。`
+                ? `已保存 ${skill.source_file_count} 个源码文件、${skill.usable_asset_count || 0} 个可加载素材；模式 ${skill.source_mode || 'inspired'}，${skill.source_runnable ? '可建立运行基线' : '运行依赖不完整'}。`
                 : '此技能没有源码项目；可选择文件夹/ZIP 添加参考源码。'
         );
         if (skill.source_file_count) skillSourceStatus.classList.add('ready');
@@ -2191,6 +2201,7 @@ document.getElementById('btn-add-skill').addEventListener('click', async () => {
     const name = nameInput.value.trim();
     const desc = document.getElementById('skill-desc').value.trim();
     const content = document.getElementById('skill-content').value.trim();
+    const sourceMode = document.getElementById('skill-source-mode').value;
     const hasSource = selectedSkillSourceFiles.length > 0;
     const isEdit = btn.dataset.mode === 'edit';
     if (!name || !desc) { showToast('请填写技能名称和描述', 'info'); return; }
@@ -2203,6 +2214,7 @@ document.getElementById('btn-add-skill').addEventListener('click', async () => {
             formData.append('name', name);
             formData.append('description', desc);
             formData.append('content', content);
+            formData.append('source_mode', sourceMode);
             for (const file of selectedSkillSourceFiles) {
                 formData.append('files', file, file.webkitRelativePath || file.name);
             }
@@ -2216,7 +2228,7 @@ document.getElementById('btn-add-skill').addEventListener('click', async () => {
             res = await fetch(`/api/skills/${encodeURIComponent(name)}`, {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ description: desc, content }),
+                body: JSON.stringify({ description: desc, content, source_mode: sourceMode || null }),
             });
         } else {
             res = await fetch('/api/skills', {
@@ -2228,7 +2240,7 @@ document.getElementById('btn-add-skill').addEventListener('click', async () => {
         await ensureOk(res);
         const result = await res.json();
         if (hasSource) {
-            showToast(`已保存技能“${name}”：导入 ${result.source_file_count} 个源码文件、${result.usable_asset_count || 0} 个可加载素材，识别 ${result.web_dependency_count || 0} 个 HTML→CSS/JS 依赖，跳过 ${result.skipped_count} 项。`, 'success', 6000);
+            showToast(`已保存技能“${name}”：${result.source_mode}，导入 ${result.source_file_count} 个源码文件、${result.usable_asset_count || 0} 个可加载素材，识别 ${result.web_dependency_count || 0} 个 HTML→CSS/JS 依赖，跳过 ${result.skipped_count} 项。`, 'success', 6000);
             // C2：跳过项透明化——逐条展示被跳过文件的路径和后果说明，让用户知道还原度会受什么影响
             if (Array.isArray(result.skipped_details) && result.skipped_details.length) {
                 showImportReportPanel(`以下 ${result.skipped_details.length} 个文件被跳过：`, result.skipped_details);
