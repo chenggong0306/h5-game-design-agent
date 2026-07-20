@@ -371,6 +371,10 @@ class SkillsApiTests(unittest.TestCase):
         self.assertNotIn("http://old.host/pvz/Engine.js", ported)               # 外部改写掉了
         self.assertIn(f"/assets/source/{bundle}/tree/pvz/js/Engine.js", ported)  # → 本地唯一同名
         self.assertIn('s.src="level/"+n+".js"', ported)                          # 动态相对路径保持原样
+        # 4) href="#" 守卫：base href 会让 <a href="#"> 跳到 base 目录(404 冲掉页面)，
+        #    注入守卫拦掉纯锚点/空 href 的默认跳转（onclick 照常跑），否则点按钮即黑屏。
+        self.assertIn("addEventListener('click'", ported)
+        self.assertIn("preventDefault", ported)
 
     def test_search_skill_source_is_stable_across_files_and_returns_numbered_context(self):
         skill = {

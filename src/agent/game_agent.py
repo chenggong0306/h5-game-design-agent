@@ -1270,13 +1270,28 @@ def _inject_base_href_for_dynamic_urls(html: str, skill: dict) -> str:
     entry_dir = str(PurePosixPath(entry).parent) if entry else ""
     prefix = "" if entry_dir in ("", ".") else entry_dir.strip("/") + "/"
     base_tag = f'<base href="/assets/source/{bundle_id}/tree/{prefix}">'
+    # 守卫：<a href="#"> 这类"按钮"本应原地不跳，但有了 <base href> 后 href="#" 会相对 base
+    # 解析成跳到 tree 目录(404，页面被 JSON 错误冲掉)。捕获阶段拦掉纯锚点/空 href 的默认跳转，
+    # onclick 照常执行。（表单同理：action 为空/#/纯锚点时也别提交。）
+    guard = (
+        "<script>(function(){"
+        "document.addEventListener('click',function(e){"
+        "var a=e.target&&e.target.closest?e.target.closest('a[href]'):null;if(!a)return;"
+        "var h=a.getAttribute('href')||'';"
+        "if(h===''||h.charAt(0)==='#')e.preventDefault();},true);"
+        "document.addEventListener('submit',function(e){"
+        "var f=e.target;if(!f||f.tagName!=='FORM')return;var a=f.getAttribute('action')||'';"
+        "if(a===''||a.charAt(0)==='#')e.preventDefault();},true);"
+        "})();</script>"
+    )
+    inject = base_tag + guard
     m = re.search(r"(?is)<head\b[^>]*>", html)
     if m:
-        return html[:m.end()] + "\n" + base_tag + html[m.end():]
+        return html[:m.end()] + "\n" + inject + html[m.end():]
     m = re.search(r"(?is)<html\b[^>]*>", html)
     if m:
-        return html[:m.end()] + f"\n<head>{base_tag}</head>" + html[m.end():]
-    return base_tag + html
+        return html[:m.end()] + f"\n<head>{inject}</head>" + html[m.end():]
+    return inject + html
 
 
 def _source_dependency_lines(manifest: dict, limit: int = 120) -> list[str]:
