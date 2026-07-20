@@ -1215,10 +1215,68 @@ def build_faithful_source_port(skill: dict, entrypoint: str = "", mode: str = ""
     for start, end, replacement in sorted(replacements, reverse=True):
         combined = combined[:start] + replacement + combined[end:]
     combined = _rewrite_source_asset_urls(combined, skill, selected_entry, selected_entry)
+    combined = _rewrite_external_urls_to_local_tree(combined, skill)
+    combined = _inject_base_href_for_dynamic_urls(combined, skill)
     combined = _inject_source_port_metadata(combined, skill, selected_mode)
     if "</html>" not in combined.lower():
         combined = combined.rstrip() + "\n</body></html>"
     return combined
+
+
+def _rewrite_external_urls_to_local_tree(html: str, skill: dict) -> str:
+    """把硬编码的绝对外部 URL 改写到本地源码树——仅当其 basename 在源码里**唯一存在**、
+    且是脚本/样式/素材类扩展名时。老游戏常把自己的文件（如植物大战僵尸的 Process.js）
+    硬编码成原托管站的绝对 URL；这些字面量 base href 管不了，但可静态改写到本地副本。
+    有扩展名 + basename 唯一双重防护，避免误伤真正的外链（如页脚 http://www.xxx.com 无扩展名不动）。"""
+    bundle_id = str(skill.get("source_asset_bundle_id") or "")
+    if not bundle_id:
+        return html
+    _REWRITABLE_EXTS = {
+        ".js", ".mjs", ".css", ".json", ".png", ".jpg", ".jpeg", ".gif", ".webp",
+        ".bmp", ".svg", ".ico", ".mp3", ".wav", ".ogg", ".m4a", ".ttf", ".otf",
+        ".woff", ".woff2", ".xml", ".tmx",
+    }
+    by_base: dict[str, list[str]] = {}
+    for item in (skill.get("source_files") or []) + (skill.get("source_assets") or []):
+        p = str(item.get("path") or "")
+        if not p:
+            continue
+        by_base.setdefault(PurePosixPath(p).name.lower(), []).append(p)
+
+    def _repl(m: "re.Match") -> str:
+        url = m.group(0)
+        tail = url.split("?", 1)[0].split("#", 1)[0]
+        base = tail.rsplit("/", 1)[-1].lower()
+        if PurePosixPath(base).suffix not in _REWRITABLE_EXTS:
+            return url
+        matches = by_base.get(base)
+        if matches and len(matches) == 1:
+            return f"/assets/source/{bundle_id}/tree/{matches[0]}"
+        return url
+
+    return re.sub(r'https?://[^\s"\'<>()]+', _repl, html)
+
+
+def _inject_base_href_for_dynamic_urls(html: str, skill: dict) -> str:
+    """给移植版注入 <base href=".../tree/">：运行时动态拼出的相对 URL（如植物大战僵尸
+    的 level/0.js）无法被静态改写，靠 base href 解析到已服务的源码树。已改写为绝对
+    /assets/source/{bundle}/{hash} 的静态素材 URL 因带前导 / 不受 base 影响，无冲突。"""
+    bundle_id = str(skill.get("source_asset_bundle_id") or "")
+    if not bundle_id or re.search(r"(?is)<base\b", html):
+        return html
+    # base 必须指向入口 HTML 所在目录：入口在 pvz/index.html 时，其相对 URL(level/0.js)
+    # 相对 pvz/ 解析，base 就得是 .../tree/pvz/；入口在根则是 .../tree/。
+    entry = str((skill.get("source_summary") or {}).get("entrypoint") or "")
+    entry_dir = str(PurePosixPath(entry).parent) if entry else ""
+    prefix = "" if entry_dir in ("", ".") else entry_dir.strip("/") + "/"
+    base_tag = f'<base href="/assets/source/{bundle_id}/tree/{prefix}">'
+    m = re.search(r"(?is)<head\b[^>]*>", html)
+    if m:
+        return html[:m.end()] + "\n" + base_tag + html[m.end():]
+    m = re.search(r"(?is)<html\b[^>]*>", html)
+    if m:
+        return html[:m.end()] + f"\n<head>{base_tag}</head>" + html[m.end():]
+    return base_tag + html
 
 
 def _source_dependency_lines(manifest: dict, limit: int = 120) -> list[str]:
@@ -3099,6 +3157,9 @@ SYSTEM_PROMPT = """你是一个专业的 H5 页面游戏设计 AI 助手，帮�
      只是白白浪费回合和上下文。工具会自动机械内联原 HTML/CSS/JS、改写素材 URL（含运行时库的 /assets/source URL）并建立
      原版质量基线。移植完成后**只有当预览报运行错误时**，才用 `search_code`/`view_code` 定位并 `replace_code` 修那一处
      兼容问题；不要再 `write_game` 重写、不要改变玩法。（`load_skill_assets` 也可跳过，port 已自动处理素材 URL。）
+     **⚠️ 绝不要改写代码里动态加载的相对路径**（如 `"level/"+n+".js"`、运行时拼出的脚本/资源路径）：移植已注入
+     `<base href=".../tree/">`，原始相对路径会自动解析到已服务的源码树；你一改（尤其漏掉 `tree/` 段或换大小写）反而 404。
+     保持这些相对路径**原样不动**。只有确属代码语法/逻辑错误才修。
    - `extend`：同样先调用 `port_skill_source("技能名", mode="extend")` 跑通原版，再用 replace/insert 做用户明确要求的
      响应式、开始界面或特效增强。核心状态、碰撞、数值、资源与原布局不得重写；退化会自动回滚基线。
    - `inspired`：仅此模式才调用 `load_skill_web_bundle`、`search_skill_source`、`load_skill_source` 理解结构后重新创作。

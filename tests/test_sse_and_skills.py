@@ -321,6 +321,57 @@ class SkillsApiTests(unittest.TestCase):
         self.assertIn(asset_url, ported)
         self.assertNotIn('src="js/jquery.min.js"', ported)
 
+    def test_source_tree_serve_and_port_base_href_for_dynamic_urls(self):
+        # 模拟植物大战僵尸类：运行时动态拼 level/N.js（大小写不一：目录是 Level/），
+        # 且把自己的 Engine.js 硬编码成外部绝对 URL。
+        index_html = b"<!doctype html><html><head></head><body><script src=\"js/main.js\"></script></body></html>"
+        main_js = (
+            b"var e=document.createElement('script');"
+            b"e.src=\"http://old.host/pvz/Engine.js\";"                 # 外部硬编码，本地有同名
+            b"function loadLevel(n){var s=document.createElement('script');s.src=\"level/\"+n+\".js\";}"  # 动态拼
+        )
+        files = [
+            ("files", ("pvz/index.html", index_html, "text/html")),
+            ("files", ("pvz/js/main.js", main_js, "text/javascript")),
+            ("files", ("pvz/js/Engine.js", b"/* engine */", "text/javascript")),
+            ("files", ("pvz/Level/0.js", b"/* level zero */", "text/javascript")),  # 大写 Level
+            ("files", ("pvz/images/bg.png", b"\x89PNG\r\n", "image/png")),
+        ]
+        with mock.patch.object(routes, "_save_custom_skills"):
+            r = self.client.post(
+                "/api/skills/source",
+                data={"name": "pvz_demo", "description": "动态加载关卡的老游戏", "content": ""},
+                files=files,
+            )
+        self.assertEqual(r.status_code, 200, r.text)
+        skill = next(s for s in routes.SKILLS if s["name"] == "pvz_demo")
+        bundle = skill["source_asset_bundle_id"]
+
+        # 1) 源码树服务：小写请求 level/0.js 命中大写 Level/0.js（大小写不敏感）+ 正确 MIME
+        #    文件带 pvz/ 公共前缀，故 tree 路径含前缀（对应机械移植的 base href = .../tree/pvz/）
+        resp = self.client.get(f"/assets/source/{bundle}/tree/pvz/level/0.js")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.content, b"/* level zero */")
+        self.assertTrue(resp.headers["content-type"].startswith("text/javascript"))
+        self.assertEqual(resp.headers["x-content-type-options"], "nosniff")
+        # 原始大写路径也行
+        self.assertEqual(self.client.get(f"/assets/source/{bundle}/tree/pvz/Level/0.js").status_code, 200)
+        # 嵌套文本源码也回源
+        self.assertEqual(self.client.get(f"/assets/source/{bundle}/tree/pvz/js/main.js").status_code, 200)
+
+        # 2) 穿越 / 未登记防护
+        self.assertEqual(self.client.get(f"/assets/source/{bundle}/tree/nope.js").status_code, 404)
+        self.assertEqual(
+            self.client.get(f"/assets/source/{bundle}/tree/..%2fmanifest.json").status_code, 404
+        )
+
+        # 3) 机械移植：base href 指向入口目录、外部 Engine.js 改写到本地 tree、动态 level 相对路径原样保留
+        ported = game_agent.build_faithful_source_port(skill)
+        self.assertIn(f'<base href="/assets/source/{bundle}/tree/pvz/">', ported)
+        self.assertNotIn("http://old.host/pvz/Engine.js", ported)               # 外部改写掉了
+        self.assertIn(f"/assets/source/{bundle}/tree/pvz/js/Engine.js", ported)  # → 本地唯一同名
+        self.assertIn('s.src="level/"+n+".js"', ported)                          # 动态相对路径保持原样
+
     def test_search_skill_source_is_stable_across_files_and_returns_numbered_context(self):
         skill = {
             "name": "source_search_demo",

@@ -1037,6 +1037,55 @@ async def serve_asset(asset_type: str, filename: str):
     return FileResponse(_resolve_asset_path(asset_type, filename), headers=_ASSET_HEADERS)
 
 
+def _resolve_source_tree_path(bundle_id: str, file_path: str) -> str:
+    """按原始相对路径校验并回源源码树文件（穿越防护 + manifest 门控）。
+
+    大小写不敏感匹配：老游戏多在大小写不敏感的服务器上跑，loader 常用 `level/` 而目录实为
+    `Level/`（植物大战僵尸即如此）。用请求路径在 manifest 里忽略大小写找出**登记的真实路径**，
+    再据此取文件——同时兼容大小写敏感（Linux）与不敏感（Windows）的文件系统。
+    """
+    if not _SOURCE_ASSET_BUNDLE_RE.fullmatch(bundle_id):
+        raise HTTPException(status_code=404, detail="文件不存在")
+    rel = _safe_tree_relpath(file_path)
+    if not rel:
+        raise HTTPException(status_code=404, detail="文件不存在")
+    root = _source_asset_root().resolve()
+    bundle_dir = (root / bundle_id).resolve()
+    tree_dir = (bundle_dir / "tree").resolve()
+    if bundle_dir.parent != root:
+        raise HTTPException(status_code=404, detail="文件不存在")
+    try:
+        manifest = json.loads((bundle_dir / _SOURCE_ASSET_MANIFEST).read_text(encoding="utf-8"))
+        tree_list = manifest.get("tree") or []
+    except (OSError, ValueError, TypeError):
+        tree_list = []
+    rel_low = rel.lower()
+    actual = next((p for p in tree_list if isinstance(p, str) and p.lower() == rel_low), None)
+    if actual is None:
+        raise HTTPException(status_code=404, detail="文件不存在")
+    target = (tree_dir / actual).resolve()
+    if not str(target).startswith(str(tree_dir) + os.sep) or not target.is_file():
+        raise HTTPException(status_code=404, detail="文件不存在")
+    return str(target)
+
+
+def _tree_media_type(file_path: str) -> str:
+    return _SOURCE_ASSET_MEDIA_TYPES.get(
+        PurePosixPath(file_path).suffix.lower(), "application/octet-stream"
+    )
+
+
+# 注意：本路由必须在下方单段 {filename} 路由之前注册，否则 tree/ 段会被当作 filename。
+@router.get("/assets/source/{bundle_id}/tree/{file_path:path}")
+async def serve_source_tree(bundle_id: str, file_path: str):
+    """按原始相对路径回源源码树文件，供机械移植的 <base href> 解析运行时动态 URL。"""
+    return FileResponse(
+        _resolve_source_tree_path(bundle_id, file_path),
+        media_type=_tree_media_type(file_path),
+        headers=_SOURCE_ASSET_HEADERS,
+    )
+
+
 @router.get("/assets/source/{bundle_id}/{filename}")
 async def serve_source_asset(bundle_id: str, filename: str):
     """提供源码技能内已保存的图片、音频、字体和地图资源。"""
@@ -1238,9 +1287,29 @@ def _delete_unreferenced_source_asset_bundle(bundle_id: str | None) -> None:
     _delete_source_asset_bundle(bundle_id)
 
 
-def _persist_source_asset_bundle(asset_files: list[dict]) -> tuple[str | None, list[dict]]:
-    """原子落盘源码素材，返回不可猜 bundle id 与不含二进制内容的公开清单。"""
-    if not asset_files:
+def _safe_tree_relpath(path: str) -> str | None:
+    """规整源码树内的相对路径：拒绝绝对路径、.. 穿越、空段。返回 posix 相对路径或 None。"""
+    p = str(path or "").strip().replace("\\", "/").lstrip("/")
+    if not p:
+        return None
+    parts = []
+    for seg in p.split("/"):
+        if seg in ("", ".", ".."):
+            return None
+        parts.append(seg)
+    return "/".join(parts)
+
+
+def _persist_source_asset_bundle(
+    asset_files: list[dict], source_files: list[dict] | None = None,
+) -> tuple[str | None, list[dict]]:
+    """原子落盘源码素材，返回不可猜 bundle id 与不含二进制内容的公开清单。
+
+    除了按 hash 存可服务素材（供 URL 改写），还把**全部源文件（文本+二进制）按原始相对
+    路径**存到 {bundle}/tree/，供机械移植时用 <base href=".../tree/"> 让运行时动态拼出的
+    URL（如植物大战僵尸的 level/0.js）也能回源——静态改写覆盖不到的动态加载靠它兜住。
+    """
+    if not asset_files and not source_files:
         return None, []
     root = _source_asset_root()
     root.mkdir(parents=True, exist_ok=True)
@@ -1268,9 +1337,32 @@ def _persist_source_asset_bundle(asset_files: list[dict]) -> tuple[str | None, l
                 if key in item:
                     manifest_item[key] = item[key]
             manifest.append(manifest_item)
+        # 源码树：全部文件按原始相对路径落盘 + 登记，供 <base href> 解析动态 URL
+        tree_dir = tmp_dir / "tree"
+        tree_root_resolved = str(tree_dir.resolve())
+        tree_files: list[str] = []
+        for item in list(source_files or []) + list(asset_files):
+            rel = _safe_tree_relpath(str(item.get("path") or ""))
+            if not rel:
+                continue
+            dest = tree_dir / rel
+            try:
+                if not str(dest.resolve()).startswith(tree_root_resolved + os.sep):
+                    continue  # 穿越防护：目标必须落在 tree/ 内
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                content = item.get("content")
+                data = content if isinstance(content, bytes) else str(content or "").encode("utf-8")
+                dest.write_bytes(data)
+                tree_files.append(rel)
+            except OSError:
+                continue
         (tmp_dir / _SOURCE_ASSET_MANIFEST).write_text(
             json.dumps(
-                {"version": 1, "files": [item["stored_name"] for item in manifest]},
+                {
+                    "version": 1,
+                    "files": [item["stored_name"] for item in manifest],
+                    "tree": tree_files,
+                },
                 ensure_ascii=False,
                 separators=(",", ":"),
             ),
@@ -1803,7 +1895,7 @@ async def _save_source_skill(
         detail = skipped[0] if skipped else "没有找到可读的源码文件"
         raise HTTPException(400, f"没有导入源码：{detail}")
     bundle_id, source_assets = await asyncio.to_thread(
-        _persist_source_asset_bundle, asset_files
+        _persist_source_asset_bundle, asset_files, source_files
     )
     record = _source_skill_record(
         clean_name,

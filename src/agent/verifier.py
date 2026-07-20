@@ -629,6 +629,15 @@ def _check_source_reference_contract(
     then delete its player sprites, small-tower art, or HUD during an automatic repair.
     """
     issues = []
+    mechanical_port = bool(
+        re.search(
+            r'''<meta\b(?=[^>]*\bname\s*=\s*(["'])source-port-mode\1)'''
+            r'''(?=[^>]*\bcontent\s*=\s*(["'])(?:faithful_port|extend)\2)[^>]*>''',
+            html,
+            re.IGNORECASE,
+        )
+        and 'data-source-port="' in html
+    )
     for spec in source_specs or []:
         profile_id = str(spec.get("id") or "").strip()
         if not profile_id:
@@ -690,8 +699,13 @@ def _check_source_reference_contract(
                     "并根据移动或目标方向选择状态"
                 ),
             })
-        issues.extend(_check_source_animation_semantics(html, spec))
-        issues.extend(_check_fishjoy_cannon_semantics(html, spec))
+        # Generated rewrites need conservative source-shape checks.  A mechanical port
+        # contains the original engine abstractions (e.g. Quark frame rect arrays), which
+        # do not resemble generated drawImage code; runtime probes validate its actual
+        # crop geometry and gameplay instead of producing false static blockers.
+        if not mechanical_port:
+            issues.extend(_check_source_animation_semantics(html, spec))
+            issues.extend(_check_fishjoy_cannon_semantics(html, spec))
     return issues
 
 
@@ -833,7 +847,10 @@ _PREVIEW_ASSET_PATH_RE = re.compile(
     r"(?!\.)(?!.*\.\.)[A-Za-z0-9_.-]+$"
 )
 _PREVIEW_SOURCE_ASSET_PATH_RE = re.compile(
-    r"^/assets/source/[a-f0-9]{32}/(?!\.)(?!.*\.\.)[A-Za-z0-9_.-]+$"
+    r"^/assets/source/[a-f0-9]{32}/(?:"
+    r"(?!\.)(?!.*\.\.)[A-Za-z0-9_.-]+"                             # 单段 hash 素材
+    r"|tree/(?!.*\.\.)(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+"        # tree/ 下的嵌套原始路径
+    r")$"
 )
 
 
@@ -865,9 +882,25 @@ def _is_allowed_preview_request(url: str) -> bool:
 
 
 def _with_preview_asset_base(html: str) -> str:
-    """让 page.set_content 的根相对 `/assets/...` 与真实预览一样指向本服务。"""
+    """让 page.set_content 的根相对 `/assets/...` 与真实预览一样指向本服务。
+
+    若移植版已带自己的 <base href="/assets/source/{bundle}/tree/">（用于解析运行时动态
+    URL），要**保留**它、只把它变成指向本服务的绝对地址，而不是覆盖成 origin/——否则
+    植物大战僵尸这类靠 base 解析 level/0.js 的移植版在自检里会全线 404。
+    """
+    origin = _preview_asset_origin()
+    existing = re.search(r'''(?is)<base\b[^>]*\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))''', html or "")
+    href = ""
+    if existing:
+        href = existing.group(1) or existing.group(2) or existing.group(3) or ""
+    # 只保留「移植版自己注入的 tree base」这一种精确模式并变绝对；其余一切（无 base、
+    # 相对、不可信的绝对 http:// 或协议相对 //evil）都替换成指向本服务根，防 SSRF。
+    if re.fullmatch(r"/assets/source/[a-f0-9]{32}/tree/", href or ""):
+        base_href = origin + href
+    else:
+        base_href = origin + "/"
     clean = re.sub(r"(?is)<base\b[^>]*>", "", html or "")
-    base = f'<base href="{_preview_asset_origin()}/">'
+    base = f'<base href="{base_href}">'
     head = re.search(r"(?is)<head\b[^>]*>", clean)
     if head:
         return clean[:head.end()] + base + clean[head.end():]
@@ -1210,19 +1243,40 @@ def _source_assets_with_contract_metadata(source_assets, source_specs) -> list[d
                     str(bottom.get("resource_id") or "bottom"),
                     profile_id,
                 ))
+        resource_catalog = (spec.get("assets") or {}).get("resource_catalog") or {}
+        if isinstance(resource_catalog, dict):
+            for resource_id, role in {
+                "bullet": "bullet",
+                "web": "web",
+                "numBlack": "number",
+                "coinAni1": "coin",
+                "coinAni2": "coin",
+                "coinText": "coin",
+            }.items():
+                path = str(resource_catalog.get(resource_id) or "").strip()
+                if path:
+                    catalog_entries.append((
+                        path,
+                        {"preserve_asset_geometry": True},
+                        role,
+                        resource_id,
+                        profile_id,
+                    ))
     for asset in result:
         actual_path = str(asset.get("path") or "")
         for expected_path, meta, role, resource_id, profile_id in catalog_entries:
             if not _contract_path_matches(actual_path, expected_path):
                 continue
             asset["layout_type"] = "sprite_sheet"
-            asset["frame_width"] = meta.get("frame_width") or meta.get("frameWidth") or 0
-            asset["frame_height"] = meta.get("frame_height") or meta.get("frameHeight") or 0
-            asset["frame_count"] = meta.get("frame_count") or 0
+            if not meta.get("preserve_asset_geometry"):
+                asset["frame_width"] = meta.get("frame_width") or meta.get("frameWidth") or 0
+                asset["frame_height"] = meta.get("frame_height") or meta.get("frameHeight") or 0
+                asset["frame_count"] = meta.get("frame_count") or 0
             if meta.get("atlas_frames"):
                 asset["atlas_frames"] = meta["atlas_frames"]
-            asset["columns"] = 1
-            asset["rows"] = meta.get("frame_count") or 0
+            if not meta.get("preserve_asset_geometry"):
+                asset["columns"] = 1
+                asset["rows"] = meta.get("frame_count") or 0
             asset["contract_role"] = role
             asset["resource_id"] = resource_id
             asset["contract_profile_id"] = profile_id
@@ -1340,10 +1394,25 @@ def _with_draw_image_probe(html: str, source_assets=None) -> str:
   }}
   const records = [];
   const recordByKey = Object.create(null);
-  let drawIndex = 0;
-  window[probeName] = {{ records }};
+  let drawIndex = 0, frameIndex = 0, nextCanvasId = 1;
+  const canvasStates = new WeakMap();
+  const canvasState = canvas => {{
+    if (!canvas || (typeof canvas !== 'object' && typeof canvas !== 'function')) return {{id: 0, frame: frameIndex}};
+    let state = canvasStates.get(canvas);
+    if (!state) {{ state = {{id: nextCanvasId++, frame: 0}}; canvasStates.set(canvas, state); }}
+    return state;
+  }};
+  window[probeName] = {{ records, get frameIndex() {{ return frameIndex; }} }};
   const proto = window.CanvasRenderingContext2D && CanvasRenderingContext2D.prototype;
   if (!proto || typeof proto.drawImage !== 'function') return;
+  const originalClearRect = proto.clearRect;
+  if (typeof originalClearRect === 'function') {{
+    proto.clearRect = function(...args) {{
+      frameIndex += 1;
+      canvasState(this.canvas).frame += 1;
+      return originalClearRect.apply(this, args);
+    }};
+  }}
   const original = proto.drawImage;
   proto.drawImage = function(...args) {{
     try {{
@@ -1355,6 +1424,7 @@ def _with_draw_image_probe(html: str, source_assets=None) -> str:
       }}
       if (meta) {{
         const currentDrawIndex = ++drawIndex;
+        const currentCanvasState = canvasState(this.canvas);
         const argc = args.length;
         const naturalWidth = Number(
           (image && (image.naturalWidth || image.videoWidth || image.width)) || meta.width || 0
@@ -1398,6 +1468,11 @@ def _with_draw_image_probe(html: str, source_assets=None) -> str:
         if (prior) {{
           prior.count += 1;
           prior.last_draw_index = currentDrawIndex;
+          prior.last_frame_index = frameIndex;
+          prior.last_canvas_id = currentCanvasState.id;
+          prior.last_canvas_frame = currentCanvasState.frame;
+          prior.last_dest_left = destLeft; prior.last_dest_top = destTop;
+          prior.last_dest_right = destRight; prior.last_dest_bottom = destBottom;
           if (visible) prior.visible_count += 1;
           else prior.offscreen_count += 1;
         }} else if (records.length < 512) {{
@@ -1416,11 +1491,19 @@ def _with_draw_image_probe(html: str, source_assets=None) -> str:
             argc, sx, sy, sw, sh, dx, dy, dw, dh,
             dest_left: destLeft, dest_top: destTop,
             dest_right: destRight, dest_bottom: destBottom,
+            last_dest_left: destLeft, last_dest_top: destTop,
+            last_dest_right: destRight, last_dest_bottom: destBottom,
             canvas_width: canvasWidth, canvas_height: canvasHeight,
             visible_count: visible ? 1 : 0,
             offscreen_count: visible ? 0 : 1,
             first_draw_index: currentDrawIndex,
             last_draw_index: currentDrawIndex,
+            first_frame_index: frameIndex,
+            last_frame_index: frameIndex,
+            first_canvas_id: currentCanvasState.id,
+            last_canvas_id: currentCanvasState.id,
+            first_canvas_frame: currentCanvasState.frame,
+            last_canvas_frame: currentCanvasState.frame,
             count: 1
           }};
           recordByKey[signature] = record;
@@ -1520,7 +1603,7 @@ def _analyze_source_rect_bounds(records) -> list[dict]:
     }]
 
 
-def _analyze_fishjoy_cannon_draw_records(records) -> list[dict]:
+def _analyze_fishjoy_cannon_draw_records(records, expected: bool = False) -> list[dict]:
     """Require the active Fishjoy cannon to be drawn visibly above the bottom bar."""
     if not isinstance(records, list):
         return []
@@ -1530,11 +1613,27 @@ def _analyze_fishjoy_cannon_draw_records(records) -> list[dict]:
         and str(record.get("contract_profile_id") or "").lower().startswith("fishjoy@")
     ]
     if not fishjoy:
-        return []
+        return ([{
+            "id": "source_gameplay_scene_not_started:fishjoy@1",
+            "severity": "high",
+            "msg": "等待并执行常见开始手势后仍未绘制任何 Fishjoy 鱼、炮台或底栏，原玩法没有进入运行场景。",
+            "fix": "恢复原入口 onload、资源加载完成回调和 game.load/init/start 调用链；不要用静态背景冒充已运行。",
+        }] if expected else [])
     profile_id = str(fishjoy[0].get("contract_profile_id") or "fishjoy@1")
     fish_records = [record for record in fishjoy if record.get("contract_role") == "fish"]
     cannon_records = [record for record in fishjoy if record.get("contract_role") == "cannon"]
-    bottom_records = [record for record in fishjoy if record.get("contract_role") == "bottom"]
+    all_bottom_records = [record for record in fishjoy if record.get("contract_role") == "bottom"]
+    # bottom.png also contains +/- button frames, which are legitimately drawn after
+    # the cannon.  Draw-order validation must compare the 765x72 bar, not every draw
+    # that happens to share the same atlas URL.
+    exact_bar_records = [
+        record for record in all_bottom_records
+        if _as_finite_number(record.get("sx")) == 0
+        and _as_finite_number(record.get("sy")) == 0
+        and _as_finite_number(record.get("sw")) == 765
+        and _as_finite_number(record.get("sh")) == 72
+    ]
+    bottom_records = exact_bar_records or all_bottom_records
     issues: list[dict] = []
 
     # Fish drawing proves the gameplay scene has started.  Avoid blaming a missing cannon
@@ -1568,15 +1667,33 @@ def _analyze_fishjoy_cannon_draw_records(records) -> list[dict]:
             ),
         })
 
-    cannon_last = max(
-        int(_as_finite_number(record.get("last_draw_index")) or 0)
-        for record in cannon_records
+    latest_cannon = max(
+        cannon_records,
+        key=lambda record: int(_as_finite_number(record.get("last_draw_index")) or 0),
     )
-    bottom_last = max(
-        (int(_as_finite_number(record.get("last_draw_index")) or 0) for record in bottom_records),
-        default=0,
-    )
-    if cannon_last and bottom_last > cannon_last:
+    cannon_last = int(_as_finite_number(latest_cannon.get("last_draw_index")) or 0)
+    canvas_id = int(_as_finite_number(latest_cannon.get("last_canvas_id")) or 0)
+    canvas_frame = int(_as_finite_number(latest_cannon.get("last_canvas_frame")) or 0)
+    if canvas_id and canvas_frame:
+        comparable_bottom = [
+            record for record in bottom_records
+            if int(_as_finite_number(record.get("last_canvas_id")) or 0) == canvas_id
+            and int(_as_finite_number(record.get("last_canvas_frame")) or 0) == canvas_frame
+        ]
+        bottom_last = max(
+            (int(_as_finite_number(record.get("last_draw_index")) or 0) for record in comparable_bottom),
+            default=0,
+        )
+        same_observed_frame = bool(comparable_bottom)
+    else:
+        # Backward-compatible analysis for persisted/test records made before the
+        # per-canvas frame probe existed.
+        bottom_last = max(
+            (int(_as_finite_number(record.get("last_draw_index")) or 0) for record in bottom_records),
+            default=0,
+        )
+        same_observed_frame = True
+    if same_observed_frame and cannon_last and bottom_last > cannon_last:
         issues.append({
             "id": f"source_contract_cannon_draw_order_invalid:{profile_id}",
             "severity": "high",
@@ -2054,6 +2171,206 @@ def _schedule_idle_close():
     _idle_close_task = asyncio.create_task(_idle())
 
 
+def _has_fishjoy_runtime_contract(source_assets) -> bool:
+    return any(
+        str(item.get("contract_profile_id") or "").lower().startswith("fishjoy@")
+        for item in source_assets or [] if isinstance(item, dict)
+    )
+
+
+async def _exercise_fishjoy_flow(page) -> dict:
+    """Exercise fire -> impact/web -> capture -> reward against the live canvas.
+
+    The target comes from actual drawImage records, so this is a behaviour check rather
+    than a source-text search.  The original Fishjoy namespace is supported directly;
+    ports may alternatively expose ``window.__GAME_TEST_HOOKS__.snapshot()``.
+    """
+
+    install_reward_probe_js = """() => {
+      try {
+        const ns = window.Q && Q.use && Q.use('fish');
+        const player = ns && ns.game && ns.game.player;
+        if (!player || typeof player.updateCoin !== 'function') return false;
+        window.__fishjoyVerifierMetrics = window.__fishjoyVerifierMetrics || {rewardCredits: 0};
+        if (!player.__verifierUpdateCoinWrapped) {
+          const original = player.updateCoin;
+          player.updateCoin = function(value, increase) {
+            if (increase && Number(value) > 0) window.__fishjoyVerifierMetrics.rewardCredits += 1;
+            return original.apply(this, arguments);
+          };
+          player.__verifierUpdateCoinWrapped = true;
+        }
+        return true;
+      } catch (_) { return false; }
+    }"""
+    counts_js = f"""() => {{
+      const p = window[{json.dumps(_DRAW_IMAGE_PROBE_GLOBAL)}] || {{}};
+      const out = {{}};
+      for (const r of (p.records || [])) out[r.contract_role || ''] = Number(r.count || 0);
+      return out;
+    }}"""
+    snapshot_js = """() => {
+      try {
+        const hook = window.__GAME_TEST_HOOKS__;
+        if (hook && typeof hook.snapshot === 'function') return hook.snapshot() || {};
+      } catch (_) {}
+      try {
+        const ns = window.Q && Q.use && Q.use('fish');
+        const player = ns && ns.game && ns.game.player;
+        if (player) return {
+          coin: Number(player.coin),
+          captured: Number(player.numCapturedFishes || player.captured || 0),
+          rewardCredits: Number((window.__fishjoyVerifierMetrics || {}).rewardCredits || 0)
+        };
+      } catch (_) {}
+      return {};
+    }"""
+    target_js = f"""() => {{
+      const p = window[{json.dumps(_DRAW_IMAGE_PROBE_GLOBAL)}] || {{}};
+      const records = (p.records || []).filter(r => r.contract_role === 'fish' && Number(r.visible_count || 0) > 0);
+      const cannon = (p.records || []).filter(r => r.contract_role === 'cannon' && Number(r.visible_count || 0) > 0)
+        .sort((a, b) => Number(b.last_draw_index || 0) - Number(a.last_draw_index || 0))[0];
+      const center = r => [
+        (Number(r.last_dest_left ?? r.dest_left) + Number(r.last_dest_right ?? r.dest_right)) / 2,
+        (Number(r.last_dest_top ?? r.dest_top) + Number(r.last_dest_bottom ?? r.dest_bottom)) / 2
+      ];
+      const cannonCenter = cannon ? center(cannon) : [0, 1e9];
+      const preferred = records.filter(r => r.resource_id === 'fish1');
+      const candidates = preferred.length ? preferred : records;
+      candidates.sort((a, b) => {{
+        const [ax, ay] = center(a), [bx, by] = center(b);
+        const ad = (ax-cannonCenter[0])**2 + (ay-cannonCenter[1])**2;
+        const bd = (bx-cannonCenter[0])**2 + (by-cannonCenter[1])**2;
+        return ad - bd || Number(b.last_draw_index || 0) - Number(a.last_draw_index || 0);
+      }});
+      const r = candidates[0], canvas = document.querySelector('canvas');
+      if (!r || !canvas) return null;
+      const box = canvas.getBoundingClientRect();
+      const cw = Number(r.canvas_width || canvas.width || 1), ch = Number(r.canvas_height || canvas.height || 1);
+      const left = Number(r.last_dest_left ?? r.dest_left), right = Number(r.last_dest_right ?? r.dest_right);
+      const top = Number(r.last_dest_top ?? r.dest_top), bottom = Number(r.last_dest_bottom ?? r.dest_bottom);
+      return {{
+        x: box.left + ((left + right) / 2) * box.width / cw,
+        y: box.top + ((top + bottom) / 2) * box.height / ch
+      }};
+    }}"""
+    try:
+        await page.evaluate(install_reward_probe_js)
+        before_counts = await page.evaluate(counts_js)
+        before_state = await page.evaluate(snapshot_js)
+        if not isinstance(before_counts, dict) or not isinstance(before_state, dict):
+            return {"observed": False}
+        clicks_sent = 0
+        accepted_shots = 0
+        reward_increases = 0
+        prior_state = before_state
+        for _ in range(12):
+            target = await page.evaluate(target_js)
+            if not isinstance(target, dict):
+                break
+            x, y = _as_finite_number(target.get("x")), _as_finite_number(target.get("y"))
+            if x is None or y is None:
+                break
+            pre = await page.evaluate(snapshot_js)
+            await page.mouse.click(x, y)
+            clicks_sent += 1
+            await page.wait_for_timeout(120)
+            after_fire = await page.evaluate(snapshot_js)
+            pre_coin = _as_finite_number((pre or {}).get("coin")) if isinstance(pre, dict) else None
+            fire_coin = _as_finite_number((after_fire or {}).get("coin")) if isinstance(after_fire, dict) else None
+            if pre_coin is not None and fire_coin is not None and fire_coin < pre_coin:
+                accepted_shots += 1
+            await page.wait_for_timeout(520)
+            after_impact = await page.evaluate(snapshot_js)
+            fire_coin = _as_finite_number((after_fire or {}).get("coin")) if isinstance(after_fire, dict) else None
+            impact_coin = _as_finite_number((after_impact or {}).get("coin")) if isinstance(after_impact, dict) else None
+            if fire_coin is not None and impact_coin is not None and impact_coin > fire_coin:
+                reward_increases += 1
+            if isinstance(after_impact, dict):
+                prior_state = after_impact
+        after_counts = await page.evaluate(counts_js)
+        after_state = await page.evaluate(snapshot_js)
+        if not isinstance(after_counts, dict):
+            after_counts = {}
+        if not isinstance(after_state, dict):
+            after_state = prior_state if isinstance(prior_state, dict) else {}
+        return {
+            "observed": True,
+            "clicks_sent": clicks_sent,
+            "accepted_shots": accepted_shots,
+            "bullet_delta": int(after_counts.get("bullet", 0) or 0) - int(before_counts.get("bullet", 0) or 0),
+            "web_delta": int(after_counts.get("web", 0) or 0) - int(before_counts.get("web", 0) or 0),
+            "coin_before": before_state.get("coin"),
+            "coin_after": after_state.get("coin"),
+            "captured_before": before_state.get("captured"),
+            "captured_after": after_state.get("captured"),
+            "reward_increases": reward_increases,
+            "reward_credits_before": before_state.get("rewardCredits"),
+            "reward_credits_after": after_state.get("rewardCredits"),
+        }
+    except Exception as exc:
+        logger.warning("fishjoy_gameplay_probe_failed", error=str(exc) or repr(exc))
+        return {"observed": False}
+
+
+def _analyze_fishjoy_gameplay_probe(probe: dict, draw_records=None) -> list[dict]:
+    if not isinstance(probe, dict) or not probe.get("observed"):
+        roles = {
+            str(item.get("contract_role") or "")
+            for item in (draw_records or []) if isinstance(item, dict)
+        }
+        if {"fish", "cannon"}.issubset(roles):
+            return [{
+                "id": "source_gameplay_probe_unavailable:fishjoy@1",
+                "severity": "high",
+                "msg": "捕鱼场景已经运行，但核心玩法探针无法读取或执行，不能证明开炮到金币结算链路成立。",
+                "fix": "保留原 fish.game.player 状态，或提供 window.__GAME_TEST_HOOKS__.snapshot() 返回 coin/captured。",
+            }]
+        return []
+    clicks = int(probe.get("clicks_sent") or 0)
+    if clicks <= 0:
+        return []
+    issues: list[dict] = []
+    bullet_delta = int(probe.get("bullet_delta") or 0)
+    web_delta = int(probe.get("web_delta") or 0)
+    if bullet_delta <= 0:
+        issues.append({
+            "id": "source_gameplay_fire_chain_broken:fishjoy@1",
+            "severity": "high",
+            "msg": "浏览器已点击画面中的鱼，但炮台没有产生可见源码子弹，开炮链路中断。",
+            "fix": "保持原版输入→扣除炮弹费用→炮台开火→按共享炮口原点创建 Bullet 的调用链。",
+        })
+        return issues
+    if web_delta <= 0:
+        issues.append({
+            "id": "source_gameplay_impact_chain_broken:fishjoy@1",
+            "severity": "high",
+            "msg": "浏览器确认已经开炮，但多次射击后从未在命中处绘制源码渔网。",
+            "fix": "恢复 Bullet.checkCollision/destory 到 Web 创建逻辑，并使用当前炮级对应的 web 源矩形。",
+        })
+        return issues
+    before = _as_finite_number(probe.get("captured_before"))
+    after = _as_finite_number(probe.get("captured_after"))
+    if before is not None and after is not None and after <= before:
+        issues.append({
+            "id": "source_gameplay_capture_chain_broken:fishjoy@1",
+            "severity": "high",
+            "msg": "子弹和渔网均已运行，但连续命中后捕获计数从未增加，捕获判定链路中断。",
+            "fix": "渔网内逐鱼使用源码 captureRate 与炮级修正判定；成功后切换 capture 动画并进入奖励结算。",
+        })
+    elif before is not None and after is not None and after > before:
+        credits_before = int(probe.get("reward_credits_before") or 0)
+        credits_after = int(probe.get("reward_credits_after") or 0)
+        if credits_after <= credits_before and int(probe.get("reward_increases") or 0) <= 0:
+            issues.append({
+                "id": "source_gameplay_reward_chain_broken:fishjoy@1",
+                "severity": "high",
+                "msg": "捕获计数已经增加，但命中结算后未观测到金币回升，捕获奖励没有进入玩家账户。",
+                "fix": "捕获成功后按鱼种源码 coin 值更新 player.coin，并刷新逐字裁切的金币 HUD。",
+            })
+    return issues
+
+
 async def run_headless(
     html: str,
     timeout_s: float = 15.0,
@@ -2086,7 +2403,7 @@ async def _run_headless_impl(
         return None
     atlas_assets = _normalise_source_atlases(source_assets)
 
-    async def _run() -> tuple[list[str], bool, bytes, list[dict], dict, dict, list[dict]]:
+    async def _run() -> tuple[list[str], bool, bytes, list[dict], dict, dict, list[dict], dict]:
         # --no-sandbox：root 容器/AutoDL 等环境下 Chromium 启动的必要条件。
         # 去掉沙箱降低进程隔离，威胁模型里的缓解措施：
         #   1. 仅跑不可信 HTML 且拦截外部网络请求（只额外放行本服务只读 /assets/）
@@ -2170,6 +2487,9 @@ async def _run_headless_impl(
                 pass
             # 总观察时间超过 3 秒，覆盖常见的“加载完成先启动、3 秒超时又启动”缺陷。
             await page.wait_for_timeout(_HEADLESS_POST_INPUT_WAIT_MS)
+            gameplay_probe = {}
+            if _has_fishjoy_runtime_contract(atlas_assets):
+                gameplay_probe = await _exercise_fishjoy_flow(page)
             shot = await page.screenshot()
             draw_records: list[dict] = []
             if atlas_assets:
@@ -2206,6 +2526,7 @@ async def _run_headless_impl(
                 runtime_probe,
                 input_probe,
                 asset_failures,
+                gameplay_probe,
             )
         finally:
             await page.close()  # 即便超时取消，也保证关掉页面；浏览器实例留给下次复用
@@ -2221,6 +2542,7 @@ async def _run_headless_impl(
                 runtime_probe,
                 input_probe,
                 asset_failures,
+                gameplay_probe,
             ) = await asyncio.wait_for(_run(), timeout=timeout_s)
 
             seen = set()
@@ -2246,13 +2568,16 @@ async def _run_headless_impl(
                                "msg": "画面出现严重的面片撕裂/碎片化（3D 渲染的顶点计算或投影/背面剔除逻辑有误）",
                                "fix": "检查 V3 类方法（sub/mul/cross/norm）是否返回正确类型、project() 返回值是否被当成 V3 调用方法、背面剔除是否在视角空间判 vn.z、旋转后 orig 是否 Math.round 量化"})
             issues.extend(_analyze_source_rect_bounds(draw_records))
-            issues.extend(_analyze_fishjoy_cannon_draw_records(draw_records))
+            issues.extend(_analyze_fishjoy_cannon_draw_records(
+                draw_records, expected=_has_fishjoy_runtime_contract(atlas_assets)
+            ))
             issues.extend(_analyze_atlas_draw_records(draw_records))
             issues.extend(_analyze_atlas_frame_records(draw_records))
             issues.extend(_analyze_placeholder_draw_records(draw_records))
             issues.extend(_analyze_animation_loop_probe(runtime_probe))
             issues.extend(_analyze_input_reachability_probe(input_probe))
             issues.extend(_analyze_asset_load_failures(asset_failures))
+            issues.extend(_analyze_fishjoy_gameplay_probe(gameplay_probe, draw_records))
         except (NameError, AttributeError, TypeError, UnboundLocalError) as e:
             # 自身编程错误（而非环境性失败）：必须高调记录，否则无头检测会静默退化成"从不报告问题"
             logger.error("headless_verify_bug", error=repr(e))
@@ -2273,12 +2598,18 @@ async def verify_game(
     source_assets: list[dict] | None = None,
     source_specs: list[dict] | None = None,
 ) -> dict:
-    """返回 {ok, issues}。ok = 没有 high/medium 级问题（low 仅提示，不触发自修）。"""
+    """Return verification issues with strict error/warning separation.
+
+    Only ``high`` issues block delivery and trigger automatic repair.  ``medium``
+    and ``low`` findings are warnings: they remain visible but may not cause model
+    rewrites, because a speculative lint warning must never degrade working gameplay.
+    """
     issues = analyze_static(html)
     issues.extend(_check_source_reference_contract(html, source_specs, source_assets))
     if use_headless:
         headless_assets = _source_assets_with_contract_metadata(source_assets, source_specs)
-        h = await run_headless(html, source_assets=headless_assets)
+        timeout_s = 24.0 if _has_fishjoy_runtime_contract(headless_assets) else 15.0
+        h = await run_headless(html, timeout_s=timeout_s, source_assets=headless_assets)
         if h:
             issues.extend(h)
     # 按 id 去重
@@ -2287,5 +2618,11 @@ async def verify_game(
         if i["id"] not in seen:
             seen.add(i["id"])
             uniq.append(i)
-    blocking = [i for i in uniq if i["severity"] in ("high", "medium")]
-    return {"ok": len(blocking) == 0, "issues": uniq, "blocking": blocking}
+    blocking = [i for i in uniq if i["severity"] == "high"]
+    warnings = [i for i in uniq if i["severity"] in ("medium", "low")]
+    return {
+        "ok": len(blocking) == 0,
+        "issues": uniq,
+        "blocking": blocking,
+        "warnings": warnings,
+    }
