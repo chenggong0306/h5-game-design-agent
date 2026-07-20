@@ -191,15 +191,24 @@
                 <div class="skill-add-form">
                     <div class="skill-form-help">
                         <strong>一个源码项目可以作为一个技能参考</strong>
-                        <span>例：名称“超级玛丽类平台跳跃”，描述“横版平台跳跃、关卡闯关、跳跃踩敌玩法”。名称和描述用于自动匹配；命中后会先加载 HTML+CSS+JS 组合参考，再生成新游戏。</span>
+                        <span>完整且可运行的项目默认忠实移植，再做兼容或视觉增强；依赖不完整时才降级为参考创作。</span>
                     </div>
                     <input type="text" id="skill-name" maxlength="100" placeholder="技能名称，如：超级玛丽类平台跳跃">
                     <input type="text" id="skill-desc" maxlength="500" placeholder="技能描述，如：横版平台跳跃、关卡闯关、跳跃踩敌玩法">
                     <textarea id="skill-content" rows="5" maxlength="100000" placeholder="补充说明/复用规则（上传源码时可留空；不上传源码时必填）"></textarea>
+                    <label class="skill-mode-row" for="skill-source-mode">
+                        <span>源码复用模式</span>
+                        <select id="skill-source-mode">
+                            <option value="">自动（完整项目默认忠实移植）</option>
+                            <option value="faithful_port">faithful_port · 原玩法忠实移植</option>
+                            <option value="extend">extend · 保留玩法后增强</option>
+                            <option value="inspired">inspired · 仅参考素材和风格</option>
+                        </select>
+                    </label>
                     <div class="skill-source-box">
                         <div>
                             <strong>参考源码（可选）</strong>
-                            <p>一个文件夹或一个 ZIP 视为一个游戏项目。原始 HTML/JS/CSS 按目录保存并自动组合参考；安全的图片、音频和字体也会保存，并生成游戏内可直接加载的素材 URL。</p>
+                            <p>一个文件夹或一个 ZIP 视为一个游戏项目。HTML/JS/CSS（含本地压缩运行库）会完整保留并机械打包；图片、音频和字体会改写为可加载 URL。</p>
                         </div>
                         <div class="skill-source-actions">
                             <label class="skill-source-label">

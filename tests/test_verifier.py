@@ -81,6 +81,15 @@ class StaticAnalysisTests(unittest.TestCase):
         self.assertIn("no_mouse_input", got)
         self.assertIn("dpr_css_size", got)
 
+    def test_medium_issue_is_warning_and_does_not_trigger_repair(self):
+        html = ("<!doctype html><html><body><canvas></canvas><script>"
+                "const ctx={scale(){}};const dpr=2;ctx.scale(dpr,dpr);"
+                "</script></body></html>")
+        res = asyncio.run(verifier.verify_game(html, use_headless=False))
+        self.assertTrue(res["ok"], res)
+        self.assertNotIn("ctx_scale_dpr", ids(res["blocking"]))
+        self.assertIn("ctx_scale_dpr", ids(res["warnings"]))
+
     def test_recognised_source_contract_marker_is_required(self):
         html = (
             "<!doctype html><html><body><canvas></canvas>"
@@ -370,6 +379,41 @@ class StaticAnalysisTests(unittest.TestCase):
 
         self.assertNotIn("source_contract_cannon_position_invalid:fishjoy@1", got)
         self.assertNotIn("source_contract_cannon_animation_invalid:fishjoy@1", got)
+
+    def test_fishjoy_runtime_flow_requires_bullet_web_capture_and_reward(self):
+        unavailable = verifier._analyze_fishjoy_gameplay_probe(
+            {"observed": False},
+            [{"contract_role": "fish"}, {"contract_role": "cannon"}],
+        )
+        self.assertIn("source_gameplay_probe_unavailable:fishjoy@1", ids(unavailable))
+
+        fire = verifier._analyze_fishjoy_gameplay_probe({
+            "observed": True, "clicks_sent": 4, "bullet_delta": 0,
+        })
+        self.assertIn("source_gameplay_fire_chain_broken:fishjoy@1", ids(fire))
+
+        impact = verifier._analyze_fishjoy_gameplay_probe({
+            "observed": True, "clicks_sent": 4, "bullet_delta": 10, "web_delta": 0,
+        })
+        self.assertIn("source_gameplay_impact_chain_broken:fishjoy@1", ids(impact))
+
+        capture = verifier._analyze_fishjoy_gameplay_probe({
+            "observed": True, "clicks_sent": 8, "bullet_delta": 10, "web_delta": 2,
+            "captured_before": 1, "captured_after": 1,
+        })
+        self.assertIn("source_gameplay_capture_chain_broken:fishjoy@1", ids(capture))
+
+        reward = verifier._analyze_fishjoy_gameplay_probe({
+            "observed": True, "clicks_sent": 8, "bullet_delta": 10, "web_delta": 2,
+            "captured_before": 1, "captured_after": 2, "reward_increases": 0,
+        })
+        self.assertIn("source_gameplay_reward_chain_broken:fishjoy@1", ids(reward))
+
+        complete = verifier._analyze_fishjoy_gameplay_probe({
+            "observed": True, "clicks_sent": 8, "bullet_delta": 10, "web_delta": 2,
+            "captured_before": 1, "captured_after": 2, "reward_increases": 1,
+        })
+        self.assertEqual(complete, [])
 
     def test_non_fish_profile_does_not_apply_vertical_fish_semantics(self):
         spec = {

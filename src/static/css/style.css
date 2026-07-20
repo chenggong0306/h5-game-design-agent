@@ -810,6 +810,8 @@ body {
     padding: 12px; border: 1px solid var(--border); border-radius: 8px;
     background: var(--bg-primary);
 }
+.skill-mode-row { display: grid; grid-template-columns: 120px minmax(0, 1fr); align-items: center; gap: 10px; color: var(--text-secondary); font-size: 13px; }
+.skill-mode-row select { width: 100%; }
 .skill-source-box p { margin: 4px 0 0; color: var(--text-secondary); font-size: 12px; line-height: 1.5; }
 .skill-source-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .skill-source-label, #btn-clear-skill-source {
