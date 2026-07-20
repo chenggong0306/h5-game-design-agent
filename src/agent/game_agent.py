@@ -1687,17 +1687,30 @@ def load_skill(skill_name: str) -> str:
                         "也**不要**把压缩库当源码读，或因它大退回纯 Canvas 重造（那是质量倒退）。\n"
                         + lib_lines
                     )
+                if source_mode in {SOURCE_MODE_FAITHFUL, SOURCE_MODE_EXTEND}:
+                    # 忠实/增强模式：机械移植是逐字内联，不需要读源码。给干脆的指令，
+                    # 且**不**在这里教 search_skill_source/load_skill_source（那会诱导弱模型去
+                    # 探索源码、白白浪费回合，甚至转去 write_game 重写）。
+                    mode_directive = (
+                        f"复用模式：`{source_mode}`（{mode_label(source_mode)}）；"
+                        + ("运行依赖完整。" if runnable else "运行依赖不完整：" + "；".join(readiness_issues))
+                        + "\n\n**下一步就调用 `port_skill_source(skill_name)`——现在、直接调，"
+                        "不要先 `load_skill_source`/`load_skill_web_bundle`/`search_skill_source` 读源码"
+                        "（机械移植逐字内联，不需要你读懂逻辑），也不要 `write_game` 重写。**"
+                        "工具会自动内联原 HTML/CSS/JS、改写素材与运行时库 URL，建立原版质量基线。"
+                        "移植完成后，仅当预览报运行错误时，才用 `search_code`/`view_code` 定位并 `replace_code` 修那一处。"
+                    )
+                else:
+                    mode_directive = (
+                        f"复用模式：`{source_mode}`（{mode_label(source_mode)}）；"
+                        + ("运行依赖完整。" if runnable else "运行依赖不完整：" + "；".join(readiness_issues))
+                        + "该项目只能参考创作：先 `load_skill_web_bundle(skill_name)` 理解结构，"
+                        "超长或未直接引用的文件用 `search_skill_source` 定位核心符号、"
+                        "`load_skill_source(skill_name, file_path, start_line, line_count)` 精读对应行段，再重新创作。"
+                    )
                 result += (
                     "\n\n## 源码参考项目\n\n"
-                    f"复用模式：`{source_mode}`（{mode_label(source_mode)}）；"
-                    + ("运行依赖完整。" if runnable else "运行依赖不完整：" + "；".join(readiness_issues))
-                    + ("先调用 `port_skill_source(skill_name)` 机械移植并建立原版基线；禁止重新实现玩法。"
-                       if source_mode in {SOURCE_MODE_FAITHFUL, SOURCE_MODE_EXTEND}
-                       else "该项目只能参考创作，先调用 `load_skill_web_bundle(skill_name)` 理解结构。")
-                    + "需要审阅组合源码时仍可调用 `load_skill_web_bundle(skill_name)`，但不得据此手工重写。"
-                    + "源码按原目录分文件保存，同时已解析入口 HTML 对 CSS/JS 的引用关系。"
-                    "超长或未直接引用的文件先用 `search_skill_source` 定位布局、输入与动画核心符号，"
-                    "再用 `load_skill_source(skill_name, file_path, start_line, line_count)` 精读对应行段。"
+                    + mode_directive
                     + (f"\n\n推荐入口：`{entrypoint}`" if entrypoint else "")
                     + "\n\n"
                     "### 源码文件\n" + "\n".join(source_lines)
@@ -3072,8 +3085,11 @@ SYSTEM_PROMPT = """你是一个专业的 H5 页面游戏设计 AI 助手，帮�
 1. **必须调用 `search_assets("图片 音频 素材")`** → 搜索公共素材库，但此时不要因为结果为空就决定全部用 Canvas。
    - **有公共素材** → 调用 `load_skill("assets")` 获取 loadImages/loadSounds/drawSprite 用法，用图片渲染游戏对象。
 2. **匹配源码技能后先看 mode，禁止一律重写**：调用 `load_skill("技能名")` 后按其模式执行：
-   - `faithful_port`（完整源码默认）：立即调用 `port_skill_source("技能名")`。工具会机械内联原 HTML/CSS/JS、
-     改写素材 URL 并建立原版质量基线。不要再调用 `write_game` 重写，不要改变玩法；只允许修复运行兼容性。
+   - `faithful_port`（完整源码默认）：`load_skill` 后**紧接着就调用 `port_skill_source("技能名")`，中间不要再读源码**——
+     机械移植是逐字内联，不需要你事先"读懂"游戏逻辑，读 `load_skill_source`/`load_skill_web_bundle`/`search_skill_source`
+     只是白白浪费回合和上下文。工具会自动机械内联原 HTML/CSS/JS、改写素材 URL（含运行时库的 /assets/source URL）并建立
+     原版质量基线。移植完成后**只有当预览报运行错误时**，才用 `search_code`/`view_code` 定位并 `replace_code` 修那一处
+     兼容问题；不要再 `write_game` 重写、不要改变玩法。（`load_skill_assets` 也可跳过，port 已自动处理素材 URL。）
    - `extend`：同样先调用 `port_skill_source("技能名", mode="extend")` 跑通原版，再用 replace/insert 做用户明确要求的
      响应式、开始界面或特效增强。核心状态、碰撞、数值、资源与原布局不得重写；退化会自动回滚基线。
    - `inspired`：仅此模式才调用 `load_skill_web_bundle`、`search_skill_source`、`load_skill_source` 理解结构后重新创作。
