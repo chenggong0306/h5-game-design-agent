@@ -71,6 +71,10 @@ class Settings(BaseSettings):
     # 上传大小上限（字节，默认 20MB）：素材上传与技能 ZIP 导入共用。
     # 这两个端点都把整个文件读进内存，uvicorn/Starlette 默认不限请求体大小，必须设限防 OOM
     max_upload_bytes: int = 20 * 1024 * 1024
+    # 源码项目导入上限（字节，默认 200MB）：整游戏项目自带图片/音频/大库，20MB 装不下真实项目。
+    # 与 max_upload_bytes 分开——素材/技能 ZIP 端点保持紧上限防误传超大文件，源码导入走大上限
+    # （本机工具，瞬时内存占用可接受；ZIP 解压炸弹守卫仍按本值 ×3 派生）。.env 里 SOURCE_MAX_UPLOAD_BYTES 可覆盖
+    source_max_upload_bytes: int = 200 * 1024 * 1024
 
     # 项目
     project_name: str = "AI Game Design Agent"

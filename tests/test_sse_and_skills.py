@@ -204,6 +204,39 @@ class SkillsApiTests(unittest.TestCase):
         )
         self.assertEqual(r.status_code, 400)
 
+    def test_source_upload_uses_dedicated_cap(self):
+        """源码导入走 source_max_upload_bytes 独立上限：
+        通用 max_upload_bytes 调到 1 字节也不拦源码导入；源码上限本身仍然生效。"""
+        orig_source = routes._settings.source_max_upload_bytes
+        orig_generic = routes._settings.max_upload_bytes
+        payload = [("files", (
+            "demo/index.html",
+            b"<html><canvas id='g'></canvas><script>function startGame(){}</script></html>",
+            "text/html",
+        ))]
+        try:
+            routes._settings.max_upload_bytes = 1
+            routes._settings.source_max_upload_bytes = 200 * 1024 * 1024
+            with mock.patch.object(routes, "_save_custom_skills"):
+                ok = self.client.post(
+                    "/api/skills/source",
+                    data={"name": "cap_demo_pass", "description": "上限用例", "content": ""},
+                    files=payload,
+                )
+            self.assertEqual(ok.status_code, 200, ok.text)
+
+            routes._settings.source_max_upload_bytes = 16
+            r = self.client.post(
+                "/api/skills/source",
+                data={"name": "cap_demo_reject", "description": "上限用例", "content": ""},
+                files=payload,
+            )
+            self.assertEqual(r.status_code, 413)
+            self.assertIn("源码上传总量", r.json()["detail"])
+        finally:
+            routes._settings.source_max_upload_bytes = orig_source
+            routes._settings.max_upload_bytes = orig_generic
+
     def test_import_source_folder_as_one_skill(self):
         index_html = b"""<!doctype html>
 <html><head><link rel="stylesheet" href="css/style.css"></head>

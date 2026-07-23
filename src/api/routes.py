@@ -1194,6 +1194,9 @@ _SOURCE_MAX_ARCHIVE_ENTRIES = 5000
 _SOURCE_MAX_UPLOAD_PARTS = 5000
 _SOURCE_MAX_FILE_BYTES = 2 * 1024 * 1024
 _SOURCE_MAX_TEXT_BYTES = 2 * 1024 * 1024
+# 运行时库单文件上限单列（16MB）：库不进模型可读文本预算，只存盘回源，
+# 卡 2MB 会把大游戏的打包产物（game.min.js 等）踢掉，直接毁掉忠实移植
+_SOURCE_MAX_LIB_BYTES = 16 * 1024 * 1024
 _SOURCE_MAX_ASSET_PATHS = 2000
 _SOURCE_USABLE_ASSET_EXTS = set().union(*_ALLOWED_ASSET_EXTS.values()) | {".js", ".mjs", ".css"}
 # 运行时库文件名判定：压缩库（*.min.js/.min.css）或常见引擎/框架库。
@@ -1476,7 +1479,7 @@ def _expand_source_uploads(
                             "ZIP 内路径含越界或非法字符，为安全起见未导入，游戏无法引用该文件"))
                         continue
                     expanded_bytes += info.file_size
-                    if expanded_bytes > _settings.max_upload_bytes * 3:
+                    if expanded_bytes > _settings.source_max_upload_bytes * 3:
                         raise _SourceImportLimitError(f"{safe_name}: 解压后内容超过安全上限")
                     if len(entries) >= _SOURCE_MAX_ARCHIVE_ENTRIES:
                         raise _SourceImportLimitError(
@@ -1488,7 +1491,7 @@ def _expand_source_uploads(
             error_details.append(_skip_detail(
                 safe_name, "unsupported_type",
                 "ZIP 文件损坏无法解压，其中的内容完全没有导入"))
-    if expanded_bytes > _settings.max_upload_bytes * 3:
+    if expanded_bytes > _settings.source_max_upload_bytes * 3:
         raise _SourceImportLimitError("源码项目展开后超过安全上限")
     return entries, errors, error_details
 
@@ -1530,9 +1533,9 @@ def _build_source_reference(
         # 运行时库：不当可读源码（536KB 压缩 three.js 读进上下文是灾难），而是作为
         # 「可服务但不可读」的资产回源，生成游戏用 <script src> 引入即可忠实还原。
         if _is_runtime_library(name_lower, suffix):
-            if len(raw) > _SOURCE_MAX_FILE_BYTES:
+            if len(raw) > _SOURCE_MAX_LIB_BYTES:
                 path_statuses[path] = "skipped"
-                skipped.append(f"{path}: 运行时库超过 {_SOURCE_MAX_FILE_BYTES // (1024 * 1024)}MB")
+                skipped.append(f"{path}: 运行时库超过 {_SOURCE_MAX_LIB_BYTES // (1024 * 1024)}MB")
                 skipped_details.append(_skip_detail(
                     path, "too_large",
                     "运行时库超过单文件大小上限，未保存，游戏无法引用它"))
@@ -1677,10 +1680,10 @@ async def _read_source_uploads(files: list[UploadFile]) -> list[tuple[str, bytes
     for file in files:
         raw = await file.read()
         total += len(raw)
-        if total > _settings.max_upload_bytes:
+        if total > _settings.source_max_upload_bytes:
             raise HTTPException(
                 413,
-                f"源码上传总量超过 {_settings.max_upload_bytes // (1024 * 1024)}MB 上限",
+                f"源码上传总量超过 {_settings.source_max_upload_bytes // (1024 * 1024)}MB 上限",
             )
         uploaded.append((file.filename or "", raw))
     return uploaded
