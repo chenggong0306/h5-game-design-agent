@@ -7,6 +7,7 @@
 """
 
 import asyncio
+import io
 import json
 import re
 import sys
@@ -19,7 +20,64 @@ from src.utils.logger import logger
 
 def looks_like_game(html: str) -> bool:
     low = (html or "").lower()
-    return ("<canvas" in low or "getcontext" in low) and "<script" in low
+    if "<script" not in low:
+        return False
+    # Phaser 引擎游戏：<canvas> 由引擎运行时创建，HTML 里可能没有 canvas 标签
+    if "new phaser.game" in low or "phaser.min.js" in low:
+        return True
+    return "<canvas" in low or "getcontext" in low
+
+
+# ---------------- 质量探针：精美要素静态检测（功能之外的"简陋"信号） ----------------
+# 功能自检管"能不能玩"，这里管"糙不糙"。每项: (id, label, 正则, core, hint)。
+# core=True 的缺口单项即可触发补强轮（无声/无反馈/生硬是简陋感的三大来源）。
+# 正则宁漏勿误报：探到存在就不提示，探不到才列为缺口交给模型补。
+
+_QUALITY_PROBES = [
+    ("audio", "音频（BGM/音效）",
+     r"AudioContext|webkitAudioContext|new Audio\(|howler|zzfx", True,
+     "用 polish 技能「极简音频引擎」补 WebAudio 合成 BGM + 玩法事件音效，"
+     "ensureAudio() 挂首次用户手势，HUD 加 🔊/🔇 静音开关"),
+    ("particles", "粒子反馈",
+     r"spawnParticles|particles\.push|new Particle|add\.particles", True,
+     "按 polish 技能粒子系统给击中/得分/死亡接 spawnParticles"),
+    ("easing", "缓动/平滑动画",
+     r"\bease\.|easeOut|easeIn|outQuad|outBack|outBounce|\blerp\s*\(", True,
+     "按 polish 技能缓动函数给元素出场/UI 数值/状态切换加 ease/lerp 平滑，消除生硬瞬移"),
+    ("impact", "打击感（震屏/闪白/顿帧）",
+     r"screenShake|hitstop|hitStop|flashTime|freezeFrame|freezeUntil|trauma|cameras?\.main\.shake|\.shake\(", False,
+     "重击/爆炸/死亡加 screenShake 或白闪/顿帧（见 polish/visual §6）"),
+    ("float_text", "得分浮字",
+     r"floatText|FloatText|addFloat", False,
+     "得分/奖励处加 addFloatText 浮动数字反馈"),
+    ("gradient", "渐变/氛围背景",
+     r"createLinearGradient|createRadialGradient|fillGradientStyle", False,
+     "背景用多层渐变+氛围效果（见 visual §3），不要纯色一填了事"),
+    ("difficulty", "难度成长",
+     r"difficulty|getDifficulty|\bwave\b|\blevel\b", False,
+     "按 gamedesign 难度曲线让强度随 gameTime 逐步提升"),
+    ("hiscore", "最高分持久化",
+     r"hiScore|highScore|bestScore|localStorage", False,
+     "用 localStorage 保存最高分并显示在 HUD 与结束画面"),
+    ("game_over", "结束画面",
+     r"GAME OVER|游戏结束|gameOver|drawOver", False,
+     "按 gamedesign 规范补完整结束画面（得分+最高分+重玩提示）"),
+]
+
+
+def quality_gaps(html: str) -> list[dict]:
+    """静态探测生成游戏缺失的"精美要素"，返回 [{id,label,hint,core}]。
+    只用于全新生成的游戏（忠实移植不适用——原版说了算）。"""
+    gaps = []
+    for pid, label, pattern, core, hint in _QUALITY_PROBES:
+        if not re.search(pattern, html or ""):
+            gaps.append({"id": pid, "label": label, "hint": hint, "core": core})
+    return gaps
+
+
+def should_polish(gaps: list[dict]) -> bool:
+    """任一核心缺口，或总缺口 ≥3，才值得追加一轮补强（小缺口不折腾）。"""
+    return any(g["core"] for g in gaps) or len(gaps) >= 3
 
 
 # ---------------- 静态检查（高精度、低误报） ----------------
@@ -846,6 +904,10 @@ _PREVIEW_ASSET_PATH_RE = re.compile(
     r"^/assets/(?:image|audio|spritesheet|tilemap|font)/"
     r"(?!\.)(?!.*\.\.)[A-Za-z0-9_.-]+$"
 )
+# 平台内置运行时库（Phaser 等）：/static/vendor/ 下单文件名，无子目录、防穿越
+_PREVIEW_VENDOR_PATH_RE = re.compile(
+    r"^/static/vendor/(?!\.)(?!.*\.\.)[A-Za-z0-9_.-]+\.(?:js|mjs|css)$"
+)
 _PREVIEW_SOURCE_ASSET_PATH_RE = re.compile(
     r"^/assets/source/[a-f0-9]{32}/(?:"
     r"(?!\.)(?!.*\.\.)[A-Za-z0-9_.-]+"                             # 单段 hash 素材
@@ -868,6 +930,8 @@ def _is_preview_asset_request(url: str) -> bool:
         and bool(
             _PREVIEW_ASSET_PATH_RE.fullmatch(parsed.path)
             or _PREVIEW_SOURCE_ASSET_PATH_RE.fullmatch(parsed.path)
+            or _PREVIEW_VENDOR_PATH_RE.fullmatch(parsed.path)
+            or _PREVIEW_PROJECT_PATH_RE.fullmatch(parsed.path)
         )
     )
 
@@ -881,7 +945,12 @@ def _is_allowed_preview_request(url: str) -> bool:
     return scheme in {"data", "about", "blob"} or _is_preview_asset_request(url)
 
 
-def _with_preview_asset_base(html: str) -> str:
+_PREVIEW_PROJECT_PATH_RE = re.compile(
+    r"^/project/[A-Za-z0-9_-]{1,128}/(?!\.)(?:[A-Za-z0-9_\-.一-鿿]+/)*[A-Za-z0-9_\-.一-鿿]+$"
+)
+
+
+def _with_preview_asset_base(html: str, base_path: str | None = None) -> str:
     """让 page.set_content 的根相对 `/assets/...` 与真实预览一样指向本服务。
 
     若移植版已带自己的 <base href="/assets/source/{bundle}/tree/">（用于解析运行时动态
@@ -893,9 +962,12 @@ def _with_preview_asset_base(html: str) -> str:
     href = ""
     if existing:
         href = existing.group(1) or existing.group(2) or existing.group(3) or ""
+    # 项目模式：调用方显式给定 /project/{sid}/ 基路径（相对引用 js/main.js 由树服务解析）
+    if base_path and re.fullmatch(r"/project/[A-Za-z0-9_-]{1,128}/", base_path):
+        base_href = origin + base_path
     # 只保留「移植版自己注入的 tree base」这一种精确模式并变绝对；其余一切（无 base、
     # 相对、不可信的绝对 http:// 或协议相对 //evil）都替换成指向本服务根，防 SSRF。
-    if re.fullmatch(r"/assets/source/[a-f0-9]{32}/tree/", href or ""):
+    elif re.fullmatch(r"/assets/source/[a-f0-9]{32}/tree/", href or ""):
         base_href = origin + href
     else:
         base_href = origin + "/"
@@ -1921,6 +1993,37 @@ def _analyze_placeholder_draw_records(records) -> list[dict]:
         "fix": "改用源码真正的游戏场景素材；asset_role=placeholder 的网页外壳/尺寸示意图不得预加载或绘制",
     }]
 
+# 最近一次无头自检的末帧截图：视觉评审（VLM 挑毛病）的输入。
+# 自检按会话串行执行，模块级快照足够；仅保留最新一张，不落盘。
+_last_screenshot: dict = {"png": None}
+
+
+def _remember_screenshot(png_bytes: bytes) -> None:
+    if png_bytes:
+        _last_screenshot["png"] = png_bytes
+
+
+def last_screenshot() -> bytes | None:
+    return _last_screenshot["png"]
+
+
+def _frames_identical(a: bytes, b: bytes) -> bool:
+    """两帧截图像素级完全相同 → 画面静止。无法比较时返回 False（宁漏勿误报）。"""
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    try:
+        from PIL import Image, ImageChops
+        ia = Image.open(io.BytesIO(a)).convert("RGB")
+        ib = Image.open(io.BytesIO(b)).convert("RGB")
+        if ia.size != ib.size:
+            return False
+        return ImageChops.difference(ia, ib).getbbox() is None
+    except Exception:
+        return False
+
+
 def _is_blank_png(png_bytes: bytes) -> bool:
     """整屏近乎纯色 → 判为空白（初始化失败/全屏没画东西）。需要 PIL（chromadb 已带 pillow）。"""
     try:
@@ -2375,6 +2478,7 @@ async def run_headless(
     html: str,
     timeout_s: float = 15.0,
     source_assets: list[dict] | None = None,
+    preview_base: str | None = None,
 ) -> list[dict] | None:
     """用 playwright chromium 跑一遍游戏，捕获运行时报错 + 空屏。
     未安装 playwright/chromium 或出错/超时 → 返回 None（视为不可用，降级到纯静态）。
@@ -2386,17 +2490,18 @@ async def run_headless(
     if sys.platform == "win32":
         # uvicorn 在 Windows 的 Selector 循环不支持子进程 → 整套搬到专属 Proactor 循环执行
         try:
-            return await _on_pw_loop(_run_headless_impl(html, timeout_s, source_assets))
+            return await _on_pw_loop(_run_headless_impl(html, timeout_s, source_assets, preview_base))
         except Exception as e:
             logger.warning("headless_verify_failed", error=str(e) or repr(e))
             return None
-    return await _run_headless_impl(html, timeout_s, source_assets)
+    return await _run_headless_impl(html, timeout_s, source_assets, preview_base)
 
 
 async def _run_headless_impl(
     html: str,
     timeout_s: float,
     source_assets: list[dict] | None = None,
+    preview_base: str | None = None,
 ) -> list[dict] | None:
     browser = await _acquire_browser()
     if browser is None:
@@ -2458,9 +2563,10 @@ async def _run_headless_impl(
             page.on("requestfailed", _record_request_failure)
             prepared_html = _with_draw_image_probe(html, atlas_assets)
             prepared_html = _with_preview_runtime_probe(prepared_html)
-            prepared_html = _with_preview_asset_base(prepared_html)
+            prepared_html = _with_preview_asset_base(prepared_html, base_path=preview_base)
             await page.set_content(prepared_html, wait_until="load")
             await page.wait_for_timeout(_HEADLESS_STARTUP_WAIT_MS)
+            shot_pre_input = await page.screenshot()  # 输入前基准帧（时序 diff 用）
             try:
                 # Start controls vary widely across generated mobile games. A single fixed click
                 # used to miss centre buttons around 58% height, so only the title screen was
@@ -2485,12 +2591,14 @@ async def _run_headless_impl(
                     await page.wait_for_timeout(100)
             except Exception:
                 pass
+            shot_post_input = await page.screenshot()  # 输入后帧
             # 总观察时间超过 3 秒，覆盖常见的“加载完成先启动、3 秒超时又启动”缺陷。
             await page.wait_for_timeout(_HEADLESS_POST_INPUT_WAIT_MS)
             gameplay_probe = {}
             if _has_fishjoy_runtime_contract(atlas_assets):
                 gameplay_probe = await _exercise_fishjoy_flow(page)
             shot = await page.screenshot()
+            _remember_screenshot(shot)  # 供视觉评审（VLM）取用
             draw_records: list[dict] = []
             if atlas_assets:
                 try:
@@ -2518,6 +2626,13 @@ async def _run_headless_impl(
                     input_probe = raw_input_probe
             except Exception as e:
                 logger.warning("input_reachability_probe_failed", error=str(e) or repr(e))
+            # 时序帧证据：输入后到静置末帧完全相同 → 疑似冻结（画面正常但主循环死了，
+            # 单帧空白检测抓不到这种）；三帧全同 → 输入无任何可见响应。
+            # 只对声明了 rAF 主循环的游戏判定：有循环就该有动静；纯静态 DOM/无循环
+            # 益智界面完全可能合法静止，硬判会常态化误报。
+            has_raf_loop = "requestanimationframe" in html.lower()
+            frozen = has_raf_loop and _frames_identical(shot_post_input, shot)
+            input_static = frozen and _frames_identical(shot_pre_input, shot_post_input)
             return (
                 errs,
                 _is_blank_png(shot),
@@ -2527,6 +2642,8 @@ async def _run_headless_impl(
                 input_probe,
                 asset_failures,
                 gameplay_probe,
+                frozen,
+                input_static,
             )
         finally:
             await page.close()  # 即便超时取消，也保证关掉页面；浏览器实例留给下次复用
@@ -2543,6 +2660,8 @@ async def _run_headless_impl(
                 input_probe,
                 asset_failures,
                 gameplay_probe,
+                frozen,
+                input_static,
             ) = await asyncio.wait_for(_run(), timeout=timeout_s)
 
             seen = set()
@@ -2567,6 +2686,14 @@ async def _run_headless_impl(
                 issues.append({"id": "visual_tearing", "severity": "high",
                                "msg": "画面出现严重的面片撕裂/碎片化（3D 渲染的顶点计算或投影/背面剔除逻辑有误）",
                                "fix": "检查 V3 类方法（sub/mul/cross/norm）是否返回正确类型、project() 返回值是否被当成 V3 调用方法、背面剔除是否在视角空间判 vn.z、旋转后 orig 是否 Math.round 量化"})
+            if frozen and not blank:
+                issues.append({"id": "frozen_frames", "severity": "medium",
+                               "msg": "输入后画面在整个观察窗口内完全静止（疑似主循环未启动/死循环/游戏冻结）",
+                               "fix": "确认 requestAnimationFrame 主循环已启动且每帧有绘制变化；检查 update 是否被异常中断"})
+            if input_static and not blank:
+                issues.append({"id": "input_no_visual_response", "severity": "medium",
+                               "msg": "模拟点击/按键前后画面无任何像素变化（输入可能未生效或无反馈）",
+                               "fix": "确认开始界面响应 pointerdown/click/空格；任何输入都应有可见反馈"})
             issues.extend(_analyze_source_rect_bounds(draw_records))
             issues.extend(_analyze_fishjoy_cannon_draw_records(
                 draw_records, expected=_has_fishjoy_runtime_contract(atlas_assets)
@@ -2597,6 +2724,7 @@ async def verify_game(
     use_headless: bool = False,
     source_assets: list[dict] | None = None,
     source_specs: list[dict] | None = None,
+    preview_base: str | None = None,
 ) -> dict:
     """Return verification issues with strict error/warning separation.
 
@@ -2609,7 +2737,8 @@ async def verify_game(
     if use_headless:
         headless_assets = _source_assets_with_contract_metadata(source_assets, source_specs)
         timeout_s = 24.0 if _has_fishjoy_runtime_contract(headless_assets) else 15.0
-        h = await run_headless(html, timeout_s=timeout_s, source_assets=headless_assets)
+        h = await run_headless(html, timeout_s=timeout_s, source_assets=headless_assets,
+                               preview_base=preview_base)
         if h:
             issues.extend(h)
     # 按 id 去重
@@ -2625,4 +2754,35 @@ async def verify_game(
         "issues": uniq,
         "blocking": blocking,
         "warnings": warnings,
+        "scores": _axis_scores(uniq, blocking),
     }
+
+
+def _axis_scores(uniq: list[dict], blocking: list[dict]) -> dict:
+    """三轴评分之二（可运行/可玩性）；意图对齐轴由 agent 侧 LLM 判审补充。
+
+    从已有 issue 信号确定性推导，不额外花模型调用。粗粒度即可——
+    它的用途是趋势对比（补强前后/版本间），不是绝对评价。"""
+    ids = {i["id"] for i in uniq}
+    build = 100
+    if "runtime_error" in ids:
+        build -= 45
+    if "blank_screen" in ids:
+        build -= 45
+    if "no_html_close" in ids:
+        build -= 30
+    build -= 10 * sum(
+        1 for i in blocking if i["id"] not in {"runtime_error", "blank_screen", "no_html_close"}
+    )
+    playability = 100
+    if "blank_screen" in ids:
+        playability -= 50
+    if "frozen_frames" in ids:
+        playability -= 35
+    if "input_no_visual_response" in ids:
+        playability -= 30
+    playability -= 10 * sum(
+        1 for i in ids if ("input" in i or "mouse" in i)
+        and i != "input_no_visual_response"
+    )
+    return {"build_health": max(0, build), "playability": max(0, playability)}
