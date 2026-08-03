@@ -28,6 +28,9 @@ class Settings(BaseSettings):
     max_output_tokens: int = 8192
     # 单回合墙钟上限（秒）：防止个别回合（工具循环/自修）跑太久、占资源。流式与非流式都生效。
     turn_deadline_seconds: float = 900.0  # 大型游戏一轮要写十几段，600s 会掐断主回合
+    # Unity 线专属回合上限：编辑器施工+PlayMode 自测+WebGL 构建（3-6 分钟）天然比 H5 长，
+    # 900s 会把构建掐在半路（实测 8 分钟才走完装配）。仅用户点名 unity 的回合生效
+    unity_turn_deadline_seconds: float = 2400.0
     # 大游戏上下文掩码阈值（字符）：代码超过后，每轮注入"模块地图+接口摘要"而非全文，
     # 模型用 view_module 按需查看、replace_module 定点改写——体量上限的解法（调研 P11）
     code_context_full_limit: int = 45000
@@ -54,6 +57,14 @@ class Settings(BaseSettings):
     vision_model: str = ""
     vision_api_base_url: str = ""
     vision_api_key: str = ""
+
+    # Unity 3D 生成线：平台经 unity-mcp 桥驱动本机 Unity 编辑器（画布工程需在编辑器中打开）。
+    # 桥不在线时 Unity 线工具自动降级提示，H5 主线不受影响
+    unity_project_path: str = r"C:\xiangmu\unity_games\demo3d"
+    unity_bridge_url: str = "http://localhost:27099"
+    unity_editor_exe: str = r"C:\Program Files\Unity\Hub\Editor\6000.5.6f1\Editor\Unity.exe"
+    # 素材工厂：独立无头工程批量渲染 3D 模型为 2D 序列帧图集（与编辑器画布工程互不干扰）
+    unity_factory_path: str = r"C:\xiangmu\unity_games\asset_factory"
 
     # 云生图素材管线（OpenAI images 兼容端点 /v1/images/generations）。
     # IMAGE_MODEL 留空 = 功能关闭（生成走程序化绘制）。base/key 缺省回退 OPENAI_*

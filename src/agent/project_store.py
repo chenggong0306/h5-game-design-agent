@@ -26,6 +26,7 @@ _ALLOWED_EXTS = {
     ".html", ".htm", ".js", ".mjs", ".css", ".json", ".txt", ".md", ".csv", ".xml",
     ".svg", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico",
     ".mp3", ".ogg", ".wav", ".ttf", ".woff", ".woff2",
+    ".wasm", ".data", ".mem",  # Unity WebGL 构建产物（压缩已关，无 .br/.gz）
 }
 _SAFE_SEG_RE = re.compile(r"^[A-Za-z0-9_\-.一-鿿]{1,64}$")
 _lock = threading.Lock()

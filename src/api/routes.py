@@ -1113,6 +1113,9 @@ _SOURCE_ASSET_HEADERS = {
     "Cross-Origin-Resource-Policy": "cross-origin",
 }
 _SOURCE_ASSET_MEDIA_TYPES = {
+    ".html": "text/html; charset=utf-8", ".htm": "text/html; charset=utf-8",
+    ".wasm": "application/wasm", ".data": "application/octet-stream",
+    ".mem": "application/octet-stream",  # Unity WebGL 产物
     ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
     ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp",
     ".ico": "image/x-icon", ".avif": "image/avif", ".tif": "image/tiff",

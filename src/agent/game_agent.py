@@ -776,6 +776,94 @@ def generate_asset(description: str, asset_kind: str = "sprite", art_style: str 
     )
 
 
+# ============ Unity 3D 生成线工具（经 unity-mcp 桥驱动本机编辑器） ============
+
+@tool
+def unity_list_tools() -> str:
+    """列出 Unity 编辑器桥的全部真实工具名。Unity 线开工第一步必调——工具名不能猜。"""
+    from src.agent import unity_line
+    names = unity_line.list_tool_names()
+    if not names:
+        return "读不到工具清单（画布工程缺 .claude/skills）。"
+    return (f"Unity 桥共 {len(names)} 个工具：\n" + ", ".join(names)
+            + "\n\n参数不确定的工具，先 unity_tool_help(name) 看官方文档再调，禁止盲试参数。")
+
+
+@tool
+def unity_tool_help(name: str) -> str:
+    """查看某个 Unity 工具的官方文档（参数表 + 调用示例）。调用前拿不准参数就先看这个。
+
+    Args:
+        name: 工具名（unity_list_tools 清单内）
+    """
+    from src.agent import unity_line
+    doc = unity_line.tool_doc(name)
+    return doc or f"没有 '{name}' 的文档（确认名字在 unity_list_tools 清单里）。"
+
+
+@tool
+def unity_tool(name: str, input_json: str = "{}") -> str:
+    """执行一个 Unity 编辑器工具（unity-mcp 桥）。工具名必须来自 unity_list_tools 的清单，禁止猜名。
+
+    关键工具速记（均为真名）：gameobject-create / gameobject-component-add /
+    script-update-or-create（写 C#）/ editor-application-set-state（进出 Play Mode）/
+    console-get-logs / screenshot-game-view / scene-save。空参调用会返回该工具的参数名提示；
+    gameObjectRef 类参数是对象形：{"gameObjectRef": {"path": "物体名"}}。
+
+    Args:
+        name: 工具名（真实清单内，小写连字符）
+        input_json: 工具入参 JSON 字符串
+    """
+    from src.agent import unity_line
+    return unity_line.run_tool(name, input_json)
+
+
+@tool
+def unity_build_webgl() -> str:
+    """把当前 Unity 画布工程构建成 WebGL，产物落到本会话 build/ 目录（树服务可直接伺服）。
+
+    构建前必须已通过 PlayMode 自测（console 无报错）。构建耗时数分钟，整回合只做一次。
+    成功后用 write_game 写包装页：<iframe src="build/index.html"> 全屏嵌入，走常规交付。
+    """
+    session_id = _current_session_id.get()
+    if not session_id:
+        return "无会话上下文"
+    if not project_store.is_project(session_id):
+        project_store.init(session_id)  # Unity 线产物必然多文件
+    from src.agent import unity_line
+    return unity_line.build_webgl(session_id)
+
+
+@tool
+def render_sprite_sheet(model: str = "demo-cube", frames: int = 8, size: int = 256) -> str:
+    """用 Unity 素材工厂把 3D 模型渲染成 2D 序列帧图集并入素材库（透明底、横向 grid）。
+
+    模型来自工厂工程 Assets/Models/ 目录（.fbx/.prefab 文件名），"demo-cube" 为内置验证模型。
+    返回 /assets/ URL 和帧元信息；H5 游戏按 frameWidth 裁帧播放。首次调用会自动创建工厂工程（较慢）。
+
+    Args:
+        model: 模型文件名或 demo-cube
+        frames: 帧数（1-32）
+        size: 单帧边长像素（64-512）
+    """
+    from src.knowledge import unity_factory
+    if not _kb:
+        return "知识库未初始化"
+    result = unity_factory.render(model, frames, size)
+    if not result.get("ok"):
+        return f"渲染失败：{result.get('error')}。可改用云生图或程序化绘制。"
+    record = _kb.upload_asset(
+        result["sheet_path"],
+        file_name=f"sheet-{model}-{frames}f.png",
+        asset_type="spritesheet",
+        description=f"{model} 序列帧图集：{frames} 帧，每帧 {result['frame_w']}x{result['frame_h']}（Unity 工厂渲染，透明底）",
+        tags=["unity-factory", "spritesheet", model],
+    )
+    url = f"/assets/spritesheet/{record['asset_id']}{record['extension']}"
+    return (f"图集已入库：{url}（{frames} 帧横排，每帧 {result['frame_w']}x{result['frame_h']}）。"
+            f"播放：ctx.drawImage(img, i*{result['frame_w']}, 0, {result['frame_w']}, {result['frame_h']}, x, y, w, h)")
+
+
 # ============ 项目工作区工具（多文件真目录；小游戏保持单文件不要用） ============
 
 @tool
@@ -2985,6 +3073,14 @@ def _looks_like_big_game_request(text: str) -> bool:
     return bool(_BIG_GAME_HINT_RE.search(text or ""))
 
 
+# Unity 线信号：显式点名才走（重管线，不做隐式推断）
+_UNITY_HINT_RE = re.compile(r"unity|真\s*3d|引擎级|3d\s*大作", re.IGNORECASE)
+
+
+def _looks_like_unity_request(text: str) -> bool:
+    return bool(_UNITY_HINT_RE.search(text or ""))
+
+
 def _recall_key(text: str) -> tuple:
     return (hash(text), hash(tuple(s["name"] for s in SKILLS)))
 
@@ -3204,6 +3300,13 @@ def _format_generation_mandate(user_text: str) -> str:
             "load_skill(\"gameloop,visual,polish,gamedesign\")（支持逗号多载，一次调用即可），"
             "并按命中项加载品类模板/源码参考。底座里的粒子/震屏/缓动/音频引擎/美术方向必须实际用上。"
         )
+        if _looks_like_unity_request(user_text):
+            mandate += (
+                "\n【Unity 3D 线】用户点名 Unity/真 3D：第一步必须 unity_list_tools 拿真实工具名"
+                "（清单外的名必失败，禁止猜名/探 API），随后按系统提示的 Unity 工作流执行"
+                "（建场景写码 → editor-application-set-state 进 Play Mode 自测+截图 → "
+                "unity_build_webgl → 包装页交付）。桥不在线则明确告知用户并降级 Canvas 拟 3D。"
+            )
         if _looks_like_big_game_request(user_text):
             mandate += (
                 "\n【大型游戏·强制模块化】本请求是多系统大型游戏，必须走模块化工作流："
@@ -3448,6 +3551,34 @@ def _build_code_addendum(code: str) -> str:
     )
 
 
+def _patch_orphan_tool_calls(messages: list) -> tuple[list, bool]:
+    """修补被硬掐回合留下的孤儿 tool_calls：assistant 发了调用、结果没写回 checkpoint，
+    历史即非法（API 400: tool_calls must be followed by tool messages），任何续跑都会炸。
+    给每个缺失回执的调用合成一条"因中断未执行"的 ToolMessage，让会话可继续。"""
+    from langchain_core.messages import AIMessage, ToolMessage
+    patched: list = []
+    changed = False
+    for i, m in enumerate(messages):
+        patched.append(m)
+        if not isinstance(m, AIMessage) or not getattr(m, "tool_calls", None):
+            continue
+        answered = set()
+        for follower in messages[i + 1:]:
+            if isinstance(follower, ToolMessage):
+                answered.add(getattr(follower, "tool_call_id", None))
+                continue
+            break  # 工具回执必须紧随其后，遇到其他消息即止
+        for tc in m.tool_calls:
+            tc_id = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", None)
+            if tc_id and tc_id not in answered:
+                patched.append(ToolMessage(
+                    content="（该工具调用因回合中断未执行，无结果。如仍需要请重新调用。）",
+                    tool_call_id=tc_id,
+                ))
+                changed = True
+    return patched, changed
+
+
 def _inject_code_into_request(request: ModelRequest) -> ModelRequest:
     """把当前会话的实时代码临时注入到 system message，仅本次模型调用可见。
 
@@ -3455,9 +3586,10 @@ def _inject_code_into_request(request: ModelRequest) -> ModelRequest:
     checkpointer 持久化——历史里永远 0 份代码，每次调用最多 1 份，彻底消除累积。
     """
     req = request
-    # 1) 清理旧会话遗留在历史里的代码块（防止历史残留多份）
+    # 1) 清理旧会话遗留在历史里的代码块（防止历史残留多份）+ 修补孤儿 tool_calls
     messages, changed = _strip_persisted_code_blocks(list(request.messages))
-    if changed:
+    messages, patched = _patch_orphan_tool_calls(messages)
+    if changed or patched:
         req = req.override(messages=messages)
 
     # 2) 注入当前实时代码到 system message（临时、不持久化；大文件走掩码模式）
@@ -4069,6 +4201,16 @@ SYSTEM_PROMPT = """你是一个专业的 H5 页面游戏设计 AI 助手，帮�
    - **用户明确要求多文件/项目结构，或需要运行时懒加载（几十关的关卡数据）** → 先 `init_project()` 开项目模式：
      游戏落成真实目录（入口 index.html + js/ + levels/…），文件用 write_file/read_file/replace_in_file 操作，
      入口引用其他文件必须相对路径（预览/自检/扫码由 /project/ 树服务解析）。普通小游戏保持单文件，不开项目
+   - **用户点名 Unity/真 3D/引擎级画面** → 走 Unity 3D 线（本机编辑器必须开着画布工程）：
+     ⓪`unity_list_tools` 拿真实工具清单（名字不能猜）；每个工具**首次使用前先
+       `unity_tool_help(name)` 看参数文档**——参数形状同样不能猜，盲试超过 1 次即违规 →
+     ①`unity_tool` 建场景写 C#：gameobject-create / gameobject-component-add /
+       script-update-or-create；修到 console-get-logs 无报错 →
+     ②`unity_tool("editor-application-set-state")` 进 Play Mode 自测 +
+       `unity_tool("screenshot-game-view")` 截图自审，测完退出 Play Mode →
+     ③`unity_build_webgl` 一次性构建（数分钟，整回合只构建一次，别在 Play Mode 中构建）→
+     ④`write_game` 写全屏包装页 `<iframe src="build/index.html" style="border:0;position:fixed;inset:0;width:100%;height:100%">`
+     桥不在线时工具会明确提示——此时改走 Canvas 拟 3D（3d-rendering 技能）并告知用户
    - **用户点名要引擎/物理效果，或物理密集题材（大型平台跳跃/弹球/堆叠/载具）** → 追加 `load_skill("engine_phaser")`：
      平台内置 Phaser 3.90（`/static/vendor/phaser.min.js`，禁止换 CDN，导出自动内联）。用 Phaser 时
      底座的 canvas/DPR/resize 手写规则不适用，按该技能的 Scale/物理规范写；粒子必须用 3.60+ 新 API
@@ -4144,6 +4286,11 @@ SYSTEM_PROMPT = """你是一个专业的 H5 页面游戏设计 AI 助手，帮�
 ALL_TOOLS = [
     search_assets,
     generate_asset,
+    unity_list_tools,
+    unity_tool_help,
+    unity_tool,
+    unity_build_webgl,
+    render_sprite_sheet,
     init_project,
     list_files,
     read_file,
@@ -4868,7 +5015,14 @@ class GameDesignAgent:
                   "last_code_emit_ts": 0.0, "code_pushed": False, "ctx_key": None,
                   "staging_push_ts": 0.0, "staging_push_len": 0}
 
-            async with asyncio.timeout(settings.turn_deadline_seconds):  # 单回合墙钟上限（含自修），防失控长跑
+            # 单回合墙钟上限（含自修），防失控长跑；Unity 线（编辑器施工+WebGL 构建）用专属更长上限
+            _deadline = (
+                settings.unity_turn_deadline_seconds
+                if _looks_like_unity_request(
+                    user_message if isinstance(user_message, str) else str(user_message)
+                ) else settings.turn_deadline_seconds
+            )
+            async with asyncio.timeout(_deadline):
                 # 主回合：模型生成
                 async for ev in self._run_agent_stream(self._build_message(user_message, base_code), config, ss):
                     yield ev
