@@ -18,7 +18,7 @@ import zlib
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException
+from fastapi import APIRouter, Response, UploadFile, File, Form, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse
 from starlette.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -40,7 +40,9 @@ from src.agent.game_agent import (
     SKILLS,
     _save_custom_skills,
     build_source_web_manifest,
+    generate_source_description,
     restore_session_code,
+    set_session_code_external,
 )
 
 router = APIRouter()
@@ -549,7 +551,120 @@ async def play_session(session_id: str):
     code = await asyncio.to_thread(load_session_code, session_id)
     if code is None:
         raise HTTPException(status_code=404, detail="会话代码不存在")
+    # 项目模式：注入 <base>，入口里的相对引用（js/main.js、levels/1.json）走项目树服务
+    from src.agent import project_store
+    if project_store.is_project(session_id):
+        base = f'<base href="/project/{session_id}/">'
+        head = _re.search(r"(?is)<head\b[^>]*>", code)
+        if head and "<base" not in code[:head.end() + 200].lower():
+            code = code[:head.end()] + base + code[head.end():]
     return HTMLResponse(code)
+
+
+@router.get("/project/{session_id}/{file_path:path}")
+async def serve_project_file(session_id: str, file_path: str):
+    """项目模式的运行时文件服务（相对引用解析）。免 token 理由同 /play。
+
+    安全：session_id 过安全正则；file_path 经 project_store.safe_relpath 白名单化
+    （拒绝穿越/隐藏段/未知扩展名）；media type 按扩展名映射，未知一律下载型。
+    """
+    _require_safe_session_id(session_id)
+    from src.agent import project_store
+    if not project_store.is_project(session_id):
+        raise HTTPException(status_code=404, detail="不是项目会话")
+    data = await asyncio.to_thread(project_store.read_file_bytes, session_id, file_path)
+    if data is None:
+        raise HTTPException(status_code=404, detail="文件不存在")
+    # ACAO:*：无头自检用 set_content 加载入口（不透明 origin），游戏里 fetch("levels/1.json")
+    # 是 CORS 请求，没有本头会被浏览器拦成"空白游戏"（script 标签 no-cors 才幸免）。
+    # 本路径免 token 纯只读、无凭据，放开跨源读不扩大任何权限。
+    return Response(content=data, media_type=_tree_media_type(file_path),
+                    headers={"Cache-Control": "no-cache",
+                             "Access-Control-Allow-Origin": "*"})
+
+
+# ---- 工作台文件 API（前端文件树/多标签用；管理接口走 token 策略） ----
+
+_WS_TEXT_EXTS = {".html", ".htm", ".js", ".mjs", ".css", ".json", ".txt", ".md", ".csv", ".xml", ".svg"}
+
+
+class WorkspaceFileWrite(BaseModel):
+    path: str
+    content: str
+
+
+@router.get("/api/workspace/{session_id}/files")
+async def workspace_files(session_id: str):
+    """工作台文件清单。非项目会话返回 project=False（前端据此隐藏文件树）。"""
+    _require_safe_session_id(session_id)
+    from src.agent import project_store
+    if not project_store.is_project(session_id):
+        return {"project": False, "entry": None, "files": []}
+    files = await asyncio.to_thread(project_store.list_files, session_id)
+    return {"project": True, "entry": project_store.entry_file(session_id), "files": files}
+
+
+@router.get("/api/workspace/{session_id}/file")
+async def workspace_read_file(session_id: str, path: str):
+    _require_safe_session_id(session_id)
+    from src.agent import project_store
+    if not project_store.is_project(session_id):
+        raise HTTPException(404, "不是项目会话")
+    rel = project_store.safe_relpath(path)
+    if rel is None:
+        raise HTTPException(400, "路径非法")
+    if PurePosixPath(rel).suffix.lower() not in _WS_TEXT_EXTS:
+        raise HTTPException(415, "二进制文件不支持文本编辑")
+    content = await asyncio.to_thread(project_store.read_file, session_id, rel)
+    if content is None:
+        raise HTTPException(404, "文件不存在")
+    return {"path": rel, "content": content}
+
+
+@router.put("/api/workspace/{session_id}/file")
+async def workspace_write_file(session_id: str, req: WorkspaceFileWrite):
+    """保存工作台编辑：入口文件走双写助手（同步单文件通道），其余直写项目目录。"""
+    _require_safe_session_id(session_id)
+    from src.agent import project_store
+    if not project_store.is_project(session_id):
+        raise HTTPException(404, "不是项目会话")
+    rel = project_store.safe_relpath(req.path)
+    if rel is None:
+        raise HTTPException(400, "路径非法")
+    if len(req.content) > _settings.max_upload_bytes:
+        raise HTTPException(413, "内容过大")
+    if rel == project_store.entry_file(session_id):
+        await asyncio.to_thread(set_session_code_external, session_id, req.content)
+    else:
+        try:
+            await asyncio.to_thread(project_store.write_file, session_id, rel, req.content)
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from e
+    return {"ok": True, "path": rel}
+
+
+@router.get("/api/project/{session_id}/export.zip")
+async def export_project_zip(session_id: str):
+    """把项目目录打包成 zip 下载（管理接口，走 token 策略）。"""
+    _require_safe_session_id(session_id)
+    from src.agent import project_store
+    if not project_store.is_project(session_id):
+        raise HTTPException(status_code=404, detail="不是项目会话")
+
+    def _build() -> bytes:
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for f in project_store.list_files(session_id):
+                data = project_store.read_file_bytes(session_id, f["path"])
+                if data is not None:
+                    zf.writestr(f["path"], data)
+        return buf.getvalue()
+
+    payload = await asyncio.to_thread(_build)
+    return Response(
+        content=payload, media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="game-{session_id[:8]}.zip"'},
+    )
 
 
 @router.get("/api/server-info")
@@ -986,7 +1101,11 @@ async def annotate_assets_batch(csv_file: UploadFile = File(...)):
     return result
 
 
-_ASSET_HEADERS = {"X-Content-Type-Options": "nosniff"}
+_ASSET_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    # 无头自检（set_content 不透明 origin）里 fetch 本路径需要 CORS 放行；只读无凭据
+    "Access-Control-Allow-Origin": "*",
+}
 _SOURCE_ASSET_HEADERS = {
     "X-Content-Type-Options": "nosniff",
     "Cache-Control": "public, max-age=31536000, immutable",
@@ -1875,8 +1994,8 @@ async def _save_source_skill(
 ) -> dict:
     clean_name = name.strip()
     clean_description = description.strip()
-    if not clean_name or not clean_description:
-        raise HTTPException(400, "技能名称和描述不能为空")
+    if not clean_name:
+        raise HTTPException(400, "技能名称不能为空")
     if len(clean_name) > 100 or len(clean_description) > 500:
         raise HTTPException(400, "技能名称最多 100 个字符，描述最多 500 个字符")
     if len(content) > 100000:
@@ -1900,6 +2019,14 @@ async def _save_source_skill(
     bundle_id, source_assets = await asyncio.to_thread(
         _persist_source_asset_bundle, asset_files, source_files
     )
+    # 自动描述：描述缺失或等于名字（"游戏N"零语义场景）时，用模型按入口标题/文件清单
+    # 生成一行玩法描述——召回质量直接取决于它。失败则回退原值/名字，不阻断导入。
+    if not clean_description or clean_description == clean_name:
+        auto_desc = await asyncio.to_thread(
+            generate_source_description,
+            clean_name, summary.get("entrypoint"), source_files, content,
+        )
+        clean_description = auto_desc or clean_description or clean_name
     record = _source_skill_record(
         clean_name,
         clean_description,
@@ -1970,6 +2097,53 @@ async def add_source_skill(
         name=name, description=description, content=content, files=files, replace=False,
         source_mode=source_mode,
     )
+
+
+class SessionTemplateRequest(BaseModel):
+    session_id: str
+    name: str = ""
+    description: str = ""
+
+
+@router.post("/api/skills/from-session")
+async def save_session_as_template(req: SessionTemplateRequest):
+    """把当前会话的游戏沉淀为源码参考技能（inspired 模式）——好产物回流成可召回的模板。"""
+    _require_safe_session_id(req.session_id)
+    from src.utils.persistence import load_session_code
+    code = await asyncio.to_thread(load_session_code, req.session_id)
+    if not code or "<html" not in code.lower():
+        raise HTTPException(404, "该会话没有可保存的游戏代码")
+    clean_name = (req.name or "").strip()[:100] or f"模板-{req.session_id[:8]}"
+    if any(s["name"] == clean_name for s in SKILLS):
+        raise HTTPException(409, f"技能 '{clean_name}' 已存在，换个名字")
+    uploaded = [(f"{clean_name}/index.html", code.encode("utf-8"))]
+    source_files, asset_files, summary, _skipped, _details = await asyncio.to_thread(
+        _build_source_reference, uploaded
+    )
+    if not source_files:
+        raise HTTPException(400, "会话代码无法解析为可参考源码")
+    bundle_id, source_assets = await asyncio.to_thread(
+        _persist_source_asset_bundle, asset_files, source_files
+    )
+    description = (req.description or "").strip()[:500]
+    if not description:
+        description = await asyncio.to_thread(
+            generate_source_description, clean_name, summary.get("entrypoint"), source_files, ""
+        ) or clean_name
+    record = _source_skill_record(
+        clean_name,
+        description,
+        "平台生成后沉淀的模板，仅作 inspired 参考：借玩法结构与美术方向，不逐字移植。",
+        source_files,
+        source_assets,
+        bundle_id,
+        summary,
+        source_mode="inspired",
+    )
+    SKILLS.append(record)
+    _sync_skills()
+    return {"name": clean_name, "description": description,
+            "source_mode": record.get("source_mode", "inspired")}
 
 
 @router.put("/api/skills/{skill_name}/source")

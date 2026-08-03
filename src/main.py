@@ -146,6 +146,7 @@ async def require_token(request: Request, x_api_token: str | None = Header(defau
     path = request.url.path
     if (path.startswith("/play/")
             or path.startswith("/assets/")
+            or path.startswith("/project/")
             or path.startswith("/api/assets/file/")):
         return
     client_host = request.client.host if request.client else ""

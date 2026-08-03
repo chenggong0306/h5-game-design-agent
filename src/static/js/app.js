@@ -316,11 +316,196 @@ let pendingLatestCode = null; // Monaco 尚未初始化时，临时保存要恢�
 let codeDirty = false;        // 用户是否在编辑器里手动改过代码（随请求上报，服务端据此决定是否采用 current_code）
 let isApplyingCode = false;   // 程序化写入编辑器时置位，避免把它误判为用户编辑
 
+// ============ 项目工作台：文件树 + Monaco 多标签（项目模式会话可见） ============
+let wsMainModel = null;            // 主通道 model：入口/单文件的唯一真相
+let wsIsProject = false, wsEntry = 'index.html', wsFiles = [];
+const wsTabs = new Map();          // path -> { model, savedVer }（不含入口）
+let wsActive = null;               // 当前激活文件路径；null = 入口
+let wsRenderTimer = null;
+
+function getMainCode() { return wsMainModel ? wsMainModel.getValue() : (editor ? editor.getValue() : ''); }
+
+function wsLang(path) {
+    const ext = (path.split('.').pop() || '').toLowerCase();
+    return { js: 'javascript', mjs: 'javascript', json: 'json', css: 'css',
+             html: 'html', htm: 'html', md: 'markdown', svg: 'xml', xml: 'xml' }[ext] || 'plaintext';
+}
+
+function wsTabDirty(path) {
+    const t = wsTabs.get(path);
+    return !!t && t.model.getAlternativeVersionId() !== t.savedVer;
+}
+
+function wsRenderSoon() {
+    clearTimeout(wsRenderTimer);
+    wsRenderTimer = setTimeout(wsRender, 120);
+}
+
+async function refreshWorkspace() {
+    if (!sessionId) { wsSetVisible(false); return; }
+    try {
+        const res = await fetch(`/api/workspace/${sessionId}/files`);
+        if (!res.ok) throw new Error(res.status);
+        const data = await res.json();
+        wsIsProject = !!data.project;
+        wsEntry = data.entry || 'index.html';
+        wsFiles = data.files || [];
+    } catch (_) { wsIsProject = false; }
+    wsSetVisible(wsIsProject);
+    if (!wsIsProject) { wsDisposeAll(); return; }
+    // 干净标签从磁盘重载（AI 可能在对话里改了文件）；脏标签保留用户编辑
+    for (const [path, t] of wsTabs) {
+        if (wsTabDirty(path)) continue;
+        try {
+            const r = await fetch(`/api/workspace/${sessionId}/file?path=${encodeURIComponent(path)}`);
+            if (r.ok) {
+                const d = await r.json();
+                if (d.content !== t.model.getValue()) {
+                    t.model.setValue(d.content);
+                    t.savedVer = t.model.getAlternativeVersionId();
+                }
+            } else if (r.status === 404) { wsCloseTab(path, true); }
+        } catch (_) {}
+    }
+    wsRender();
+}
+
+function wsSetVisible(v) {
+    document.getElementById('file-tree').classList.toggle('hidden', !v);
+    document.getElementById('editor-tabs').classList.toggle('hidden', !v);
+    if (!v && editor && wsMainModel && editor.getModel() !== wsMainModel) {
+        editor.setModel(wsMainModel);
+        wsActive = null;
+    }
+}
+
+function wsDisposeAll() {
+    if (editor && wsMainModel && editor.getModel() !== wsMainModel) editor.setModel(wsMainModel);
+    for (const [, t] of wsTabs) { try { t.model.dispose(); } catch (_) {} }
+    wsTabs.clear();
+    wsActive = null;
+}
+
+function wsModelAlive(m) { return !!m && !(m.isDisposed && m.isDisposed()); }
+
+async function wsOpen(path) {
+    if (!editor || !wsModelAlive(wsMainModel)) return;
+    if (path === wsEntry || path === null) {
+        editor.setModel(wsMainModel);
+        wsActive = null;
+        wsRender();
+        return;
+    }
+    let t = wsTabs.get(path);
+    if (t && !wsModelAlive(t.model)) { wsTabs.delete(path); t = null; }  // 被意外 dispose → 重建
+    if (!t) {
+        try {
+            const r = await fetch(`/api/workspace/${sessionId}/file?path=${encodeURIComponent(path)}`);
+            if (!r.ok) {
+                showToast(r.status === 415 ? '二进制文件不支持文本编辑' : '文件读取失败', 'info');
+                return;
+            }
+            const d = await r.json();
+            const model = monaco.editor.createModel(d.content, wsLang(path));
+            t = { model, savedVer: model.getAlternativeVersionId() };
+            model.onDidChangeContent(() => { if (!isApplyingCode) wsRenderSoon(); });
+            wsTabs.set(path, t);
+        } catch (e) { showToast('文件读取失败: ' + (e.message || e), 'error'); return; }
+    }
+    if (!wsModelAlive(t.model)) { wsTabs.delete(path); return; }
+    editor.setModel(t.model);
+    wsActive = path;
+    wsRender();
+}
+
+// 自愈兜底：任何未知路径把当前 model 弄没了（dispose 竞态等），回落到主通道
+function wsEnsureModel() {
+    if (editor && !editor.getModel() && wsModelAlive(wsMainModel)) {
+        editor.setModel(wsMainModel);
+        wsActive = null;
+        wsRender();
+    }
+}
+setInterval(wsEnsureModel, 1500);
+
+function wsCloseTab(path, force) {
+    const t = wsTabs.get(path);
+    if (!t) return;
+    if (!force && wsTabDirty(path) && !confirm(`${path} 有未保存修改，确定关闭？`)) return;
+    if (wsActive === path) { editor.setModel(wsMainModel); wsActive = null; }
+    try { t.model.dispose(); } catch (_) {}
+    wsTabs.delete(path);
+    wsRender();
+}
+
+async function wsSave() {
+    if (!wsIsProject || !sessionId) return;
+    const path = wsActive === null ? wsEntry : wsActive;
+    const content = wsActive === null ? getMainCode() : wsTabs.get(wsActive).model.getValue();
+    try {
+        const res = await fetch(`/api/workspace/${sessionId}/file`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ path, content }),
+        });
+        if (!res.ok) throw new Error((await res.json()).detail || res.status);
+        if (wsActive === null) codeDirty = false;
+        else { const t = wsTabs.get(wsActive); t.savedVer = t.model.getAlternativeVersionId(); }
+        showToast(`已保存 ${path}`, 'success', 1500);
+        wsRender();
+    } catch (e) { showToast('保存失败: ' + (e.message || e), 'error'); }
+}
+
+function wsRender() {
+    const tree = document.getElementById('file-tree');
+    const tabsBar = document.getElementById('editor-tabs');
+    if (!tree || !tabsBar || !wsIsProject) return;
+    // —— 文件树：按目录分组（单层）——
+    const groups = new Map();
+    for (const f of wsFiles) {
+        const idx = f.path.lastIndexOf('/');
+        const dir = idx === -1 ? '' : f.path.slice(0, idx);
+        if (!groups.has(dir)) groups.set(dir, []);
+        groups.get(dir).push(f.path);
+    }
+    let html = '';
+    for (const dir of [...groups.keys()].sort()) {
+        if (dir) html += `<div class="ft-dir">📁 ${escapeHtml(dir)}/</div>`;
+        for (const p of groups.get(dir).sort()) {
+            const name = p.slice(dir ? dir.length + 1 : 0);
+            const active = (wsActive === p || (wsActive === null && p === wsEntry)) ? ' active' : '';
+            const dirty = (p === wsEntry ? codeDirty : wsTabDirty(p)) ? ' dirty' : '';
+            const mark = p === wsEntry ? ' ⭐' : '';
+            html += `<div class="ft-file${active}${dirty}" data-path="${escapeHtml(p)}">${escapeHtml(name)}${mark}</div>`;
+        }
+    }
+    tree.innerHTML = html;
+    tree.querySelectorAll('.ft-file').forEach(el =>
+        el.addEventListener('click', () => wsOpen(el.dataset.path)));
+    // —— 标签栏：入口固定 + 已打开文件 ——
+    let tabs = `<div class="editor-tab${wsActive === null ? ' active' : ''}${codeDirty ? ' dirty' : ''}" data-path="">`
+        + `<span class="tab-name">${escapeHtml(wsEntry)}</span></div>`;
+    for (const p of wsTabs.keys()) {
+        tabs += `<div class="editor-tab${wsActive === p ? ' active' : ''}${wsTabDirty(p) ? ' dirty' : ''}" data-path="${escapeHtml(p)}">`
+            + `<span class="tab-name">${escapeHtml(p.split('/').pop())}</span>`
+            + `<span class="tab-close" data-close="${escapeHtml(p)}" title="关闭">×</span></div>`;
+    }
+    tabsBar.innerHTML = tabs;
+    tabsBar.querySelectorAll('.editor-tab').forEach(el =>
+        el.addEventListener('click', e => {
+            if (e.target.dataset.close !== undefined && e.target.dataset.close !== '') return;
+            wsOpen(el.dataset.path || null);
+        }));
+    tabsBar.querySelectorAll('.tab-close').forEach(el =>
+        el.addEventListener('click', e => { e.stopPropagation(); wsCloseTab(el.dataset.close); }));
+}
+
 // 程序化写入编辑器（服务器代码 / 模板 / 加载项目），写入后清除 dirty 标记
 function applyEditorCode(code) {
     if (!editor) { pendingLatestCode = code; return; }
     isApplyingCode = true;
-    editor.setValue(code || '');
+    if (wsMainModel && editor.getModel() !== wsMainModel) wsMainModel.setValue(code || '');
+    else editor.setValue(code || '');
     isApplyingCode = false;
     codeDirty = false;
 }
@@ -345,8 +530,17 @@ function createMonacoEditor() {
 
     // 区分用户手改与程序化写入：只有非程序化写入才标记为脏
     editor.onDidChangeModelContent(() => {
-        if (!isApplyingCode) codeDirty = true;
+        if (isApplyingCode) return;
+        if (wsMainModel && editor.getModel() !== wsMainModel) { wsRenderSoon(); return; }
+        codeDirty = true;
     });
+    // 主通道 model：入口/单文件的唯一真相。必须用显式 createModel 替换 create({value})
+    // 隐式生成的初始 model——隐式 model 归编辑器所有，首次 setModel 切走即被自动
+    // dispose，wsMainModel 会变死引用（实测坑：切标签后再也回不到入口）
+    wsMainModel = monaco.editor.createModel(editor.getValue(), 'html');
+    editor.setModel(wsMainModel);
+    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => { wsSave(); });
+    refreshWorkspace();
 
     if (pendingLatestCode !== null) {
         restoreEditorCode(pendingLatestCode);
@@ -769,6 +963,8 @@ function setSessionId(id) {
     sessionId = id || '';
     if (sessionId) localStorage.setItem('gameDesignSessionId', sessionId);
     else localStorage.removeItem('gameDesignSessionId');
+    wsDisposeAll();          // 换会话：丢弃旧项目的标签/模型
+    refreshWorkspace();      // 新会话若是项目模式，文件树自动出现
 }
 
 async function loadChatHistory(session) {
@@ -862,8 +1058,10 @@ function setStreamingUI(streaming) {
     chatInput.disabled = streaming;
 }
 
+let userStoppedStream = false;  // 区分"用户点了停止"与网络/未知原因断流（提示语不同）
 function stopCurrentStream() {
     if (!isStreaming || !currentStreamController) return;
+    userStoppedStream = true;
     currentStreamController.abort();
 }
 
@@ -959,7 +1157,7 @@ async function sendMessage(messageOverride = null, options = {}) {
     };
 
     try {
-        const currentCode = editor ? editor.getValue() : '';
+        const currentCode = getMainCode();
         const res = await fetch('/api/chat/stream', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -1072,6 +1270,8 @@ async function sendMessage(messageOverride = null, options = {}) {
                         let txt;
                         if (event.status === 'repairing') {
                             txt = '🔧 阻断级运行检查发现问题，正在自动修复：\n' + (event.issues || []).map(s => '· ' + s).join('\n');
+                        } else if (event.status === 'polishing') {
+                            txt = '✨ 功能检查通过；正在自动补强精美度（音效/反馈/动效等）：\n' + (event.warnings || []).map(s => '· ' + s).join('\n');
                         } else if (event.status === 'passed') {
                             txt = '✅ 运行与核心玩法检查通过';
                         } else if (event.status === 'passed_with_warnings') {
@@ -1126,6 +1326,7 @@ async function sendMessage(messageOverride = null, options = {}) {
                         // 整轮结束后统一刷新一次预览（保证渲染的是完整代码，而非分段半成品）
                         if (activeStreamState.codeUpdated || event.code) runGame();
                         codeDirty = false;  // 本回合已完成，编辑器内容已随请求送达服务端，重置脏标记
+                        refreshWorkspace(); // 项目模式：AI 本回合可能建了/改了文件，刷新文件树与干净标签
 
                         // 显示编辑日志，不依赖 editor 是否需要兜底同步
                         if (event.action === 'edit' && event.edit_logs) {
@@ -1160,16 +1361,21 @@ async function sendMessage(messageOverride = null, options = {}) {
 
     } catch (err) {
         activeStreamState.done = true;
-        if (err.name === 'AbortError') {
+        if (err.name === 'AbortError' && userStoppedStream) {
             ensureTextBlock(activeStreamState).content += '\n⏹️ 已停止生成。';
         } else {
-            ensureTextBlock(activeStreamState).content += `\n❌ 错误: ${err.message}`;
+            // 网络断流/未知 abort：服务器端回合大概率仍在继续，给用户明确的自救指引
+            ensureTextBlock(activeStreamState).content +=
+                '\n⚠️ 连接中断——服务器可能仍在后台继续生成。稍等片刻刷新页面，即可看到最新代码与文件。';
+            showToast('连接中断：后台可能仍在生成，稍后刷新页面查看结果', 'info', 8000);
         }
         flushStreamRender(activeStreamState);
     } finally {
+        userStoppedStream = false;
         currentStreamController = null;
         setStreamingUI(false);
         stopStreamStatus();  // 兜底：中断/网络错误/流意外结束时状态栏也要消失
+        refreshWorkspace();  // 正常/异常都刷新工作台：断流时项目文件树也要出现
     }
 }
 
@@ -1356,7 +1562,7 @@ function showPreviewRuntimeError(error) {
 
 function buildRuntimeErrorFixPrompt() {
     if (!lastPreviewRuntimeError) return '';
-    const currentCode = editor ? editor.getValue() : '';
+    const currentCode = getMainCode();
     return [
         '右侧 iframe 运行游戏时报错了，请直接修复当前代码。',
         '',
@@ -1441,9 +1647,15 @@ function injectPreviewErrorBridge(code) {
 }
 
 function runGame() {
-    const code = editor ? editor.getValue() : '';
+    let code = getMainCode();
     if (!code.trim()) return;
     clearPreviewRuntimeError();
+    // 项目模式：srcdoc 沙箱里相对路径（js/main.js、levels/1.json）无源可依，
+    // 注入绝对 <base> 指向项目树服务（服务端带 ACAO:*，沙箱 null origin 的 fetch 也能过）
+    if (wsIsProject && sessionId && !/<base\b/i.test(code)) {
+        const base = `<base href="${location.origin}/project/${sessionId}/">`;
+        code = code.replace(/<head\b[^>]*>/i, function(m) { return m + base; });
+    }
     const iframe = document.getElementById('game-preview');
     iframe.srcdoc = injectPreviewErrorBridge(code);
 }
@@ -1565,10 +1777,10 @@ function buildExportFilename(code) {
     return `${title}-${ymd}.html`;
 }
 
-// 把导出副本中引用的 /assets/ 服务器路径内联成 base64 data URI，
-// 否则 HTML 文件发给别人后素材全部 404。编辑器原文不动，只改导出副本。
+// 把导出副本中引用的 /assets/ 与 /static/vendor/（内置运行时库如 Phaser）服务器路径
+// 内联成 base64 data URI，否则 HTML 文件发给别人后素材/引擎全部 404。编辑器原文不动，只改导出副本。
 async function inlineAssetPaths(code) {
-    const re = /['"`](\/assets\/[^'"`\s]+)['"`]/g;
+    const re = /['"`]((?:\/assets\/|\/static\/vendor\/)[^'"`\s]+)['"`]/g;
     const found = new Set();
     let m;
     while ((m = re.exec(code)) !== null) found.add(m[1]);
@@ -1597,12 +1809,45 @@ async function inlineAssetPaths(code) {
     return { code: result, total: paths.length, inlined, failed };
 }
 
+document.getElementById('btn-save-template').addEventListener('click', async () => {
+    const code = getMainCode();
+    if (!code.trim() || !code.toLowerCase().includes('<html')) {
+        showToast('还没有可沉淀的游戏代码', 'info');
+        return;
+    }
+    if (!sessionId) { showToast('当前没有会话', 'info'); return; }
+    const name = window.prompt('给这个模板起个名字（会进入技能库、可被召回参考）：', '');
+    if (name === null) return;
+    try {
+        const res = await fetch('/api/skills/from-session', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ session_id: sessionId, name: name.trim() }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(typeof data.detail === 'string' ? data.detail : `HTTP ${res.status}`);
+        showToast(`已沉淀为模板「${data.name}」：${data.description}`, 'success', 6000);
+        loadSkills();
+    } catch (e) {
+        showToast('存为模板失败：' + (e.message || e), 'error');
+    }
+});
+
 document.getElementById('btn-export').addEventListener('click', async () => {
-    const code = editor ? editor.getValue() : '';
+    const code = getMainCode();
     const trimmed = code.trim();
     // 为空，或仍是初始占位注释（以 <!-- 开头且整份代码不含 <html）→ 没东西可导
     if (!trimmed || (trimmed.startsWith('<!--') && !/<html/i.test(code))) {
         showToast('还没有可导出的游戏代码', 'info');
+        return;
+    }
+    // 项目会话：单文件内联带不上 js/levels 等相对文件（导出会残废），改走整包 zip
+    if (wsIsProject && sessionId) {
+        const a = document.createElement('a');
+        a.href = `/api/project/${sessionId}/export.zip`;
+        a.download = '';
+        document.body.appendChild(a); a.click(); a.remove();
+        showToast('项目已按 zip 整包导出。注意：含 fetch 动态加载的项目需用本地静态服务器打开（如 VSCode Live Server），双击 index.html 会因浏览器限制加载不了数据文件', 'success', 9000);
         return;
     }
     const filename = buildExportFilename(code);
@@ -1667,7 +1912,7 @@ document.getElementById('btn-save').addEventListener('click', async () => {
         showToast('编辑器尚未就绪，请稍候再试', 'info');
         return;
     }
-    const code = editor.getValue();
+    const code = getMainCode();
     const name = await showPrompt('项目名称:', buildDefaultProjectName(code));
     if (!name) return;
     try {
@@ -2406,7 +2651,7 @@ function loadQrLib() {
 
 document.getElementById('btn-qrcode').addEventListener('click', async () => {
     // 还没会话或编辑器里只有占位注释 = 这个会话没生成过代码，磁盘上没有可供 /play 的文件
-    const currentCode = editor ? editor.getValue().trim() : '';
+    const currentCode = getMainCode().trim();
     const onlyComment = !currentCode || /^<!--[\s\S]*?-->$/.test(currentCode);
     if (!sessionId || onlyComment) {
         showToast('当前会话还没有生成过代码，先让 AI 生成一个游戏吧', 'info');
