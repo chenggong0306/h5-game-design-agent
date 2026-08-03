@@ -27,7 +27,10 @@ class Settings(BaseSettings):
     # 太大可能被 provider 拒绝/截断；配合"分段写入"使用，单段建议 ≤300 行。
     max_output_tokens: int = 8192
     # 单回合墙钟上限（秒）：防止个别回合（工具循环/自修）跑太久、占资源。流式与非流式都生效。
-    turn_deadline_seconds: float = 600.0
+    turn_deadline_seconds: float = 900.0  # 大型游戏一轮要写十几段，600s 会掐断主回合
+    # 大游戏上下文掩码阈值（字符）：代码超过后，每轮注入"模块地图+接口摘要"而非全文，
+    # 模型用 view_module 按需查看、replace_module 定点改写——体量上限的解法（调研 P11）
+    code_context_full_limit: int = 45000
     # 流式时是否请求 usage_metadata（stream_options.include_usage）。默认开（供压缩计数校正）；
     # 个别严格的 OpenAI 兼容网关不认这个字段时可设 false 关闭。
     stream_usage: bool = True
@@ -35,6 +38,30 @@ class Settings(BaseSettings):
     # 生成后自检 + 自修闭环
     self_check_enabled: bool = True      # 生成游戏后自动质检，发现问题让模型自修后再返回
     self_check_max_rounds: int = 2       # 最多自修轮数（每轮一次模型修复 + 重新质检；第2轮只在仍失败时才跑）
+    # 质量补强轮：功能自检通过后，静态探针查"精美要素"（音频/粒子/缓动/难度曲线等），
+    # 有缺口且是全新生成（非忠实移植）时追加一轮自动补强。QUALITY_PASS_ENABLED=0 可关
+    quality_pass_enabled: bool = True
+    # 意图对齐评审：全新生成通过功能自检后，用主模型对照用户原始请求判一次"哪些明确要求没实现"，
+    # 缺口并入补强轮。INTENT_REVIEW_ENABLED=0 可关
+    intent_review_enabled: bool = True
+    # 生成前绘制清单（实验开关，默认关）：新游戏先输出玩法规格+逐元素绘制清单再写码，
+    # 用于 A/B 验证一次通过率。DESIGN_MANIFEST_ENABLED=1 开启
+    design_manifest_enabled: bool = False
+
+    # 视觉评审（"眼睛"）：用视觉模型审自检截图挑毛病（贴纸感/HUD 裁切/风格割裂/空场景），
+    # 缺陷并入补强轮。VISION_MODEL 留空=关闭；base/key 缺省回退 IMAGE_API_* 再回退 OPENAI_*
+    # （硅基流动同一个 key 就有 Qwen2.5-VL）。示例：VISION_MODEL=Qwen/Qwen2.5-VL-32B-Instruct
+    vision_model: str = ""
+    vision_api_base_url: str = ""
+    vision_api_key: str = ""
+
+    # 云生图素材管线（OpenAI images 兼容端点 /v1/images/generations）。
+    # IMAGE_MODEL 留空 = 功能关闭（生成走程序化绘制）。base/key 缺省回退 OPENAI_*
+    # （聚合代理通常同时提供图像端点）。示例：IMAGE_MODEL=Kwai-Kolors/Kolors
+    image_api_base_url: str = ""
+    image_api_key: str = ""
+    image_model: str = ""
+    image_size: str = "1024x1024"
     self_check_headless: bool = True      # 启用无头浏览器运行检查（需 playwright + chromium）：
                                            # 未安装时自动降级到纯静态分析
 
@@ -75,6 +102,10 @@ class Settings(BaseSettings):
     # 与 max_upload_bytes 分开——素材/技能 ZIP 端点保持紧上限防误传超大文件，源码导入走大上限
     # （本机工具，瞬时内存占用可接受；ZIP 解压炸弹守卫仍按本值 ×3 派生）。.env 里 SOURCE_MAX_UPLOAD_BYTES 可覆盖
     source_max_upload_bytes: int = 200 * 1024 * 1024
+
+    # 技能语义路由开关：词法召回空手时，用主模型跑一次轻量 JSON 调用做语义匹配
+    # （"做个塔防"也能命中"植物大战僵尸"源码参考）。SKILL_RECALL_ROUTER=0 可关
+    skill_recall_router: bool = True
 
     # 项目
     project_name: str = "AI Game Design Agent"
