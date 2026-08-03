@@ -52,3 +52,13 @@ Thumbs.db
 .python-version
 .tmp_video_analysis/
 data/skills/custom_skills.backup-*.json
+
+# 项目工作区目录（运行时生成的多文件游戏）
+data/projects/
+
+# 修复知识库（运行时学习数据）
+data/repair_kb.json
+
+# 会话截图/临时产物
+baseline_ingame.jpeg
+.playwright-mcp/
