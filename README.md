@@ -101,6 +101,23 @@ OPENAI_MODEL=deepseek-v4-flash
 # OPENAI_MODEL=llama3
 ```
 
+可选增强（不配也全部正常，对应功能自动降级）：
+
+```env
+# 云生图素材（硅基流动等 OpenAI images 兼容端点）
+# IMAGE_MODEL=Kwai-Kolors/Kolors
+# IMAGE_API_BASE_URL=https://api.siliconflow.cn/v1
+# IMAGE_API_KEY=sk-xxx
+
+# 视觉评审"眼睛"（同一个硅基流动 key 可复用）
+# VISION_MODEL=Qwen/Qwen3-VL-30B-A3B-Instruct
+
+# Unity 3D 生成线（聊天点名 "用 unity" 时驱动本机编辑器出 WebGL）
+# 完整搭建与排障见 docs/unity-setup.md
+# UNITY_PROJECT_PATH=D:\unity_games\forge_canvas
+# UNITY_EDITOR_EXE=C:\Program Files\Unity\Hub\Editor\6000.5.6f1\Editor\Unity.exe
+```
+
 ### 4. 启动
 
 ```bash
