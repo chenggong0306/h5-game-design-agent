@@ -58,6 +58,11 @@ class Settings(BaseSettings):
     vision_api_base_url: str = ""
     vision_api_key: str = ""
 
+    # 联网搜索工具：查玩法规则/技术资料。TAVILY_API_KEY 配了走 Tavily（agent 专用搜索，
+    # 结果干净），没配自动走 DuckDuckGo 免 key 兜底。WEB_SEARCH_ENABLED=0 整体关闭
+    web_search_enabled: bool = True
+    tavily_api_key: str = ""
+
     # Unity 3D 生成线：平台经 unity-mcp 桥驱动本机 Unity 编辑器（画布工程需在编辑器中打开）。
     # 桥不在线时 Unity 线工具自动降级提示，H5 主线不受影响
     unity_project_path: str = r"C:\xiangmu\unity_games\demo3d"

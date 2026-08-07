@@ -776,6 +776,28 @@ def generate_asset(description: str, asset_kind: str = "sprite", art_style: str 
     )
 
 
+@tool
+def web_search(query: str, max_results: int = 5) -> str:
+    """联网搜索，查游戏玩法规则、题材资料、技术方案（返回标题+链接+摘要）。
+
+    何时用：不熟悉的玩法规则（麻将/斗地主计分等）、题材背景资料、拿不准的技术细节。
+    不要用于：找素材图片/音频（素材走 generate_asset 或素材库；**搜到的外链严禁写进游戏代码**，
+    外链不可靠且预览环境会拦截）。每回合最多搜 3 次，搜完凭结果继续干活。
+
+    Args:
+        query: 搜索关键词（中英文均可）
+        max_results: 结果条数（1-8，默认 5）
+    """
+    from src.knowledge import web_search as ws
+    if not settings.web_search_enabled:
+        return "联网搜索已被配置关闭（WEB_SEARCH_ENABLED=0）。凭已有知识继续。"
+    try:
+        results = ws.search(query, max_results)
+    except RuntimeError as e:
+        return f"{e}。不要反复重试，凭已有知识继续。"
+    return ws.format_results(results)
+
+
 # ============ Unity 3D 生成线工具（经 unity-mcp 桥驱动本机编辑器） ============
 
 @tool
@@ -4254,6 +4276,8 @@ SYSTEM_PROMPT = """你是一个专业的 H5 页面游戏设计 AI 助手，帮�
 - **过渡与缓动**：状态切换（开始→游戏→结束）、元素出场/消亡、数值变化必须用缓动（ease.out*/lerp 平滑），生硬瞬移和数字跳变是"潦草感"的主要来源
 - **素材保真（质量）**：有可用源码/公共图片时，必须用 `Image` + `drawImage` 或 CSS `url()` 实际渲染，不能把整套角色和背景重画成简陋图形。精灵表/atlas 必须先确认帧尺寸或 frame 坐标并用九参数 `drawImage` 裁切；**把整张精灵表缩成一个角色/塔/卡牌属于阻断级错误**。只对缺失或加载失败的部分程序化补画。
 - **美术风格（先选，再画）**：没有可用图片、需要程序化绘制时，**先按题材/用户要求选定 1 个美术方向**（扁平极简 / 卡通手绘 / 像素复古 / 霓虹赛博 / 暖色扁平 / 暗黑写实），然后**只用那个方向的语言**画完所有元素——风格自洽比堆特效更重要。选定后细节做足：扁平就把留白/色块/对齐做到位，卡通就把描边/渐变/弹性做到位，像素就把网格/有限色/硬边做到位。**贪吃蛇、2048、棋牌等休闲/极简题材默认用扁平或卡通，不要一律套深色霓虹**；不同题材应呈现不同视觉语言。需要具体画法、调色板与选择规则时 `load_skill("visual")`（§0.5 是选方向的表）。纯三原色直填在多数风格里刺眼，但语义色（魔方六面、红绿灯、扑克花色）优先于美学。
+- **资料**：题材玩法规则拿不准时（麻将计分、真实运动规则、冷门题材背景）先 `web_search` 查清再设计，
+  每回合最多 3 次；素材绝不使用搜索到的外链 URL（外链不可靠且预览环境拦截，素材只走 generate_asset/素材库）
 - **设计（好玩三要素，gamedesign 技能有现成实现）**：难度随 `gameTime` 提升 + 波次"压力-释放"节奏；**连击/倍率**或等价技巧奖励（按品类）+ 每 20~30 秒一个改变玩法动词的**道具/事件**（按品类）；≥3 种**行为不同**的敌人/障碍变体（换色不算变体）。操作要有宽容度（输入缓冲/受击框缩小/拾取磁吸——gamedesign 的 FORGIVE 表）
 - **界面**：完整 start/over 界面（标题 + 操作说明 + 本局得分 + 最高分 + 重玩提示）；失败后 1 秒内可重开；结束画面显示**距最高分差距**（"就差 120 分！"）；HUD（分数左上、最高分右上、连击顶中）
 
@@ -4286,6 +4310,7 @@ SYSTEM_PROMPT = """你是一个专业的 H5 页面游戏设计 AI 助手，帮�
 ALL_TOOLS = [
     search_assets,
     generate_asset,
+    web_search,
     unity_list_tools,
     unity_tool_help,
     unity_tool,
